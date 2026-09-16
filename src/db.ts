@@ -1,0 +1,210 @@
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
+import type { LedgerRow, Usage } from "./types.js";
+
+export type Db = DatabaseSync;
+
+export function openDb(dbPath: string): Db {
+  const absolute = dbPath === ":memory:" ? dbPath : resolve(dbPath);
+  if (absolute !== ":memory:") {
+    mkdirSync(dirname(absolute), { recursive: true });
+  }
+  const db = new DatabaseSync(absolute);
+  db.exec("PRAGMA journal_mode = WAL;");
+  db.exec("PRAGMA foreign_keys = ON;");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS requests (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      project TEXT NOT NULL DEFAULT 'default',
+      model TEXT NOT NULL DEFAULT 'unknown',
+      prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      cost_usd REAL NOT NULL DEFAULT 0,
+      status INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      upstream_id TEXT,
+      path TEXT NOT NULL DEFAULT '/v1/chat/completions',
+      streamed INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_requests_created ON requests(created_at);
+    CREATE INDEX IF NOT EXISTS idx_requests_project ON requests(project);
+    CREATE TABLE IF NOT EXISTS events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      type TEXT NOT NULL,
+      project TEXT NOT NULL,
+      message TEXT NOT NULL
+    );
+  `);
+  return db;
+}
+
+export function spendFor(db: Db, project?: string): number {
+  if (project) {
+    const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM requests WHERE project = ?`).get(project) as {
+      s: number;
+    };
+    return Number(row.s) || 0;
+  }
+  const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM requests`).get() as { s: number };
+  return Number(row.s) || 0;
+}
+
+export function insertRequest(
+  db: Db,
+  row: {
+    id?: string;
+    createdAt?: string;
+    project: string;
+    model: string;
+    usage: Usage;
+    costUsd: number;
+    status: number;
+    error?: string | null;
+    upstreamId?: string | null;
+    path: string;
+    streamed?: boolean;
+  },
+): LedgerRow {
+  const id = row.id ?? randomUUID();
+  const createdAt = row.createdAt ?? new Date().toISOString();
+  db.prepare(
+    `INSERT INTO requests (
+      id, created_at, project, model, prompt_tokens, completion_tokens, cached_tokens,
+      total_tokens, cost_usd, status, error, upstream_id, path, streamed
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    createdAt,
+    row.project,
+    row.model,
+    row.usage.promptTokens,
+    row.usage.completionTokens,
+    row.usage.cachedTokens,
+    row.usage.totalTokens,
+    roundUsd(row.costUsd),
+    row.status,
+    row.error ?? null,
+    row.upstreamId ?? null,
+    row.path,
+    row.streamed ? 1 : 0,
+  );
+  return {
+    id,
+    createdAt,
+    project: row.project,
+    model: row.model,
+    promptTokens: row.usage.promptTokens,
+    completionTokens: row.usage.completionTokens,
+    cachedTokens: row.usage.cachedTokens,
+    totalTokens: row.usage.totalTokens,
+    costUsd: roundUsd(row.costUsd),
+    status: row.status,
+    error: row.error ?? null,
+    upstreamId: row.upstreamId ?? null,
+    path: row.path,
+    streamed: row.streamed ? 1 : 0,
+  };
+}
+
+export function insertEvent(db: Db, type: string, project: string, message: string): void {
+  if (type === "soft_warn") {
+    const existing = db.prepare(`SELECT 1 AS ok FROM events WHERE type = 'soft_warn' AND project = ? LIMIT 1`).get(project);
+    if (existing) return;
+  }
+  db.prepare(`INSERT INTO events (created_at, type, project, message) VALUES (?, ?, ?, ?)`).run(
+    new Date().toISOString(),
+    type,
+    project,
+    message,
+  );
+}
+
+export function listRecent(db: Db, limit = 50): LedgerRow[] {
+  const rows = db
+    .prepare(
+      `SELECT id, created_at AS createdAt, project, model,
+              prompt_tokens AS promptTokens, completion_tokens AS completionTokens,
+              cached_tokens AS cachedTokens, total_tokens AS totalTokens,
+              cost_usd AS costUsd, status, error, upstream_id AS upstreamId, path, streamed
+       FROM requests ORDER BY created_at DESC LIMIT ?`,
+    )
+    .all(limit) as LedgerRow[];
+  return rows.map(normalizeRow);
+}
+
+export function loadSummaryParts(db: Db): {
+  spendUsd: number;
+  requests: number;
+  tokens: number;
+  byProject: { project: string; spendUsd: number; requests: number; tokens: number }[];
+  byModel: { model: string; spendUsd: number; requests: number; tokens: number }[];
+  daily: { day: string; spendUsd: number; requests: number }[];
+  recent: LedgerRow[];
+  events: { createdAt: string; type: string; project: string; message: string }[];
+} {
+  const totals = db.prepare(`SELECT COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens FROM requests`).get() as {
+    spendUsd: number;
+    requests: number;
+    tokens: number;
+  };
+  const byProject = db
+    .prepare(
+      `SELECT project, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens
+       FROM requests GROUP BY project ORDER BY spendUsd DESC`,
+    )
+    .all() as { project: string; spendUsd: number; requests: number; tokens: number }[];
+  const byModel = db
+    .prepare(
+      `SELECT model, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens
+       FROM requests GROUP BY model ORDER BY spendUsd DESC`,
+    )
+    .all() as { model: string; spendUsd: number; requests: number; tokens: number }[];
+  const daily = db
+    .prepare(
+      `SELECT substr(created_at, 1, 10) AS day, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests
+       FROM requests GROUP BY day ORDER BY day ASC`,
+    )
+    .all() as { day: string; spendUsd: number; requests: number }[];
+  const events = db
+    .prepare(
+      `SELECT created_at AS createdAt, type, project, message FROM events ORDER BY id DESC LIMIT 20`,
+    )
+    .all() as { createdAt: string; type: string; project: string; message: string }[];
+  return {
+    spendUsd: Number(totals.spendUsd) || 0,
+    requests: Number(totals.requests) || 0,
+    tokens: Number(totals.tokens) || 0,
+    byProject: byProject.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
+    byModel: byModel.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
+    daily: daily.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests) })),
+    recent: listRecent(db, 40),
+    events,
+  };
+}
+
+function normalizeRow(row: LedgerRow): LedgerRow {
+  return {
+    ...row,
+    promptTokens: Number(row.promptTokens),
+    completionTokens: Number(row.completionTokens),
+    cachedTokens: Number(row.cachedTokens),
+    totalTokens: Number(row.totalTokens),
+    costUsd: Number(row.costUsd),
+    status: Number(row.status),
+    streamed: Number(row.streamed),
+  };
+}
+
+export function roundUsd(n: number): number {
+  return Math.round(n * 1e8) / 1e8;
+}
+
+export function closeDb(db: Db): void {
+  db.close();
+}
