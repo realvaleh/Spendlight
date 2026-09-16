@@ -1,0 +1,43 @@
+{
+  "name": "spendlight",
+  "version": "0.1.0",
+  "description": "Drop-in OpenAI-compatible reverse proxy with SQLite spend tracking, budgets, and receipts.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "spendlight": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "spendlight.config.example.json"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "node --experimental-strip-types src/index.ts",
+    "prepare": "tsc",
+    "test": "tsc && node dist/smoke.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/realvaleh/Spendlight.git"
+  },
+  "keywords": [
+    "openai",
+    "proxy",
+    "spend",
+    "budget",
+    "sqlite",
+    "llm",
+    "cost"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2"
+  }
+}
