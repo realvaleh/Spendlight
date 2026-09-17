@@ -19,6 +19,8 @@ const HOP = new Set([
   "content-length",
 ]);
 
+const STRIP_REQUEST = new Set(["cookie", "cookie2", "set-cookie"]);
+
 export async function proxyRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -28,15 +30,22 @@ export async function proxyRequest(
 ): Promise<void> {
   const rawBody = await readBody(req);
   const project = resolveProject(req, url, rawBody);
-  const budgeted = isBudgetedPath(req.method ?? "GET", url.pathname);
+  const priced = isPricedPath(url.pathname);
+  const mutating = isMutating(req.method ?? "GET");
   const decision = evaluateBudget(db, config, project);
 
-  if (budgeted && !decision.allowed) {
+  if (mutating && !decision.allowed) {
     insertEvent(db, "hard_block", project, decision.message ?? "hard budget");
-    json(res, 402, budgetErrorBody(decision.message ?? "Hard budget exceeded"), {
-      "x-spendlight-budget-status": "hard",
-      "x-spendlight-project": project,
-    });
+    json(
+      res,
+      402,
+      budgetErrorBody(decision.message ?? "Hard budget exceeded"),
+      {
+        "x-spendlight-budget-status": "hard",
+        "x-spendlight-project": project,
+      },
+      req,
+    );
     return;
   }
 
@@ -76,17 +85,23 @@ export async function proxyRequest(
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    json(res, 502, {
-      error: { message: `Spendlight could not reach upstream: ${message}`, type: "spendlight_upstream_error" },
-    });
+    json(
+      res,
+      502,
+      {
+        error: { message: `Spendlight could not reach upstream: ${message}`, type: "spendlight_upstream_error" },
+      },
+      {},
+      req,
+    );
     return;
   }
 
-  const outHeaders = filterResponseHeaders(upstream.headers);
+  const outHeaders = filterResponseHeaders(upstream.headers, req);
   outHeaders["x-spendlight-project"] = project;
   outHeaders["x-spendlight-budget-status"] = decision.status;
   if (decision.message) outHeaders["x-spendlight-budget-warning"] = decision.message;
-  if (budgeted && decision.status === "soft") {
+  if (priced && decision.status === "soft") {
     insertEvent(db, "soft_warn", project, decision.message ?? "soft budget");
   }
 
@@ -108,7 +123,7 @@ export async function proxyRequest(
     const text = Buffer.concat(chunks).toString("utf8");
     const usage = extractUsageFromSse(text) ?? zeroUsage();
     const upstreamId = extractSseId(text);
-    if (budgeted || usage.totalTokens > 0) {
+    if (priced || usage.totalTokens > 0) {
       logCompleted({
         db,
         config,
@@ -144,7 +159,7 @@ export async function proxyRequest(
   res.writeHead(upstream.status, outHeaders);
   res.end(buf);
 
-  if (budgeted || usage.totalTokens > 0) {
+  if (priced || usage.totalTokens > 0) {
     logCompleted({
       db,
       config,
@@ -160,8 +175,13 @@ export async function proxyRequest(
   }
 }
 
-function isBudgetedPath(method: string, pathname: string): boolean {
-  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return false;
+function isMutating(method: string): boolean {
+  const m = method.toUpperCase();
+  return m !== "GET" && m !== "HEAD" && m !== "OPTIONS";
+}
+
+/** Routes whose usage we know how to price. Kill-switch still covers all mutating /v1 calls. */
+function isPricedPath(pathname: string): boolean {
   return (
     pathname.endsWith("/chat/completions") ||
     pathname.endsWith("/completions") ||
@@ -202,7 +222,32 @@ export function joinUpstream(base: string, pathname: string, search = ""): strin
   let path = pathname.startsWith("/") ? pathname : `/${pathname}`;
   if (baseHasV1 && path.startsWith("/v1/")) path = path.slice(3);
   else if (baseHasV1 && path === "/v1") path = "";
+  if (path.startsWith("//")) path = `/${path.replace(/^\/+/, "")}`;
   return `${base}${path}${search}`;
+}
+
+export function corsHeaders(req: IncomingMessage): Record<string, string> {
+  const origin = headerVal(req, "origin");
+  if (!origin || !isLocalOrigin(origin)) return {};
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-headers":
+      "authorization, content-type, x-spendlight-project, x-spendlight-tag",
+    "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    "access-control-expose-headers":
+      "x-spendlight-cost-usd, x-spendlight-budget-status, x-spendlight-budget-warning, x-spendlight-project",
+    vary: "Origin",
+  };
+}
+
+export function isLocalOrigin(origin: string): boolean {
+  try {
+    const u = new URL(origin);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+    return u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1";
+  } catch {
+    return false;
+  }
 }
 
 function resolveProject(req: IncomingMessage, url: URL, body: Buffer): string {
@@ -223,15 +268,23 @@ function resolveProject(req: IncomingMessage, url: URL, body: Buffer): string {
   return "default";
 }
 
-function sanitizeProject(value: string): string {
-  return value.trim().slice(0, 64) || "default";
+/** Safe for headers, SQLite grouping, and dashboard HTML. Client-chosen tags are not auth. */
+export function sanitizeProject(value: string): string {
+  const cleaned = value
+    .replace(/[\r\n\0]/g, "")
+    .replace(/[^A-Za-z0-9._/\- ]+/g, "")
+    .trim()
+    .slice(0, 64)
+    .trim();
+  return cleaned || "default";
 }
 
 function forwardHeaders(req: IncomingMessage, config: Config, contentLength: number): Record<string, string> {
   const headers: Record<string, string> = {};
   for (const [key, value] of Object.entries(req.headers)) {
-    if (!value || HOP.has(key.toLowerCase())) continue;
-    if (key.toLowerCase().startsWith("x-spendlight-")) continue;
+    const lower = key.toLowerCase();
+    if (!value || HOP.has(lower) || STRIP_REQUEST.has(lower)) continue;
+    if (lower.startsWith("x-spendlight-")) continue;
     headers[key] = Array.isArray(value) ? value.join(", ") : value;
   }
   if (!headers.authorization && config.upstreamApiKey) {
@@ -245,15 +298,16 @@ function forwardHeaders(req: IncomingMessage, config: Config, contentLength: num
   return headers;
 }
 
-function filterResponseHeaders(headers: Headers): Record<string, string> {
+function filterResponseHeaders(headers: Headers, req: IncomingMessage): Record<string, string> {
   const out: Record<string, string> = {};
   headers.forEach((value, key) => {
-    if (HOP.has(key.toLowerCase())) return;
-    if (key.toLowerCase() === "content-encoding") return;
+    const lower = key.toLowerCase();
+    if (HOP.has(lower)) return;
+    if (lower === "content-encoding") return;
+    if (lower.startsWith("access-control-")) return;
     out[key] = value;
   });
-  out["access-control-allow-origin"] = "*";
-  out["access-control-expose-headers"] = "x-spendlight-cost-usd, x-spendlight-budget-status, x-spendlight-budget-warning, x-spendlight-project";
+  Object.assign(out, corsHeaders(req));
   return out;
 }
 
@@ -281,12 +335,18 @@ async function readBody(req: IncomingMessage, limit = 20 * 1024 * 1024): Promise
   return Buffer.concat(chunks);
 }
 
-function json(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
+function json(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  extra: Record<string, string> = {},
+  req?: IncomingMessage,
+): void {
   const buf = Buffer.from(JSON.stringify(body));
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "content-length": String(buf.length),
-    "access-control-allow-origin": "*",
+    ...(req ? corsHeaders(req) : {}),
     ...extra,
   });
   res.end(buf);

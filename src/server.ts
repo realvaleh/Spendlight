@@ -4,7 +4,7 @@ import { closeDb, loadSummaryParts, openDb, type Db } from "./db.js";
 import { evaluateBudget } from "./budget.js";
 import { dashboardHtml, FAVICON_SVG } from "./ui.js";
 import { badgeSvg, receiptMarkdown, receiptSvg } from "./receipts.js";
-import { proxyRequest } from "./proxy.js";
+import { proxyRequest, corsHeaders } from "./proxy.js";
 
 export type App = {
   server: Server;
@@ -62,36 +62,32 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
   const url = new URL(req.url ?? "/", `http://${host}`);
 
   if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "access-control-allow-origin": "*",
-      "access-control-allow-headers": "*",
-      "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-    });
+    res.writeHead(204, corsHeaders(req));
     res.end();
     return;
   }
 
   if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/dashboard")) {
-    return send(res, 200, "text/html; charset=utf-8", dashboardHtml());
+    return send(res, 200, "text/html; charset=utf-8", dashboardHtml(), req);
   }
   if (req.method === "GET" && url.pathname === "/favicon.svg") {
-    return send(res, 200, "image/svg+xml", FAVICON_SVG);
+    return send(res, 200, "image/svg+xml", FAVICON_SVG, req);
   }
   if (req.method === "GET" && url.pathname === "/health") {
-    return sendJson(res, 200, { ok: true, service: "spendlight" });
+    return sendJson(res, 200, { ok: true, service: "spendlight" }, req);
   }
   if (req.method === "GET" && url.pathname === "/api/summary") {
-    return sendJson(res, 200, buildSummary(db, config));
+    return sendJson(res, 200, buildSummary(db, config), req);
   }
   if (req.method === "GET" && url.pathname === "/receipt.md") {
-    return send(res, 200, "text/markdown; charset=utf-8", receiptMarkdown(buildSummary(db, config)));
+    return send(res, 200, "text/markdown; charset=utf-8", receiptMarkdown(buildSummary(db, config)), req);
   }
   if (req.method === "GET" && url.pathname === "/receipt.svg") {
-    return send(res, 200, "image/svg+xml; charset=utf-8", receiptSvg(buildSummary(db, config)));
+    return send(res, 200, "image/svg+xml; charset=utf-8", receiptSvg(buildSummary(db, config)), req);
   }
   if (req.method === "GET" && url.pathname === "/badge.svg") {
     res.setHeader("cache-control", "no-cache");
-    return send(res, 200, "image/svg+xml; charset=utf-8", badgeSvg(buildSummary(db, config)));
+    return send(res, 200, "image/svg+xml; charset=utf-8", badgeSvg(buildSummary(db, config)), req);
   }
 
   if (url.pathname.startsWith("/v1/") || url.pathname === "/v1") {
@@ -99,7 +95,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
     return;
   }
 
-  sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } });
+  sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } }, req);
 }
 
 export function buildSummary(db: Db, config: Config): Summary {
@@ -112,16 +108,16 @@ export function buildSummary(db: Db, config: Config): Summary {
   };
 }
 
-function send(res: ServerResponse, status: number, type: string, body: string): void {
+function send(res: ServerResponse, status: number, type: string, body: string, req: IncomingMessage): void {
   const buf = Buffer.from(body);
   res.writeHead(status, {
     "content-type": type,
     "content-length": String(buf.length),
-    "access-control-allow-origin": "*",
+    ...corsHeaders(req),
   });
   res.end(buf);
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  send(res, status, "application/json; charset=utf-8", JSON.stringify(body));
+function sendJson(res: ServerResponse, status: number, body: unknown, req: IncomingMessage): void {
+  send(res, status, "application/json; charset=utf-8", JSON.stringify(body), req);
 }

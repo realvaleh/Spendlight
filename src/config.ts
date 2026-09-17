@@ -100,17 +100,23 @@ export function loadConfig(explicitPath?: string): Config {
   if (envSoft !== undefined) global.softUsd = envSoft;
   if (envHard !== undefined) global.hardUsd = envHard;
 
+  if (file.upstream?.apiKey && !process.env.OPENAI_API_KEY) {
+    console.warn(
+      "Spendlight: upstream.apiKey is set in the config file. Prefer OPENAI_API_KEY so the secret is not sitting in JSON.",
+    );
+  }
+
   return {
     host: process.env.SPENDLIGHT_HOST ?? file.host ?? "127.0.0.1",
     port: Number(process.env.SPENDLIGHT_PORT ?? file.port ?? 8787),
     dbPath: process.env.SPENDLIGHT_DB ?? file.dbPath ?? "./data/spendlight.db",
     configPath,
-    upstreamBaseUrl: (
+    upstreamBaseUrl: normalizeUpstreamUrl(
       process.env.OPENAI_BASE_URL ??
-      process.env.SPENDLIGHT_UPSTREAM_URL ??
-      file.upstream?.baseUrl ??
-      "https://api.openai.com/v1"
-    ).replace(/\/$/, ""),
+        process.env.SPENDLIGHT_UPSTREAM_URL ??
+        file.upstream?.baseUrl ??
+        "https://api.openai.com/v1",
+    ),
     upstreamApiKey: process.env.OPENAI_API_KEY ?? file.upstream?.apiKey ?? null,
     budgets: { global, projects },
     pricing,
@@ -138,4 +144,27 @@ Env:
   SPENDLIGHT_CONFIG              Config JSON path
   SPENDLIGHT_SOFT_BUDGET_USD     Global soft budget
   SPENDLIGHT_HARD_BUDGET_USD     Global hard budget (kill-switch)
+
+Bind to 127.0.0.1 (the default). The dashboard, receipts, and /api/summary have no auth.
 `;
+
+/** http(s) only; strips userinfo so keys in the URL cannot leak via logs or fetch. */
+export function normalizeUpstreamUrl(raw: string): string {
+  const trimmed = raw.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error("OPENAI_BASE_URL must be a valid http or https URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("OPENAI_BASE_URL must be http or https");
+  }
+  parsed.username = "";
+  parsed.password = "";
+  return parsed.href.replace(/\/$/, "");
+}
+
+export function isWildcardBind(host: string): boolean {
+  return host === "0.0.0.0" || host === "::" || host === "[::]" || host === "*";
+}

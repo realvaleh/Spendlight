@@ -2,10 +2,10 @@ import { createServer } from "node:http";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "./config.js";
+import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
 import { createApp, listen } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
-import { DEFAULT_FALLBACK, DEFAULT_PRICING } from "./config.js";
+import { joinUpstream, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
   prompt_tokens: 100_000,
@@ -31,6 +31,34 @@ async function main(): Promise<void> {
     DEFAULT_FALLBACK,
   ).costUsd;
   assert(Math.abs(cost - 0.045) < 1e-9, `expected $0.045 cost, got ${cost}`);
+
+  assert(normalizeUpstreamUrl("https://api.openai.com/v1/") === "https://api.openai.com/v1", "strip trailing slash");
+  const redacted = normalizeUpstreamUrl("https://user:sk-secret@api.openai.com/v1");
+  assert(redacted === "https://api.openai.com/v1", `userinfo should be stripped, got ${redacted}`);
+  let rejected = false;
+  try {
+    normalizeUpstreamUrl("file:///etc/passwd");
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, "file: upstream URLs must be rejected");
+  rejected = false;
+  try {
+    normalizeUpstreamUrl("ftp://example.com");
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, "non-http(s) upstream URLs must be rejected");
+
+  assert(sanitizeProject("demo") === "demo", "plain project tag");
+  assert(!sanitizeProject("demo\r\nX-Injected: 1").includes("\n"), "CR/LF stripped from project");
+  assert(!sanitizeProject("<script>alert(1)</script>").includes("<"), "HTML stripped from project");
+  assert(sanitizeProject("   ") === "default", "blank project becomes default");
+  assert(
+    joinUpstream("https://api.openai.com/v1", "/v1//evil.example/x") ===
+      "https://api.openai.com/v1/evil.example/x",
+    "protocol-relative join must not escape upstream host",
+  );
 
   const dir = mkdtempSync(join(tmpdir(), "spendlight-smoke-"));
   const dbPath = join(dir, "ledger.db");
@@ -101,6 +129,24 @@ async function main(): Promise<void> {
     const health = (await fetch(`${base}/health`).then((r) => r.json())) as { ok?: boolean };
     assert(health.ok === true, "health check failed");
 
+    const evilCors = await fetch(`${base}/api/summary`, { headers: { origin: "https://evil.example" } });
+    assert(evilCors.ok, "summary should still load without CORS");
+    assert(
+      evilCors.headers.get("access-control-allow-origin") == null,
+      "non-local Origin must not receive CORS allow-origin",
+    );
+    const localCors = await fetch(`${base}/api/summary`, { headers: { origin: "http://127.0.0.1:9999" } });
+    assert(
+      localCors.headers.get("access-control-allow-origin") === "http://127.0.0.1:9999",
+      "localhost Origin should be reflected",
+    );
+    const preflight = await fetch(`${base}/v1/chat/completions`, {
+      method: "OPTIONS",
+      headers: { origin: "https://evil.example" },
+    });
+    assert(preflight.status === 204, `OPTIONS status ${preflight.status}`);
+    assert(preflight.headers.get("access-control-allow-origin") == null, "preflight must not allow foreign origins");
+
     const first = await fetch(`${base}/v1/chat/completions`, {
       method: "POST",
       headers: {
@@ -143,6 +189,13 @@ async function main(): Promise<void> {
     assert(blocked.error?.type === "spendlight_budget_exceeded", "missing error type");
     assert(blocked.error?.message?.toLowerCase().includes("hard budget"), "unclear kill-switch message");
 
+    const images = await fetch(`${base}/v1/images/generations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "should be blocked" }),
+    });
+    assert(images.status === 402, `kill-switch should cover non-chat mutating /v1, got ${images.status}`);
+
     const summary2 = (await fetch(`${base}/api/summary`).then((r) => r.json())) as { requests: number };
     assert(summary2.requests === 1, "blocked request should not add spend");
 
@@ -162,11 +215,12 @@ async function main(): Promise<void> {
     const dash = await fetch(`${base}/`).then((r) => r.text());
     assert(dash.includes("Spend"), "dashboard missing brand");
     assert(dash.includes("/api/summary"), "dashboard missing summary fetch");
+    assert(dash.includes("const esc"), "dashboard should HTML-escape untrusted fields");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
 
-    console.log("SMOKE OK: logged completion, hard kill-switch, receipts, pass-through");
+    console.log("SMOKE OK: logged completion, hard kill-switch, receipts, pass-through, cors");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));

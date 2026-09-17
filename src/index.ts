@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { HELP, loadConfig, parseArgs } from "./config.js";
+import { HELP, isWildcardBind, loadConfig, parseArgs } from "./config.js";
 import { createApp, listen } from "./server.js";
 
 const args = parseArgs(process.argv.slice(2));
@@ -24,6 +24,10 @@ console.log(`  db         ${config.dbPath}`);
 console.log(`  upstream   ${config.upstreamBaseUrl}`);
 if (!config.upstreamApiKey) {
   console.log("  note       OPENAI_API_KEY unset; clients must send Authorization");
+}
+if (isWildcardBind(config.host)) {
+  console.log("  warn       Bound on all interfaces with no dashboard auth.");
+  console.log("             Do not expose this port publicly; prefer 127.0.0.1.");
 }
 
 const shutdown = async () => {

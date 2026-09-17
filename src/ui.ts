@@ -154,6 +154,9 @@ export function dashboardHtml(): string {
       return "$" + n.toFixed(6);
     };
     const fmtInt = (n) => Number(n || 0).toLocaleString("en-US");
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
     function pill(status) {
       const el = $("status-pill");
       el.className = "pill " + status;
@@ -205,7 +208,7 @@ export function dashboardHtml(): string {
       const proj = table(
         [{label:"Project"},{label:"Spend",num:true},{label:"Reqs",num:true}],
         s.byProject.map(p => [
-          p.project + '<div class="bar"><i style="width:' + (p.spendUsd / maxP * 100) + '%"></i></div>',
+          esc(p.project) + '<div class="bar"><i style="width:' + (p.spendUsd / maxP * 100) + '%"></i></div>',
           fmtMoney(p.spendUsd),
           p.requests
         ])
@@ -213,22 +216,22 @@ export function dashboardHtml(): string {
       $("by-project").innerHTML = proj || '<div class="empty">No projects yet.</div>';
       const models = table(
         [{label:"Model"},{label:"Spend",num:true},{label:"Tokens",num:true}],
-        s.byModel.map(m => ["<code>" + m.model + "</code>", fmtMoney(m.spendUsd), fmtInt(m.tokens)])
+        s.byModel.map(m => ["<code>" + esc(m.model) + "</code>", fmtMoney(m.spendUsd), fmtInt(m.tokens)])
       );
       $("by-model").innerHTML = models || '<div class="empty">No models yet.</div>';
       const recent = table(
         [{label:"When"},{label:"Project"},{label:"Model"},{label:"Tokens",num:true},{label:"Cost",num:true}],
         s.recent.map(r => [
           new Date(r.createdAt).toLocaleString(),
-          r.project,
-          "<code>" + r.model + "</code>",
+          esc(r.project),
+          "<code>" + esc(r.model) + "</code>",
           fmtInt(r.totalTokens),
           fmtMoney(r.costUsd)
         ])
       );
       $("recent").innerHTML = recent || '<div class="empty">Point a client at <code>/v1</code> to light this up.</div>';
       $("events").innerHTML = s.events.length
-        ? s.events.map(e => "<li><strong>" + e.type + "</strong> · " + e.project + " · " + e.message + "</li>").join("")
+        ? s.events.map(e => "<li><strong>" + esc(e.type) + "</strong> · " + esc(e.project) + " · " + esc(e.message) + "</li>").join("")
         : '<li class="empty" style="border:0;padding-left:0">None yet.</li>';
     }
     tick();
