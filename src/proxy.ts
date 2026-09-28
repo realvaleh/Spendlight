@@ -2,9 +2,17 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { Config, Usage } from "./types.js";
 import type { Db } from "./db.js";
-import { insertEvent, insertRequest } from "./db.js";
-import { budgetErrorBody, evaluateBudget } from "./budget.js";
-import { estimateCostUsd, extractUsageFromSse, parseUsage } from "./pricing.js";
+import { insertEvent, releaseReservation, settleReservation } from "./db.js";
+import { admitMutating, budgetErrorBody, evaluateBudget } from "./budget.js";
+import {
+  completionCharsFromSseData,
+  estimateCostUsd,
+  extractUsageFromSse,
+  parseUsage,
+  preflightFromBody,
+  roughTokens,
+  type Preflight,
+} from "./pricing.js";
 
 const HOP = new Set([
   "connection",
@@ -32,31 +40,16 @@ export async function proxyRequest(
   const project = resolveProject(req, url, rawBody);
   const priced = isPricedPath(url.pathname);
   const mutating = isMutating(req.method ?? "GET");
-  const decision = evaluateBudget(db, config, project);
-
-  if (mutating && !decision.allowed) {
-    insertEvent(db, "hard_block", project, decision.message ?? "hard budget");
-    json(
-      res,
-      402,
-      budgetErrorBody(decision.message ?? "Hard budget exceeded"),
-      {
-        "x-spendlight-budget-status": "hard",
-        "x-spendlight-project": project,
-      },
-      req,
-    );
-    return;
-  }
-
   const isChat = url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions";
+
   let outboundBody = rawBody;
   let model = "unknown";
   let stream = false;
+  let parsed: Record<string, unknown> | null = null;
 
   if (rawBody.length && isJsonReq(req)) {
     try {
-      const parsed = JSON.parse(rawBody.toString("utf8")) as Record<string, unknown>;
+      parsed = JSON.parse(rawBody.toString("utf8")) as Record<string, unknown>;
       if (typeof parsed.model === "string") model = parsed.model;
       stream = Boolean(parsed.stream);
       if ("spendlight_project" in parsed) {
@@ -69,12 +62,48 @@ export async function proxyRequest(
       }
       outboundBody = Buffer.from(JSON.stringify(parsed));
     } catch {
-      // pass original body
+      parsed = null;
+    }
+  }
+
+  const preflight = priced
+    ? preflightFromBody(model, parsed, url.pathname, config.pricing, config.fallbackPrice)
+    : null;
+
+  let decision = evaluateBudget(db, config, project);
+  let reservationId: string | null = null;
+  let reserveUsd = 0;
+  if (mutating) {
+    const admission = admitMutating(db, config, project, preflight);
+    decision = admission.decision;
+    reservationId = admission.reservationId;
+    reserveUsd = admission.reserveUsd;
+    if (!admission.allowed) {
+      insertEvent(db, "hard_block", project, decision.message ?? "hard budget");
+      json(
+        res,
+        402,
+        budgetErrorBody(decision.message ?? "Hard budget exceeded"),
+        {
+          "x-spendlight-budget-status": "hard",
+          "x-spendlight-project": project,
+        },
+        req,
+      );
+      return;
     }
   }
 
   const upstreamUrl = joinUpstream(config.upstreamBaseUrl, url.pathname, url.search);
   const headers = forwardHeaders(req, config, outboundBody.length);
+  const ac = new AbortController();
+  let settled = false;
+  const release = () => {
+    if (!settled) {
+      releaseReservation(db, reservationId);
+      settled = true;
+    }
+  };
 
   let upstream: Response;
   try {
@@ -82,8 +111,10 @@ export async function proxyRequest(
       method: req.method,
       headers,
       body: req.method === "GET" || req.method === "HEAD" ? undefined : outboundBody,
+      signal: ac.signal,
     });
   } catch (err) {
+    release();
     const message = err instanceof Error ? err.message : String(err);
     json(
       res,
@@ -97,82 +128,194 @@ export async function proxyRequest(
     return;
   }
 
-  const outHeaders = filterResponseHeaders(upstream.headers, req);
-  outHeaders["x-spendlight-project"] = project;
-  outHeaders["x-spendlight-budget-status"] = decision.status;
-  if (decision.message) outHeaders["x-spendlight-budget-warning"] = decision.message;
-  if (priced && decision.status === "soft") {
-    insertEvent(db, "soft_warn", project, decision.message ?? "soft budget");
-  }
-
-  const contentType = upstream.headers.get("content-type") ?? "";
-  const streamed = stream || contentType.includes("text/event-stream");
-
-  if (streamed && upstream.body) {
-    res.writeHead(upstream.status, outHeaders);
-    const chunks: Buffer[] = [];
-    const reader = upstream.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const buf = Buffer.from(value);
-      chunks.push(buf);
-      res.write(buf);
+  try {
+    const outHeaders = filterResponseHeaders(upstream.headers, req);
+    outHeaders["x-spendlight-project"] = project;
+    outHeaders["x-spendlight-budget-status"] = decision.status;
+    if (decision.message) outHeaders["x-spendlight-budget-warning"] = decision.message;
+    if (priced && decision.status === "soft") {
+      insertEvent(db, "soft_warn", project, decision.message ?? "soft budget");
     }
-    res.end();
-    const text = Buffer.concat(chunks).toString("utf8");
-    const usage = extractUsageFromSse(text) ?? zeroUsage();
-    const upstreamId = extractSseId(text);
+
+    const contentType = upstream.headers.get("content-type") ?? "";
+    const streamed = stream || contentType.includes("text/event-stream");
+
+    if (streamed && upstream.body) {
+      for (const key of Object.keys(outHeaders)) {
+        if (key.toLowerCase() === "content-length") delete outHeaders[key];
+      }
+      res.writeHead(upstream.status, outHeaders);
+      const piped = await pipeSse(upstream.body, res, {
+        ac,
+        capUsd: reserveUsd > 0 ? reserveUsd : null,
+        preflight,
+        model,
+        pricing: config.pricing,
+        fallback: config.fallbackPrice,
+      });
+      if (priced || piped.usage.totalTokens > 0) {
+        logCompleted({
+          db,
+          config,
+          project,
+          model,
+          usage: piped.usage,
+          status: upstream.status,
+          path: url.pathname,
+          streamed: true,
+          upstreamId: piped.upstreamId,
+          error: piped.stopped ? "stream stopped at hard budget" : null,
+          reservationId,
+        });
+        settled = true;
+      }
+      return;
+    }
+
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    let usage = zeroUsage();
+    let upstreamId: string | null = null;
+    let loggedModel = model;
+    if (contentType.includes("json")) {
+      try {
+        const parsedJson = JSON.parse(buf.toString("utf8")) as Record<string, unknown>;
+        usage = parseUsage(parsedJson) ?? zeroUsage();
+        if (typeof parsedJson.id === "string") upstreamId = parsedJson.id;
+        if (typeof parsedJson.model === "string") loggedModel = parsedJson.model;
+      } catch {
+        // ignore
+      }
+    }
+    outHeaders["content-length"] = String(buf.length);
+    const cost = estimateCostUsd(loggedModel, usage, config.pricing, config.fallbackPrice).costUsd;
+    outHeaders["x-spendlight-cost-usd"] = String(cost);
+    res.writeHead(upstream.status, outHeaders);
+    res.end(buf);
+
     if (priced || usage.totalTokens > 0) {
       logCompleted({
         db,
         config,
         project,
-        model,
+        model: loggedModel,
         usage,
         status: upstream.status,
         path: url.pathname,
-        streamed: true,
+        streamed: false,
         upstreamId,
+        error: upstream.ok ? null : buf.toString("utf8").slice(0, 500),
+        reservationId,
       });
+      settled = true;
     }
-    return;
+  } finally {
+    release();
+  }
+}
+
+type PipeArgs = {
+  ac: AbortController;
+  capUsd: number | null;
+  preflight: Preflight | null;
+  model: string;
+  pricing: Config["pricing"];
+  fallback: Config["fallbackPrice"];
+};
+
+async function pipeSse(
+  body: ReadableStream<Uint8Array>,
+  res: ServerResponse,
+  args: PipeArgs,
+): Promise<{ usage: Usage; upstreamId: string | null; stopped: boolean }> {
+  const reader = body.getReader();
+  let pending = Buffer.alloc(0);
+  let completionChars = 0;
+  let forwarded = "";
+  let stopped = false;
+  const promptTokens = args.preflight?.usage.promptTokens ?? 0;
+
+  const runningCost = (chars: number) =>
+    estimateCostUsd(
+      args.model,
+      {
+        promptTokens,
+        completionTokens: roughTokens(chars),
+        cachedTokens: 0,
+        totalTokens: promptTokens + roughTokens(chars),
+      },
+      args.pricing,
+      args.fallback,
+    ).costUsd;
+
+  try {
+    while (!stopped) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      pending = Buffer.concat([pending, Buffer.from(value)]);
+      while (!stopped) {
+        const sep = findBlankLine(pending);
+        if (!sep) break;
+        const eventBuf = pending.subarray(0, sep.index + sep.len);
+        const eventText = eventBuf.toString("utf8");
+        const added = completionCharsFromEvent(eventText);
+        const nextChars = completionChars + added;
+        if (args.capUsd != null && added > 0 && runningCost(nextChars) >= args.capUsd) {
+          stopped = true;
+          break;
+        }
+        completionChars = nextChars;
+        pending = pending.subarray(sep.index + sep.len);
+        forwarded += eventText;
+        res.write(eventBuf);
+      }
+    }
+  } finally {
+    if (stopped) {
+      args.ac.abort();
+      try {
+        await reader.cancel();
+      } catch {
+        // Upstream is already going away.
+      }
+      const frame = `data: ${JSON.stringify(budgetErrorBody("Spendlight hard budget reached while streaming; forwarding stopped."))}\n\n`;
+      if (!res.writableEnded) res.write(frame);
+    } else if (pending.length && !res.writableEnded) {
+      forwarded += pending.toString("utf8");
+      res.write(pending);
+    }
+    if (!res.writableEnded) res.end();
   }
 
-  const buf = Buffer.from(await upstream.arrayBuffer());
-  let usage = zeroUsage();
-  let upstreamId: string | null = null;
-  let loggedModel = model;
-  if (contentType.includes("json")) {
-    try {
-      const parsed = JSON.parse(buf.toString("utf8")) as Record<string, unknown>;
-      usage = parseUsage(parsed) ?? zeroUsage();
-      if (typeof parsed.id === "string") upstreamId = parsed.id;
-      if (typeof parsed.model === "string") loggedModel = parsed.model;
-    } catch {
-      // ignore
-    }
-  }
-  outHeaders["content-length"] = String(buf.length);
-  const cost = estimateCostUsd(loggedModel, usage, config.pricing, config.fallbackPrice).costUsd;
-  outHeaders["x-spendlight-cost-usd"] = String(cost);
-  res.writeHead(upstream.status, outHeaders);
-  res.end(buf);
+  const counted: Usage = {
+    promptTokens,
+    completionTokens: roughTokens(completionChars),
+    cachedTokens: 0,
+    totalTokens: promptTokens + roughTokens(completionChars),
+  };
+  const official = !stopped ? extractUsageFromSse(forwarded) : null;
+  return {
+    usage: official ?? counted,
+    upstreamId: extractSseId(forwarded),
+    stopped,
+  };
+}
 
-  if (priced || usage.totalTokens > 0) {
-    logCompleted({
-      db,
-      config,
-      project,
-      model: loggedModel,
-      usage,
-      status: upstream.status,
-      path: url.pathname,
-      streamed: false,
-      upstreamId,
-      error: upstream.ok ? null : buf.toString("utf8").slice(0, 500),
-    });
+function findBlankLine(buf: Buffer): { index: number; len: number } | null {
+  const lf = buf.indexOf("\n\n");
+  const crlf = buf.indexOf("\r\n\r\n");
+  if (lf < 0 && crlf < 0) return null;
+  if (lf >= 0 && (crlf < 0 || lf < crlf)) return { index: lf, len: 2 };
+  return { index: crlf, len: 4 };
+}
+
+function completionCharsFromEvent(event: string): number {
+  let chars = 0;
+  for (const line of event.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    chars += completionCharsFromSseData(trimmed.slice(5).trim());
   }
+  return chars;
 }
 
 function isMutating(method: string): boolean {
@@ -201,9 +344,10 @@ function logCompleted(args: {
   streamed: boolean;
   upstreamId: string | null;
   error?: string | null;
+  reservationId: string | null;
 }): void {
   const { costUsd } = estimateCostUsd(args.model, args.usage, args.config.pricing, args.config.fallbackPrice);
-  insertRequest(args.db, {
+  settleReservation(args.db, args.reservationId, {
     id: randomUUID(),
     project: args.project,
     model: args.model,

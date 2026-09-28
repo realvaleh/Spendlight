@@ -40,8 +40,62 @@ export function openDb(dbPath: string): Db {
       project TEXT NOT NULL,
       message TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS reservations (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      project TEXT NOT NULL,
+      cost_usd REAL NOT NULL
+    );
   `);
   return db;
+}
+
+/** Drop in-flight holds left behind by a crashed process so they cannot wedge the kill-switch. */
+export const RESERVATION_TTL_MS = 15 * 60 * 1000;
+
+export function withImmediate<T>(db: Db, fn: () => T): T {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // The transaction may already be closed.
+    }
+    throw err;
+  }
+}
+
+export function purgeStaleReservations(db: Db, now = Date.now()): void {
+  const cutoff = new Date(now - RESERVATION_TTL_MS).toISOString();
+  db.prepare(`DELETE FROM reservations WHERE created_at < ?`).run(cutoff);
+}
+
+export function reservedSpend(db: Db, project?: string): number {
+  if (project) {
+    const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM reservations WHERE project = ?`).get(project) as {
+      s: number;
+    };
+    return Number(row.s) || 0;
+  }
+  const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM reservations`).get() as { s: number };
+  return Number(row.s) || 0;
+}
+
+export function insertReservation(db: Db, id: string, project: string, costUsd: number): void {
+  db.prepare(`INSERT INTO reservations (id, created_at, project, cost_usd) VALUES (?, ?, ?, ?)`).run(
+    id,
+    new Date().toISOString(),
+    project,
+    roundUsd(costUsd),
+  );
+}
+
+export function deleteReservation(db: Db, id: string): void {
+  db.prepare(`DELETE FROM reservations WHERE id = ?`).run(id);
 }
 
 export function spendFor(db: Db, project?: string): number {
@@ -203,6 +257,37 @@ function normalizeRow(row: LedgerRow): LedgerRow {
 
 export function roundUsd(n: number): number {
   return Math.round(n * 1e8) / 1e8;
+}
+
+export function releaseReservation(db: Db, reservationId: string | null): void {
+  if (!reservationId) return;
+  withImmediate(db, () => {
+    deleteReservation(db, reservationId);
+  });
+}
+
+export function settleReservation(
+  db: Db,
+  reservationId: string | null,
+  row: {
+    id?: string;
+    createdAt?: string;
+    project: string;
+    model: string;
+    usage: Usage;
+    costUsd: number;
+    status: number;
+    error?: string | null;
+    upstreamId?: string | null;
+    path: string;
+    streamed?: boolean;
+  },
+): LedgerRow {
+  if (!reservationId) return insertRequest(db, row);
+  return withImmediate(db, () => {
+    deleteReservation(db, reservationId);
+    return insertRequest(db, row);
+  });
 }
 
 export function closeDb(db: Db): void {
