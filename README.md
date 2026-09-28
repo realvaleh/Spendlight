@@ -40,11 +40,11 @@ A single Node process that:
   │  /badge.svg        README badge          │
   │  /v1/*             reverse proxy         │
   │        │                                 │
-  │        ├─ budget check (SQLite sums)     │
+  │        ├─ hard budget reserve (SQLite)   │
   │        │    soft → warning header        │
   │        │    hard → 402 on mutating /v1   │
   │        ├─ upstream fetch                 │
-  │        └─ ledger insert (tokens × price) │
+  │        └─ ledger settles the reservation │
   └──────────────────────────────────────────┘
            |                      |
            v                      v
@@ -172,6 +172,8 @@ curl "http://127.0.0.1:8787/v1/chat/completions?project=demo" ...
 curl ... -d '{"model":"gpt-4o-mini","spendlight_project":"demo","messages":[...]}'
 ```
 
+Mutating priced calls take a SQLite `BEGIN IMMEDIATE` reservation before upstream: the preflight estimate when `max_tokens` / `max_completion_tokens` is set, otherwise the remaining hard headroom. That hold counts toward the hard cap until the call settles to **actual** usage, so a concurrent request sees the in-flight hold. A single call can still finish above the cap when real usage exceeds the estimate; the ledger stores that actual cost. Streaming chats stop forwarding once a running token estimate reaches the reserved amount. A finished stream logs provider usage; a cut stream logs the partial estimate. Reservations older than 15 minutes are dropped so a crash cannot wedge the kill-switch.
+
 Hard-limit responses look like OpenAI errors:
 
 ```json
@@ -213,7 +215,7 @@ Local README badge (only useful on a machine that can reach the proxy):
 ![spend](http://127.0.0.1:8787/badge.svg)
 ```
 
-Streaming chat completions: Spendlight sets `stream_options.include_usage` so the final SSE chunk can be logged.
+Streaming chat completions: Spendlight sets `stream_options.include_usage` so a finished stream can log provider usage. If a running estimate hits the hard cap first, forwarding stops and the ledger records the partial estimate instead of waiting for the final SSE usage chunk.
 
 ## Security (local proxy)
 

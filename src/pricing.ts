@@ -50,6 +50,121 @@ function num(v: unknown): number | undefined {
   return undefined;
 }
 
+const CHARS_PER_TOKEN = 4;
+
+export type Preflight = {
+  usage: Usage;
+  /** True when output is capped (max_tokens / embeddings). False holds the remaining hard headroom. */
+  outputBounded: boolean;
+  costUsd: number;
+  promptCostUsd: number;
+};
+
+function finiteNum(v: unknown): number | undefined {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  return undefined;
+}
+
+function textChars(value: unknown): number {
+  if (typeof value === "string") return value.length;
+  if (Array.isArray(value)) {
+    let n = 0;
+    for (const item of value) n += textChars(item);
+    return n;
+  }
+  if (value && typeof value === "object") {
+    let n = 0;
+    for (const v of Object.values(value as Record<string, unknown>)) n += textChars(v);
+    return n;
+  }
+  return 0;
+}
+
+export function roughTokens(chars: number): number {
+  if (chars <= 0) return 0;
+  return Math.ceil(chars / CHARS_PER_TOKEN);
+}
+
+/** Rough input size from chat messages, completion prompts, or embedding inputs. */
+export function preflightFromBody(
+  model: string,
+  body: Record<string, unknown> | null,
+  pathname: string,
+  pricing: Record<string, ModelPrice>,
+  fallback: ModelPrice,
+): Preflight {
+  let promptChars = 0;
+  if (body) {
+    if (body.messages != null) promptChars += textChars(body.messages);
+    if (body.prompt != null) promptChars += textChars(body.prompt);
+    if (body.input != null) promptChars += textChars(body.input);
+  }
+  const promptTokens = roughTokens(promptChars);
+  const embeddings = pathname.endsWith("/embeddings");
+  let outputTokens = 0;
+  let outputBounded = embeddings;
+  if (!embeddings && body) {
+    const cap = finiteNum(body.max_completion_tokens) ?? finiteNum(body.max_tokens);
+    if (cap != null && cap >= 0) {
+      outputTokens = Math.floor(cap);
+      outputBounded = true;
+    }
+  }
+  const usage: Usage = {
+    promptTokens,
+    completionTokens: outputTokens,
+    cachedTokens: 0,
+    totalTokens: promptTokens + outputTokens,
+  };
+  const promptUsage: Usage = { ...usage, completionTokens: 0, totalTokens: promptTokens };
+  return {
+    usage,
+    outputBounded,
+    costUsd: estimateCostUsd(model, usage, pricing, fallback).costUsd,
+    promptCostUsd: estimateCostUsd(model, promptUsage, pricing, fallback).costUsd,
+  };
+}
+
+export function completionCharsFromSseData(data: string): number {
+  if (!data || data === "[DONE]") return 0;
+  try {
+    return completionCharsFromPayload(JSON.parse(data));
+  } catch {
+    return 0;
+  }
+}
+
+function completionCharsFromPayload(payload: unknown): number {
+  if (!payload || typeof payload !== "object") return 0;
+  const choices = (payload as { choices?: unknown }).choices;
+  if (!Array.isArray(choices)) return 0;
+  let chars = 0;
+  for (const choice of choices) {
+    if (!choice || typeof choice !== "object") continue;
+    const row = choice as { delta?: unknown; text?: unknown; message?: unknown };
+    if (typeof row.text === "string") chars += row.text.length;
+    chars += deltaChars(row.delta);
+    chars += deltaChars(row.message);
+  }
+  return chars;
+}
+
+function deltaChars(delta: unknown): number {
+  if (!delta || typeof delta !== "object") return 0;
+  const d = delta as { content?: unknown; refusal?: unknown; tool_calls?: unknown };
+  let chars = 0;
+  if (typeof d.content === "string") chars += d.content.length;
+  if (typeof d.refusal === "string") chars += d.refusal.length;
+  if (Array.isArray(d.tool_calls)) {
+    for (const call of d.tool_calls) {
+      if (!call || typeof call !== "object") continue;
+      const args = (call as { function?: { arguments?: unknown } }).function?.arguments;
+      if (typeof args === "string") chars += args.length;
+    }
+  }
+  return chars;
+}
+
 export function extractUsageFromSse(buffer: string): Usage | null {
   let found: Usage | null = null;
   for (const line of buffer.split(/\r?\n/)) {
