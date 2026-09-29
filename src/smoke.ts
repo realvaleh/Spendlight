@@ -201,6 +201,22 @@ async function main(): Promise<void> {
     assert(Math.abs(summary.spendUsd - 0.045) < 1e-6, `logged spend ${summary.spendUsd}`);
     assert(summary.recent[0]?.project === "demo", "project not logged");
     assert(summary.recent[0]?.model === "gpt-4o-mini", "model not logged");
+
+    const csvRes = await fetch(`${base}/api/export.csv`);
+    assert(csvRes.status === 200, `csv export status ${csvRes.status}`);
+    const csvType = csvRes.headers.get("content-type") ?? "";
+    assert(csvType.includes("text/csv"), `csv content-type ${csvType}`);
+    const csv = await csvRes.text();
+    const csvLines = csv.split(/\r?\n/).filter((line) => line.length > 0);
+    assert(
+      csvLines[0] ===
+        "timestamp,project,model,promptTokens,completionTokens,cachedTokens,totalTokens,costUsd,streamed,id,error",
+      `unexpected csv header ${csvLines[0]}`,
+    );
+    assert(
+      csvLines.some((line) => line.includes(",demo,gpt-4o-mini,")),
+      "csv missing logged demo project/model",
+    );
     assert(
       summary.budget.status === "hard",
       `expected hard status after overshoot ($$${summary.spendUsd} >= $0.04), got ${summary.budget.status}`,
@@ -243,6 +259,8 @@ async function main(): Promise<void> {
     const dash = await fetch(`${base}/`).then((r) => r.text());
     assert(dash.includes("Spend"), "dashboard missing brand");
     assert(dash.includes("/api/summary"), "dashboard missing summary fetch");
+    assert(dash.includes('href="/api/export.csv"'), "dashboard missing csv download");
+    assert(dash.includes("Download CSV"), "dashboard missing csv label");
     assert(dash.includes("const esc"), "dashboard should HTML-escape untrusted fields");
 
     const models = await fetch(`${base}/v1/models`);
@@ -252,7 +270,7 @@ async function main(): Promise<void> {
     await testBoundedRace(dir, mockUrl);
     await testStreamCutoff(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff");
+    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));

@@ -20,6 +20,7 @@ console.log(`Spendlight listening on ${url}`);
 console.log(`  dashboard  ${url}/`);
 console.log(`  openai     ${url}/v1`);
 console.log(`  receipts   ${url}/receipt.md  ${url}/receipt.svg  ${url}/badge.svg`);
+console.log(`  export     ${url}/api/export.csv`);
 console.log(`  db         ${config.dbPath}`);
 console.log(`  upstream   ${config.upstreamBaseUrl}`);
 if (!config.upstreamApiKey) {

@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { Config, Summary } from "./types.js";
-import { closeDb, loadSummaryParts, openDb, type Db } from "./db.js";
+import type { Config, LedgerRow, Summary } from "./types.js";
+import { closeDb, listRequests, loadSummaryParts, openDb, type Db } from "./db.js";
 import { evaluateBudget } from "./budget.js";
 import { dashboardHtml, FAVICON_SVG } from "./ui.js";
 import { badgeSvg, receiptMarkdown, receiptSvg } from "./receipts.js";
@@ -79,6 +79,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
   if (req.method === "GET" && url.pathname === "/api/summary") {
     return sendJson(res, 200, buildSummary(db, config), req);
   }
+  if (req.method === "GET" && url.pathname === "/api/export.csv") {
+    res.setHeader("cache-control", "no-cache");
+    res.setHeader("content-disposition", 'attachment; filename="spendlight-ledger.csv"');
+    return send(res, 200, "text/csv; charset=utf-8", ledgerCsv(listRequests(db)), req);
+  }
   if (req.method === "GET" && url.pathname === "/receipt.md") {
     return send(res, 200, "text/markdown; charset=utf-8", receiptMarkdown(buildSummary(db, config)), req);
   }
@@ -120,4 +125,48 @@ function send(res: ServerResponse, status: number, type: string, body: string, r
 
 function sendJson(res: ServerResponse, status: number, body: unknown, req: IncomingMessage): void {
   send(res, status, "application/json; charset=utf-8", JSON.stringify(body), req);
+}
+
+const LEDGER_CSV_HEADER = [
+  "timestamp",
+  "project",
+  "model",
+  "promptTokens",
+  "completionTokens",
+  "cachedTokens",
+  "totalTokens",
+  "costUsd",
+  "streamed",
+  "id",
+  "error",
+] as const;
+
+export function ledgerCsv(rows: LedgerRow[]): string {
+  const lines = [LEDGER_CSV_HEADER.join(",")];
+  for (const row of rows) {
+    lines.push(
+      [
+        row.createdAt,
+        row.project,
+        row.model,
+        row.promptTokens,
+        row.completionTokens,
+        row.cachedTokens,
+        row.totalTokens,
+        row.costUsd,
+        row.streamed ? 1 : 0,
+        row.id,
+        row.error ?? "",
+      ]
+        .map(csvCell)
+        .join(","),
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function csvCell(value: string | number): string {
+  const text = String(value);
+  if (/[",\r\n]/.test(text)) return `"${text.replaceAll('"', '""')}"`;
+  return text;
 }

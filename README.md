@@ -36,6 +36,7 @@ A single Node process that:
   ┌──────────────────────────────────────────┐
   │              Spendlight                  │
   │  /                 local dashboard       │
+  │  /api/export.csv   spend ledger CSV      │
   │  /receipt.md .svg  shareable receipts    │
   │  /badge.svg        README badge          │
   │  /v1/*             reverse proxy         │
@@ -76,7 +77,7 @@ export OPENAI_API_KEY=sk-...
 docker compose up --build
 ```
 
-Compose publishes **localhost only** (`127.0.0.1:8787`). Inside the container Spendlight still listens on `0.0.0.0` so the published port works.
+Compose publishes **localhost only** (`127.0.0.1:8787`). Inside the container Spendlight still listens on `0.0.0.0` so the published port works. The image and Compose file healthcheck `GET /health` on port 8787.
 
 ```bash
 docker build -t spendlight . && docker run --rm -p 127.0.0.1:8787:8787 \
@@ -197,6 +198,7 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 | `/receipt.svg` | Paper-style SVG receipt |
 | `/badge.svg` | Shields-style badge for a local README |
 | `/api/summary` | JSON for the same numbers |
+| `/api/export.csv` | Full spend ledger as CSV |
 | `/health` | Liveness |
 
 Sample receipt (checked in):
@@ -221,7 +223,7 @@ Streaming chat completions: Spendlight sets `stream_options.include_usage` so a 
 
 Spendlight is a **localhost reverse proxy that can spend your API key**. Treat the bind address like a secret.
 
-- **Bind localhost.** Default `SPENDLIGHT_HOST=127.0.0.1`. Docker Compose publishes `127.0.0.1:8787`. Do not put this on `0.0.0.0` / the public internet. The dashboard, receipts, badge, and `/api/summary` have **no auth**.
+- **Bind localhost.** Default `SPENDLIGHT_HOST=127.0.0.1`. Docker Compose publishes `127.0.0.1:8787`. Do not put this on `0.0.0.0` / the public internet. The dashboard, receipts, badge, `/api/summary`, and `/api/export.csv` have **no auth**.
 - **API keys.** If `OPENAI_API_KEY` is set, any client that can reach the proxy and omits `Authorization` uses your key. If the client sends `Authorization`, that value is forwarded instead. Keys are not written to the ledger or stdout. Prefer the env var over `upstream.apiKey` in JSON (do not commit keys).
 - **Trust model.** Anyone who can talk to the port is trusted: they can complete, retag projects, and read spend. Project tags are labels, not ACLs. CORS is allowed only from `http(s)://127.0.0.1`, `localhost`, and `::1` so a random website cannot drive the proxy from the browser.
 - **Upstream URL.** `OPENAI_BASE_URL` is operator-controlled (http/https only). Clients cannot pick a different host. Do not point it at arbitrary internal URLs.

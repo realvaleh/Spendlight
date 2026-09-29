@@ -113,6 +113,7 @@ export function dashboardHtml(): string {
           <a class="btn" href="/receipt.md">Markdown receipt</a>
           <a class="btn" href="/receipt.svg">SVG receipt</a>
           <a class="btn" href="/badge.svg">README badge</a>
+          <a class="btn" href="/api/export.csv" download="spendlight-ledger.csv">Download CSV</a>
         </div>
       </article>
     </section>
