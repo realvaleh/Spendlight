@@ -179,16 +179,23 @@ export function insertEvent(db: Db, type: string, project: string, message: stri
   );
 }
 
-export function listRecent(db: Db, limit = 50): LedgerRow[] {
-  const rows = db
-    .prepare(
-      `SELECT id, created_at AS createdAt, project, model,
+const REQUEST_COLUMNS = `id, created_at AS createdAt, project, model,
               prompt_tokens AS promptTokens, completion_tokens AS completionTokens,
               cached_tokens AS cachedTokens, total_tokens AS totalTokens,
-              cost_usd AS costUsd, status, error, upstream_id AS upstreamId, path, streamed
-       FROM requests ORDER BY created_at DESC LIMIT ?`,
-    )
+              cost_usd AS costUsd, status, error, upstream_id AS upstreamId, path, streamed`;
+
+export function listRecent(db: Db, limit = 50): LedgerRow[] {
+  const rows = db
+    .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests ORDER BY created_at DESC LIMIT ?`)
     .all(limit) as LedgerRow[];
+  return rows.map(normalizeRow);
+}
+
+/** Full ledger, oldest first, for CSV export. */
+export function listRequests(db: Db): LedgerRow[] {
+  const rows = db
+    .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests ORDER BY created_at ASC, id ASC`)
+    .all() as LedgerRow[];
   return rows.map(normalizeRow);
 }
 
