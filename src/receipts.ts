@@ -13,6 +13,7 @@ export function receiptMarkdown(summary: Summary): string {
     `| Requests | ${summary.requests} |`,
     `| Tokens | ${summary.tokens.toLocaleString("en-US")} |`,
     `| Budget status | ${statusLabel(summary)} |`,
+    ...windowRows(summary),
     `| Global hard | ${fmt(summary.budget.globalLimit.hardUsd)} |`,
     `| Global soft | ${fmt(summary.budget.globalLimit.softUsd)} |`,
     ``,
@@ -56,7 +57,9 @@ export function receiptSvg(summary: Summary): string {
   const rowH = 22;
   const header = 168;
   const tableH = Math.max(rows.length, 1) * rowH;
-  const height = header + tableH + 150;
+  const day = summary.budget.period === "day";
+  const extra = day ? 22 : 0;
+  const height = header + tableH + 150 + extra;
   const total = fmt(summary.spendUsd);
   const hard = fmt(summary.budget.globalLimit.hardUsd);
   const status = statusLabel(summary);
@@ -98,7 +101,8 @@ export function receiptSvg(summary: Summary): string {
   <text x="48" y="${header + tableH + 48}" class="total-label">TOTAL</text>
   <text x="432" y="${header + tableH + 48}" class="total amount">${escapeXml(total)}</text>
   <text x="48" y="${header + tableH + 76}" class="muted">requests ${summary.requests} · tokens ${summary.tokens.toLocaleString("en-US")}</text>
-  <text x="48" y="${header + tableH + 98}" class="muted">hard budget ${escapeXml(hard)}</text>
+  <text x="48" y="${header + tableH + 98}" class="muted">${day ? "hard budget today" : "hard budget"} ${escapeXml(hard)}</text>
+  ${day ? `<text x="48" y="${header + tableH + 120}" class="muted">window ${escapeXml(summary.budget.timezone)} · ${escapeXml(fmt(summary.budget.globalSpend))} counted today</text>` : ""}
   <text x="240" y="${height - 28}" text-anchor="middle" class="footer">keep the light on · estimates only</text>
   <style>
     .brand { font: 700 22px "Palatino Linotype", Palatino, "Times New Roman", serif; fill: #1c1610; letter-spacing: 6px; }
@@ -116,9 +120,11 @@ export function receiptSvg(summary: Summary): string {
 export function badgeSvg(summary: Summary): string {
   const status = summary.budget.status;
   const label = "spendlight";
-  const spend = fmt(summary.spendUsd);
+  const day = summary.budget.period === "day";
+  const spend = fmt(day ? summary.budget.globalSpend : summary.spendUsd);
   const hard = summary.budget.globalLimit.hardUsd;
-  const value = hard != null ? `${spend} / ${fmt(hard)}` : spend;
+  const shown = day ? `today ${spend}` : spend;
+  const value = hard != null ? `${shown} / ${fmt(hard)}` : shown;
   const color = status === "hard" ? "#9b2c2c" : status === "soft" ? "#b8862a" : "#2f6f4e";
   const labelW = 82;
   const valueW = Math.max(78, value.length * 7.2 + 16);
@@ -137,6 +143,14 @@ export function badgeSvg(summary: Summary): string {
     <text x="${labelW + valueW / 2}" y="14">${escapeXml(value)}</text>
   </g>
 </svg>`;
+}
+
+function windowRows(summary: Summary): string[] {
+  if (summary.budget.period !== "day") return [];
+  return [
+    `| Budget window | today (${summary.budget.timezone}) |`,
+    `| Spend in window | ${fmt(summary.budget.globalSpend)} |`,
+  ];
 }
 
 function statusLabel(summary: Summary): string {

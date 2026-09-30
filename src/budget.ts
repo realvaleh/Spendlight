@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { BudgetDecision, BudgetLimit, Config } from "./types.js";
+import type { BudgetDecision, BudgetLimit, BudgetPeriod, Config } from "./types.js";
 import type { Preflight } from "./pricing.js";
+import { calendarDayBounds } from "./day.js";
 import {
   insertReservation,
   purgeStaleReservations,
@@ -9,6 +10,7 @@ import {
   spendFor,
   withImmediate,
   type Db,
+  type SpendWindow,
 } from "./db.js";
 
 export type Admission = {
@@ -19,11 +21,20 @@ export type Admission = {
   reserveUsd: number;
 };
 
-export function evaluateBudget(db: Db, config: Config, project: string): BudgetDecision {
-  const projectSpend = spendFor(db, project);
-  const globalSpend = spendFor(db);
+/** Null for a lifetime budget. Otherwise the current calendar day in the configured timezone. */
+export function spendWindow(config: Config, now = new Date()): SpendWindow | null {
+  if (config.budgets.period !== "day") return null;
+  const { start, end } = calendarDayBounds(config.budgets.timezone, now);
+  return { startIso: start.toISOString(), endIso: end.toISOString() };
+}
+
+export function evaluateBudget(db: Db, config: Config, project: string, now = new Date()): BudgetDecision {
+  const window = spendWindow(config, now);
+  const projectSpend = spendFor(db, project, window);
+  const globalSpend = spendFor(db, undefined, window);
   const projectLimit = config.budgets.projects[project] ?? { softUsd: null, hardUsd: null };
   const globalLimit = config.budgets.global;
+  const meta = windowMeta(config, window);
 
   const projectHard = hitHard(projectSpend, projectLimit);
   const globalHard = hitHard(globalSpend, globalLimit);
@@ -40,7 +51,8 @@ export function evaluateBudget(db: Db, config: Config, project: string): BudgetD
       projectLimit,
       globalLimit,
       triggeredBy,
-      message: hardMessage(triggeredBy, project, spend, limit),
+      message: hardMessage(triggeredBy, project, spend, limit, meta),
+      ...meta,
     };
   }
 
@@ -59,7 +71,8 @@ export function evaluateBudget(db: Db, config: Config, project: string): BudgetD
       projectLimit,
       globalLimit,
       triggeredBy,
-      message: `Spendlight soft budget warning (${triggeredBy}): ${fmt(spend)} / ${fmt(limit)}.`,
+      message: softMessage(triggeredBy, spend, limit, meta),
+      ...meta,
     };
   }
 
@@ -73,6 +86,7 @@ export function evaluateBudget(db: Db, config: Config, project: string): BudgetD
     globalLimit,
     triggeredBy: null,
     message: null,
+    ...meta,
   };
 }
 
@@ -82,21 +96,31 @@ export function evaluateBudget(db: Db, config: Config, project: string): BudgetD
  * Unbounded completions (no max_tokens) hold the entire remaining headroom so a second
  * concurrent call cannot pass the same check. Bounded calls hold their preflight estimate.
  */
-export function admitMutating(db: Db, config: Config, project: string, preflight: Preflight | null): Admission {
+export function admitMutating(
+  db: Db,
+  config: Config,
+  project: string,
+  preflight: Preflight | null,
+  now = new Date(),
+): Admission {
   return withImmediate(db, () => {
-    purgeStaleReservations(db);
-    const committed = evaluateBudget(db, config, project);
+    purgeStaleReservations(db, now.getTime());
+    const committed = evaluateBudget(db, config, project, now);
     if (!committed.allowed) {
       return { allowed: false, decision: committed, reservationId: null, reserveUsd: 0 };
     }
 
-    const snap = snapshot(db, config, project);
+    const snap = snapshot(db, config, project, now);
     if (snap.room != null && snap.room <= 0) {
       const spend = snap.triggeredBy === "project" ? snap.projectAdmission : snap.globalAdmission;
       const limit = snap.triggeredBy === "project" ? snap.projectLimit.hardUsd : snap.globalLimit.hardUsd;
       return {
         allowed: false,
-        decision: hardDecision(project, snap, hardMessage(snap.triggeredBy ?? "global", project, spend, limit)),
+        decision: hardDecision(
+          project,
+          snap,
+          hardMessage(snap.triggeredBy ?? "global", project, spend, limit, snap),
+        ),
         reservationId: null,
         reserveUsd: 0,
       };
@@ -112,7 +136,9 @@ export function admitMutating(db: Db, config: Config, project: string, preflight
     const limit = triggeredBy === "project" ? snap.projectLimit.hardUsd : snap.globalLimit.hardUsd;
     if (preflight.promptCostUsd > room || (preflight.outputBounded && preflight.costUsd > room)) {
       const estimate = preflight.outputBounded ? preflight.costUsd : preflight.promptCostUsd;
-      const message = `Spendlight hard budget exceeded (${triggeredBy} '${triggeredBy === "project" ? project : "global"}'): preflight ${fmt(estimate)} exceeds remaining ${fmt(room)} (${fmt(spend)} / ${fmt(limit)}). Kill-switch is on; further completions are rejected.`;
+      const where = snap.period === "day" ? `, today ${snap.timezone}` : "";
+      const label = triggeredBy === "project" ? project : "global";
+      const message = `Spendlight hard budget exceeded (${triggeredBy} '${label}'${where}): preflight ${fmt(estimate)} exceeds remaining ${fmt(room)} (${fmt(spend)} / ${fmt(limit)}). Kill-switch is on; further completions are rejected.`;
       return {
         allowed: false,
         decision: hardDecision(project, snap, message),
@@ -132,18 +158,24 @@ export function admitMutating(db: Db, config: Config, project: string, preflight
   });
 }
 
-function snapshot(db: Db, config: Config, project: string): {
+function snapshot(db: Db, config: Config, project: string, now: Date): {
   projectAdmission: number;
   globalAdmission: number;
   projectLimit: BudgetLimit;
   globalLimit: BudgetLimit;
   room: number | null;
   triggeredBy: "project" | "global" | null;
+  period: BudgetPeriod;
+  timezone: string;
+  windowStart: string | null;
+  windowEnd: string | null;
 } {
   const projectLimit = config.budgets.projects[project] ?? { softUsd: null, hardUsd: null };
   const globalLimit = config.budgets.global;
-  const projectAdmission = spendFor(db, project) + reservedSpend(db, project);
-  const globalAdmission = spendFor(db) + reservedSpend(db);
+  const window = spendWindow(config, now);
+  const meta = windowMeta(config, window);
+  const projectAdmission = spendFor(db, project, window) + reservedSpend(db, project, window);
+  const globalAdmission = spendFor(db, undefined, window) + reservedSpend(db, undefined, window);
   let room: number | null = null;
   let triggeredBy: "project" | "global" | null = null;
   if (projectLimit.hardUsd != null) {
@@ -157,7 +189,7 @@ function snapshot(db: Db, config: Config, project: string): {
       triggeredBy = "global";
     }
   }
-  return { projectAdmission, globalAdmission, projectLimit, globalLimit, room, triggeredBy };
+  return { projectAdmission, globalAdmission, projectLimit, globalLimit, room, triggeredBy, ...meta };
 }
 
 function hardDecision(
@@ -168,6 +200,10 @@ function hardDecision(
     projectLimit: BudgetLimit;
     globalLimit: BudgetLimit;
     triggeredBy: "project" | "global" | null;
+    period: BudgetPeriod;
+    timezone: string;
+    windowStart: string | null;
+    windowEnd: string | null;
   },
   message: string,
 ): BudgetDecision {
@@ -181,12 +217,49 @@ function hardDecision(
     globalLimit: snap.globalLimit,
     triggeredBy: snap.triggeredBy,
     message,
+    period: snap.period,
+    timezone: snap.timezone,
+    windowStart: snap.windowStart,
+    windowEnd: snap.windowEnd,
   };
 }
 
-function hardMessage(triggeredBy: "project" | "global", project: string, spend: number, limit: number | null): string {
+function windowMeta(config: Config, window: SpendWindow | null): {
+  period: BudgetPeriod;
+  timezone: string;
+  windowStart: string | null;
+  windowEnd: string | null;
+} {
+  return {
+    period: config.budgets.period,
+    timezone: config.budgets.timezone,
+    windowStart: window?.startIso ?? null,
+    windowEnd: window?.endIso ?? null,
+  };
+}
+
+function windowClause(meta: { period: BudgetPeriod; timezone: string }): string {
+  return meta.period === "day" ? `, today ${meta.timezone}` : "";
+}
+
+function hardMessage(
+  triggeredBy: "project" | "global",
+  project: string,
+  spend: number,
+  limit: number | null,
+  meta: { period: BudgetPeriod; timezone: string },
+): string {
   const label = triggeredBy === "project" ? project : "global";
-  return `Spendlight hard budget exceeded (${triggeredBy} '${label}'): ${fmt(spend)} / ${fmt(limit)}. Kill-switch is on; further completions are rejected.`;
+  return `Spendlight hard budget exceeded (${triggeredBy} '${label}'${windowClause(meta)}): ${fmt(spend)} / ${fmt(limit)}. Kill-switch is on; further completions are rejected.`;
+}
+
+function softMessage(
+  triggeredBy: "project" | "global",
+  spend: number,
+  limit: number | null,
+  meta: { period: BudgetPeriod; timezone: string },
+): string {
+  return `Spendlight soft budget warning (${triggeredBy}${windowClause(meta)}): ${fmt(spend)} / ${fmt(limit)}.`;
 }
 
 function hitHard(spend: number, limit: BudgetLimit): boolean {
