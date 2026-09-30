@@ -1,6 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
-import type { BudgetLimit, Config, ModelPrice } from "./types.js";
+import { assertIanaTimeZone } from "./day.js";
+import type { BudgetLimit, BudgetPeriod, Config, ModelPrice } from "./types.js";
 
 /** Default USD prices per 1M tokens. Overridable via spendlight.config.json. */
 export const DEFAULT_PRICING: Record<string, ModelPrice> = {
@@ -36,6 +37,8 @@ type FileConfig = {
   budgets?: {
     global?: Partial<BudgetLimit>;
     projects?: Record<string, Partial<BudgetLimit>>;
+    period?: unknown;
+    timezone?: unknown;
   };
   pricing?: Record<string, Partial<ModelPrice>>;
   fallbackPrice?: Partial<ModelPrice>;
@@ -46,6 +49,41 @@ function numEnv(name: string): number | undefined {
   if (raw == null || raw === "") return undefined;
   const n = Number(raw);
   return Number.isFinite(n) ? n : undefined;
+}
+
+function strEnv(name: string): string | undefined {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return undefined;
+  return raw.trim();
+}
+
+function asString(raw: unknown): string | undefined {
+  if (raw == null) return undefined;
+  if (typeof raw === "string") return raw;
+  return String(raw);
+}
+
+function parsePeriod(raw: string | undefined): BudgetPeriod {
+  if (raw == null || raw.trim() === "") return "lifetime";
+  const period = raw.trim();
+  if (period === "lifetime" || period === "day") return period;
+  throw new Error(
+    `Invalid budget period "${period}". Expected "lifetime" or "day" (budgets.period or SPENDLIGHT_BUDGET_PERIOD).`,
+  );
+}
+
+function parseTimeZone(raw: string | undefined, period: BudgetPeriod): string {
+  if (raw == null || raw.trim() === "") {
+    if (period === "day") {
+      console.warn(
+        'Spendlight: budget period is "day" but no timezone was set. Using UTC. Set budgets.timezone or SPENDLIGHT_BUDGET_TIMEZONE (IANA, e.g. America/New_York).',
+      );
+    }
+    return "UTC";
+  }
+  const timeZone = raw.trim();
+  assertIanaTimeZone(timeZone);
+  return timeZone;
 }
 
 function parseBudget(raw: Partial<BudgetLimit> | undefined): BudgetLimit {
@@ -100,6 +138,9 @@ export function loadConfig(explicitPath?: string): Config {
   if (envSoft !== undefined) global.softUsd = envSoft;
   if (envHard !== undefined) global.hardUsd = envHard;
 
+  const period = parsePeriod(strEnv("SPENDLIGHT_BUDGET_PERIOD") ?? asString(file.budgets?.period));
+  const timezone = parseTimeZone(strEnv("SPENDLIGHT_BUDGET_TIMEZONE") ?? asString(file.budgets?.timezone), period);
+
   if (file.upstream?.apiKey && !process.env.OPENAI_API_KEY) {
     console.warn(
       "Spendlight: upstream.apiKey is set in the config file. Prefer OPENAI_API_KEY so the secret is not sitting in JSON.",
@@ -118,7 +159,7 @@ export function loadConfig(explicitPath?: string): Config {
         "https://api.openai.com/v1",
     ),
     upstreamApiKey: process.env.OPENAI_API_KEY ?? file.upstream?.apiKey ?? null,
-    budgets: { global, projects },
+    budgets: { global, projects, period, timezone },
     pricing,
     fallbackPrice: {
       inputPerMillion: file.fallbackPrice?.inputPerMillion ?? DEFAULT_FALLBACK.inputPerMillion,
@@ -144,6 +185,8 @@ Env:
   SPENDLIGHT_CONFIG              Config JSON path
   SPENDLIGHT_SOFT_BUDGET_USD     Global soft budget
   SPENDLIGHT_HARD_BUDGET_USD     Global hard budget (kill-switch)
+  SPENDLIGHT_BUDGET_PERIOD       lifetime (default) or day
+  SPENDLIGHT_BUDGET_TIMEZONE     IANA zone when period is day (e.g. America/New_York)
 
 Bind to 127.0.0.1 (the default). The dashboard, receipts, and /api/summary have no auth.
 `;

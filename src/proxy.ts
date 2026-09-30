@@ -134,7 +134,9 @@ export async function proxyRequest(
     outHeaders["x-spendlight-budget-status"] = decision.status;
     if (decision.message) outHeaders["x-spendlight-budget-warning"] = decision.message;
     if (priced && decision.status === "soft") {
-      insertEvent(db, "soft_warn", project, decision.message ?? "soft budget");
+      insertEvent(db, "soft_warn", project, decision.message ?? "soft budget", {
+        dedupeSinceIso: decision.windowStart,
+      });
     }
 
     const contentType = upstream.headers.get("content-type") ?? "";

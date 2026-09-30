@@ -74,14 +74,31 @@ export function purgeStaleReservations(db: Db, now = Date.now()): void {
   db.prepare(`DELETE FROM reservations WHERE created_at < ?`).run(cutoff);
 }
 
-export function reservedSpend(db: Db, project?: string): number {
-  if (project) {
-    const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM reservations WHERE project = ?`).get(project) as {
-      s: number;
-    };
+/** Half-open UTC range. When set, only rows inside it count toward a budget. */
+export type SpendWindow = { startIso: string; endIso: string };
+
+export function reservedSpend(db: Db, project?: string, window?: SpendWindow | null): number {
+  if (!window) {
+    if (project) {
+      const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM reservations WHERE project = ?`).get(project) as {
+        s: number;
+      };
+      return Number(row.s) || 0;
+    }
+    const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM reservations`).get() as { s: number };
     return Number(row.s) || 0;
   }
-  const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM reservations`).get() as { s: number };
+  if (project) {
+    const row = db
+      .prepare(
+        `SELECT COALESCE(SUM(cost_usd), 0) AS s FROM reservations WHERE project = ? AND created_at >= ? AND created_at < ?`,
+      )
+      .get(project, window.startIso, window.endIso) as { s: number };
+    return Number(row.s) || 0;
+  }
+  const row = db
+    .prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM reservations WHERE created_at >= ? AND created_at < ?`)
+    .get(window.startIso, window.endIso) as { s: number };
   return Number(row.s) || 0;
 }
 
@@ -98,14 +115,28 @@ export function deleteReservation(db: Db, id: string): void {
   db.prepare(`DELETE FROM reservations WHERE id = ?`).run(id);
 }
 
-export function spendFor(db: Db, project?: string): number {
-  if (project) {
-    const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM requests WHERE project = ?`).get(project) as {
-      s: number;
-    };
+export function spendFor(db: Db, project?: string, window?: SpendWindow | null): number {
+  if (!window) {
+    if (project) {
+      const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM requests WHERE project = ?`).get(project) as {
+        s: number;
+      };
+      return Number(row.s) || 0;
+    }
+    const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM requests`).get() as { s: number };
     return Number(row.s) || 0;
   }
-  const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM requests`).get() as { s: number };
+  if (project) {
+    const row = db
+      .prepare(
+        `SELECT COALESCE(SUM(cost_usd), 0) AS s FROM requests WHERE project = ? AND created_at >= ? AND created_at < ?`,
+      )
+      .get(project, window.startIso, window.endIso) as { s: number };
+    return Number(row.s) || 0;
+  }
+  const row = db
+    .prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM requests WHERE created_at >= ? AND created_at < ?`)
+    .get(window.startIso, window.endIso) as { s: number };
   return Number(row.s) || 0;
 }
 
@@ -166,9 +197,22 @@ export function insertRequest(
   };
 }
 
-export function insertEvent(db: Db, type: string, project: string, message: string): void {
+export function insertEvent(
+  db: Db,
+  type: string,
+  project: string,
+  message: string,
+  opts?: { dedupeSinceIso?: string | null },
+): void {
   if (type === "soft_warn") {
-    const existing = db.prepare(`SELECT 1 AS ok FROM events WHERE type = 'soft_warn' AND project = ? LIMIT 1`).get(project);
+    const since = opts?.dedupeSinceIso;
+    const existing = since
+      ? db
+          .prepare(
+            `SELECT 1 AS ok FROM events WHERE type = 'soft_warn' AND project = ? AND created_at >= ? LIMIT 1`,
+          )
+          .get(project, since)
+      : db.prepare(`SELECT 1 AS ok FROM events WHERE type = 'soft_warn' AND project = ? LIMIT 1`).get(project);
     if (existing) return;
   }
   db.prepare(`INSERT INTO events (created_at, type, project, message) VALUES (?, ?, ?, ?)`).run(

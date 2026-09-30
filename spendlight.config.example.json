@@ -6,9 +6,11 @@
     "baseUrl": "https://api.openai.com/v1"
   },
   "budgets": {
+    "period": "day",
+    "timezone": "America/New_York",
     "global": {
-      "softUsd": 10,
-      "hardUsd": 25
+      "softUsd": 5,
+      "hardUsd": 10
     },
     "projects": {
       "demo": {

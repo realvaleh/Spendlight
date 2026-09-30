@@ -92,7 +92,7 @@ export function dashboardHtml(): string {
 
     <section class="hero">
       <article class="card">
-        <div class="k">Estimated spend</div>
+        <div class="k" id="spend-k">Estimated spend</div>
         <div class="hero-spend" id="spend">$0.00</div>
         <div class="sub" id="spend-sub">Waiting for the first completion…</div>
         <div class="meter" id="meter"><i id="meter-bar" style="width:0%"></i></div>
@@ -201,9 +201,8 @@ export function dashboardHtml(): string {
       const pct = hard ? Math.min(100, (spend / hard) * 100) : 0;
       $("meter").className = "meter " + s.budget.status;
       $("meter-bar").style.width = (hard ? pct : 0) + "%";
-      $("budget-copy").textContent = hard == null
-        ? "No global hard budget configured."
-        : "Hard budget " + fmtMoney(spend) + " / " + fmtMoney(hard) + (s.budget.globalLimit.softUsd != null ? " · soft " + fmtMoney(s.budget.globalLimit.softUsd) : "");
+      $("spend-k").textContent = s.budget.period === "day" ? "Estimated spend · lifetime" : "Estimated spend";
+      $("budget-copy").textContent = budgetCopy(s);
       spark(s.daily || []);
       const maxP = Math.max(...s.byProject.map(p => p.spendUsd), 1e-9);
       const proj = table(
@@ -234,6 +233,21 @@ export function dashboardHtml(): string {
       $("events").innerHTML = s.events.length
         ? s.events.map(e => "<li><strong>" + esc(e.type) + "</strong> · " + esc(e.project) + " · " + esc(e.message) + "</li>").join("")
         : '<li class="empty" style="border:0;padding-left:0">None yet.</li>';
+    }
+    function budgetCopy(s) {
+      const b = s.budget;
+      const hard = b.globalLimit.hardUsd;
+      const soft = b.globalLimit.softUsd;
+      const spend = b.globalSpend;
+      const softBit = soft != null ? " · soft " + fmtMoney(soft) : "";
+      if (b.period !== "day") {
+        return hard == null
+          ? "No global hard budget configured."
+          : "Hard budget " + fmtMoney(spend) + " / " + fmtMoney(hard) + softBit;
+      }
+      const head = "Today (" + b.timezone + ") ";
+      if (hard == null) return head + "no global hard budget" + softBit + ".";
+      return head + "hard budget " + fmtMoney(spend) + " / " + fmtMoney(hard) + softBit;
     }
     tick();
     setInterval(tick, 3000);

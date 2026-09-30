@@ -2,8 +2,11 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
 import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
-import { createApp, listen } from "./server.js";
+import { calendarDayBounds } from "./day.js";
+import { closeDb, insertRequest, openDb, type Db } from "./db.js";
+import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
 import { joinUpstream, sanitizeProject } from "./proxy.js";
 
@@ -142,6 +145,8 @@ async function main(): Promise<void> {
   process.env.SPENDLIGHT_CONFIG = configPath;
   delete process.env.SPENDLIGHT_SOFT_BUDGET_USD;
   delete process.env.SPENDLIGHT_HARD_BUDGET_USD;
+  delete process.env.SPENDLIGHT_BUDGET_PERIOD;
+  delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
   delete process.env.SPENDLIGHT_PORT;
   delete process.env.SPENDLIGHT_HOST;
   delete process.env.SPENDLIGHT_DB;
@@ -232,6 +237,7 @@ async function main(): Promise<void> {
     assert(blocked.error?.code === "budget_hard_limit", "missing budget_hard_limit code");
     assert(blocked.error?.type === "spendlight_budget_exceeded", "missing error type");
     assert(blocked.error?.message?.toLowerCase().includes("hard budget"), "unclear kill-switch message");
+    assert(!blocked.error?.message?.includes("today"), "lifetime kill-switch should not mention a day window");
 
     const images = await fetch(`${base}/v1/images/generations`, {
       method: "POST",
@@ -247,6 +253,7 @@ async function main(): Promise<void> {
     assert(md.includes("Spendlight receipt"), "markdown receipt missing title");
     assert(md.includes("gpt-4o-mini"), "markdown receipt missing model");
     assert(md.includes("demo"), "markdown receipt missing project");
+    assert(!md.includes("Budget window"), "lifetime receipt should not show a day window");
 
     const svg = await fetch(`${base}/receipt.svg`).then((r) => r.text());
     assert(svg.includes("<svg"), "svg receipt not svg");
@@ -262,6 +269,8 @@ async function main(): Promise<void> {
     assert(dash.includes('href="/api/export.csv"'), "dashboard missing csv download");
     assert(dash.includes("Download CSV"), "dashboard missing csv label");
     assert(dash.includes("const esc"), "dashboard should HTML-escape untrusted fields");
+    assert(dash.includes("Today ("), "dashboard should name the day window");
+    assert(dash.includes("Estimated spend · lifetime"), "dashboard should label lifetime hero spend");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -269,8 +278,16 @@ async function main(): Promise<void> {
     await testUnboundedRace(dir, mockUrl);
     await testBoundedRace(dir, mockUrl);
     await testStreamCutoff(dir, mockUrl);
+    testCalendarDayBounds();
+    testBudgetConfig(dir);
+    testDayLedgerWindow(dir);
+    testReservationOutsideDay(dir);
+    await testDayWindow(dir, mockUrl);
+    await testLifetimeStillAccumulates(dir, mockUrl);
+    await testSoftWarnRefires(dir, mockUrl);
+    await testSoftWarnLifetimeDedupe(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff");
+    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -372,12 +389,19 @@ async function testStreamCutoff(dir: string, mockUrl: string): Promise<void> {
   });
 }
 
+type SmokeBudgets = {
+  softUsd: number | null;
+  hardUsd: number | null;
+  period?: "lifetime" | "day";
+  timezone?: string;
+};
+
 async function withApp(
   dir: string,
   name: string,
   mockUrl: string,
-  budgets: { softUsd: number | null; hardUsd: number | null },
-  fn: (base: string) => Promise<void>,
+  budgets: SmokeBudgets,
+  fn: (base: string, app: App) => Promise<void>,
 ): Promise<void> {
   const dbPath = join(dir, `${name}.db`);
   const configPath = join(dir, `${name}.json`);
@@ -388,7 +412,11 @@ async function withApp(
       port: 0,
       dbPath,
       upstream: { baseUrl: mockUrl },
-      budgets: { global: budgets },
+      budgets: {
+        period: budgets.period,
+        timezone: budgets.timezone,
+        global: { softUsd: budgets.softUsd, hardUsd: budgets.hardUsd },
+      },
     }),
   );
   const config = loadConfig(configPath);
@@ -396,7 +424,7 @@ async function withApp(
   const app = createApp(config);
   const base = await listen(app);
   try {
-    await fn(base);
+    await fn(base, app);
   } finally {
     await app.close();
   }
@@ -413,13 +441,364 @@ function postChat(base: string, project: string, body: string): Promise<Response
 async function summaryOf(base: string): Promise<{
   spendUsd: number;
   requests: number;
+  budget: {
+    status: string;
+    period: string;
+    timezone: string;
+    globalSpend: number;
+    windowStart: string | null;
+  };
+  events: { type: string; project: string; message: string; createdAt: string }[];
   recent: { streamed?: number; error?: string | null; totalTokens?: number; costUsd?: number }[];
 }> {
   return (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
     spendUsd: number;
     requests: number;
+    budget: {
+      status: string;
+      period: string;
+      timezone: string;
+      globalSpend: number;
+      windowStart: string | null;
+    };
+    events: { type: string; project: string; message: string; createdAt: string }[];
     recent: { streamed?: number; error?: string | null; totalTokens?: number; costUsd?: number }[];
   };
+}
+
+function seedSpend(db: Db, createdAt: string, costUsd: number, project: string): void {
+  insertRequest(db, {
+    createdAt,
+    project,
+    model: "gpt-4o-mini",
+    usage: { promptTokens: 1, completionTokens: 0, cachedTokens: 0, totalTokens: 1 },
+    costUsd,
+    status: 200,
+    path: "/v1/chat/completions",
+  });
+}
+
+function testCalendarDayBounds(): void {
+  const mid = calendarDayBounds("America/New_York", new Date("2026-09-30T15:00:00.000Z"));
+  assert(mid.start.toISOString() === "2026-09-30T04:00:00.000Z", `ny midday start ${mid.start.toISOString()}`);
+  assert(mid.end.toISOString() === "2026-10-01T04:00:00.000Z", `ny midday end ${mid.end.toISOString()}`);
+
+  const beforeMidnight = calendarDayBounds("America/New_York", new Date("2026-09-30T03:30:00.000Z"));
+  assert(
+    beforeMidnight.start.toISOString() === "2026-09-29T04:00:00.000Z",
+    `ny late start ${beforeMidnight.start.toISOString()}`,
+  );
+
+  const spring = calendarDayBounds("America/New_York", new Date("2026-03-08T18:00:00.000Z"));
+  assert(spring.start.toISOString() === "2026-03-08T05:00:00.000Z", `spring start ${spring.start.toISOString()}`);
+  assert(spring.end.toISOString() === "2026-03-09T04:00:00.000Z", `spring end ${spring.end.toISOString()}`);
+
+  const fall = calendarDayBounds("America/New_York", new Date("2026-11-01T18:00:00.000Z"));
+  assert(fall.start.toISOString() === "2026-11-01T04:00:00.000Z", `fall start ${fall.start.toISOString()}`);
+  assert(fall.end.toISOString() === "2026-11-02T05:00:00.000Z", `fall end ${fall.end.toISOString()}`);
+
+  const utc = calendarDayBounds("UTC", new Date("2026-09-30T15:00:00.000Z"));
+  assert(utc.start.toISOString() === "2026-09-30T00:00:00.000Z", `utc start ${utc.start.toISOString()}`);
+  assert(utc.end.toISOString() === "2026-10-01T00:00:00.000Z", `utc end ${utc.end.toISOString()}`);
+}
+
+function testBudgetConfig(dir: string): void {
+  const path = join(dir, "period.json");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      budgets: { period: "lifetime", timezone: "Europe/Berlin", global: { softUsd: 1, hardUsd: 2 } },
+    }),
+  );
+  const savedPeriod = process.env.SPENDLIGHT_BUDGET_PERIOD;
+  const savedZone = process.env.SPENDLIGHT_BUDGET_TIMEZONE;
+  const origWarn = console.warn;
+  try {
+    delete process.env.SPENDLIGHT_BUDGET_PERIOD;
+    delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
+    const base = loadConfig(path);
+    assert(base.budgets.period === "lifetime", "file period lifetime");
+    assert(base.budgets.timezone === "Europe/Berlin", "file timezone");
+
+    const barePath = join(dir, "bare.json");
+    writeFileSync(barePath, JSON.stringify({ budgets: { global: { hardUsd: 1 } } }));
+    const bare = loadConfig(barePath);
+    assert(bare.budgets.period === "lifetime", "omitted period must stay lifetime");
+    assert(bare.budgets.timezone === "UTC", "omitted timezone defaults to UTC");
+
+    const dayPath = join(dir, "day-no-zone.json");
+    writeFileSync(dayPath, JSON.stringify({ budgets: { period: "day", global: { hardUsd: 1 } } }));
+    const warnings: string[] = [];
+    console.warn = (msg?: unknown) => {
+      warnings.push(String(msg));
+    };
+    const dayDefault = loadConfig(dayPath);
+    assert(dayDefault.budgets.period === "day", "day period from file");
+    assert(dayDefault.budgets.timezone === "UTC", "missing day timezone uses UTC");
+    assert(
+      warnings.some((w) => w.includes("UTC") && w.toLowerCase().includes("timezone")),
+      `missing timezone should warn, got ${warnings.join(" | ")}`,
+    );
+
+    process.env.SPENDLIGHT_BUDGET_PERIOD = "day";
+    process.env.SPENDLIGHT_BUDGET_TIMEZONE = "America/Chicago";
+    const overridden = loadConfig(path);
+    assert(overridden.budgets.period === "day", "env period overrides file");
+    assert(overridden.budgets.timezone === "America/Chicago", "env timezone overrides file");
+
+    process.env.SPENDLIGHT_BUDGET_TIMEZONE = "Not/AZone";
+    let threw = false;
+    try {
+      loadConfig(path);
+    } catch (err) {
+      threw = true;
+      const message = err instanceof Error ? err.message : String(err);
+      assert(message.includes("Not/AZone"), message);
+      assert(message.toLowerCase().includes("iana"), message);
+    }
+    assert(threw, "invalid timezone must fail startup");
+
+    delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
+    writeFileSync(
+      join(dir, "bad-zone.json"),
+      JSON.stringify({ budgets: { period: "day", timezone: "Mars/Olympus" } }),
+    );
+    threw = false;
+    try {
+      loadConfig(join(dir, "bad-zone.json"));
+    } catch (err) {
+      threw = true;
+      const message = err instanceof Error ? err.message : String(err);
+      assert(message.includes("Mars/Olympus"), message);
+    }
+    assert(threw, "invalid timezone in the config file must fail startup");
+
+    process.env.SPENDLIGHT_BUDGET_PERIOD = "week";
+    threw = false;
+    try {
+      loadConfig(barePath);
+    } catch (err) {
+      threw = true;
+      const message = err instanceof Error ? err.message : String(err);
+      assert(message.includes("week"), message);
+    }
+    assert(threw, "invalid period must fail startup");
+  } finally {
+    console.warn = origWarn;
+    if (savedPeriod == null) delete process.env.SPENDLIGHT_BUDGET_PERIOD;
+    else process.env.SPENDLIGHT_BUDGET_PERIOD = savedPeriod;
+    if (savedZone == null) delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
+    else process.env.SPENDLIGHT_BUDGET_TIMEZONE = savedZone;
+  }
+}
+
+function testDayLedgerWindow(dir: string): void {
+  const configPath = join(dir, "ledger-day.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      dbPath: ":memory:",
+      budgets: {
+        period: "day",
+        timezone: "America/New_York",
+        global: { softUsd: 1, hardUsd: 5 },
+        projects: { demo: { softUsd: null, hardUsd: 10 } },
+      },
+    }),
+  );
+  const config = loadConfig(configPath);
+  const db = openDb(":memory:");
+  const now = new Date("2026-09-30T15:00:00.000Z");
+  const window = spendWindow(config, now);
+  assert(window, "day spend window");
+  assert(window.startIso === "2026-09-30T04:00:00.000Z", window.startIso);
+  seedSpend(db, window.startIso, 1, "demo");
+  seedSpend(db, new Date(Date.parse(window.startIso) + 60_000).toISOString(), 3, "demo");
+  seedSpend(db, new Date(Date.parse(window.startIso) - 1).toISOString(), 100, "demo");
+  seedSpend(db, window.endIso, 100, "demo");
+
+  const day = evaluateBudget(db, config, "demo", now);
+  assert(Math.abs(day.globalSpend - 4) < 1e-9, `day global spend ${day.globalSpend}`);
+  assert(Math.abs(day.projectSpend - 4) < 1e-9, `day project spend ${day.projectSpend}`);
+  assert(day.status === "soft", `expected soft inside the day window, got ${day.status}`);
+  assert(day.message?.includes("today America/New_York"), day.message ?? "missing soft message");
+
+  const lifetime = evaluateBudget(db, { ...config, budgets: { ...config.budgets, period: "lifetime" } }, "demo", now);
+  assert(lifetime.globalSpend > 100, `lifetime spend should include other days, got ${lifetime.globalSpend}`);
+  assert(lifetime.status === "hard", `lifetime should be hard, got ${lifetime.status}`);
+  assert(!lifetime.message?.includes("today"), lifetime.message ?? "");
+  assert(lifetime.windowStart == null, "lifetime decision has no window");
+  closeDb(db);
+}
+
+function testReservationOutsideDay(dir: string): void {
+  const configPath = join(dir, "res-day.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      dbPath: ":memory:",
+      budgets: {
+        period: "day",
+        timezone: "America/New_York",
+        global: { softUsd: null, hardUsd: 1 },
+      },
+    }),
+  );
+  const config = loadConfig(configPath);
+  const db = openDb(":memory:");
+  const now = new Date("2026-06-15T04:10:00.000Z");
+  const window = spendWindow(config, now);
+  assert(window?.startIso === "2026-06-15T04:00:00.000Z", window?.startIso ?? "no window");
+  const heldAt = new Date(now.getTime() - 11 * 60 * 1000).toISOString();
+  assert(heldAt < window.startIso, "hold should be before local midnight");
+  db.prepare(`INSERT INTO reservations (id, created_at, project, cost_usd) VALUES (?, ?, ?, ?)`).run(
+    "old-hold",
+    heldAt,
+    "default",
+    50,
+  );
+  const dayAdmit = admitMutating(db, config, "default", null, now);
+  assert(dayAdmit.allowed, "day window should ignore a hold from before local midnight");
+  const lifeAdmit = admitMutating(
+    db,
+    { ...config, budgets: { ...config.budgets, period: "lifetime" } },
+    "default",
+    null,
+    now,
+  );
+  assert(!lifeAdmit.allowed, "lifetime should still count that in-flight hold");
+  closeDb(db);
+}
+
+async function testDayWindow(dir: string, mockUrl: string): Promise<void> {
+  await withApp(
+    dir,
+    "day-window",
+    mockUrl,
+    { softUsd: null, hardUsd: 0.04, period: "day", timezone: "America/New_York" },
+    async (base, app) => {
+      const window = spendWindow(app.config);
+      assert(window, "day config should expose a window");
+      seedSpend(app.db, new Date(Date.parse(window.startIso) - 1000).toISOString(), 9, "yesterday");
+
+      const first = await postChat(
+        base,
+        "demo",
+        JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "hi" }] }),
+      );
+      assert(first.status === 200, `day window should admit despite yesterday's spend, got ${first.status}`);
+      await first.text();
+
+      const second = await postChat(
+        base,
+        "demo",
+        JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "again" }] }),
+      );
+      assert(second.status === 402, `day window should block once today's spend hits hard, got ${second.status}`);
+      const blocked = (await second.json()) as { error?: { message?: string } };
+      assert(
+        blocked.error?.message?.includes("today America/New_York") === true,
+        blocked.error?.message ?? "missing day kill-switch message",
+      );
+
+      const summary = await summaryOf(base);
+      assert(summary.spendUsd > 9, `lifetime hero should include yesterday, got ${summary.spendUsd}`);
+      assert(summary.budget.globalSpend < 1, `budget meter should be today only, got ${summary.budget.globalSpend}`);
+      assert(summary.budget.globalSpend >= 0.04, `today spend should reach the hard cap, got ${summary.budget.globalSpend}`);
+      assert(summary.budget.status === "hard", summary.budget.status);
+      assert(summary.budget.period === "day", summary.budget.period);
+      assert(summary.budget.timezone === "America/New_York", summary.budget.timezone);
+      assert(summary.requests === 2, `seed plus admitted call, got ${summary.requests}`);
+
+      const md = await fetch(`${base}/receipt.md`).then((r) => r.text());
+      assert(md.includes("| Budget window | today (America/New_York) |"), "markdown receipt missing day window");
+      assert(md.includes("Spend in window"), "markdown receipt missing window spend");
+      const svg = await fetch(`${base}/receipt.svg`).then((r) => r.text());
+      assert(svg.includes("counted today"), "svg receipt missing day window");
+      assert(svg.includes("America/New_York"), "svg receipt missing timezone");
+      const badge = await fetch(`${base}/badge.svg`).then((r) => r.text());
+      assert(badge.includes("today"), "badge should show today's spend");
+      assert(!badge.includes("$9"), "badge should not use the lifetime total");
+    },
+  );
+}
+
+async function testLifetimeStillAccumulates(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "lifetime-old", mockUrl, { softUsd: null, hardUsd: 0.04 }, async (base, app) => {
+    assert(app.config.budgets.period === "lifetime", "omitted period must stay lifetime");
+    seedSpend(app.db, new Date(Date.now() - 36 * 60 * 60 * 1000).toISOString(), 9, "yesterday");
+    const first = await postChat(
+      base,
+      "demo",
+      JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "hi" }] }),
+    );
+    assert(first.status === 402, `lifetime should still block on older spend, got ${first.status}`);
+    const blocked = (await first.json()) as { error?: { message?: string } };
+    assert(!blocked.error?.message?.includes("today"), blocked.error?.message ?? "lifetime message");
+    const summary = await summaryOf(base);
+    assert(summary.requests === 1, `blocked call should not add a row, got ${summary.requests}`);
+    assert(summary.budget.period === "lifetime", summary.budget.period);
+    assert(summary.budget.windowStart == null, "lifetime summary should not set a window");
+    assert(summary.budget.globalSpend >= 9, `lifetime budget spend ${summary.budget.globalSpend}`);
+    const md = await fetch(`${base}/receipt.md`).then((r) => r.text());
+    assert(!md.includes("Budget window"), "lifetime receipt should not mention a day window");
+  });
+}
+
+async function testSoftWarnRefires(dir: string, mockUrl: string): Promise<void> {
+  await withApp(
+    dir,
+    "soft-day",
+    mockUrl,
+    { softUsd: 0.00001, hardUsd: 100, period: "day", timezone: "UTC" },
+    async (base, app) => {
+      const window = spendWindow(app.config);
+      assert(window, "soft day window");
+      const yesterday = new Date(Date.parse(window.startIso) - 1000).toISOString();
+      app.db
+        .prepare(`INSERT INTO events (created_at, type, project, message) VALUES (?, 'soft_warn', ?, ?)`)
+        .run(yesterday, "daywarn", "yesterday warning");
+      seedSpend(app.db, window.startIso, 0.001, "daywarn");
+      const body = JSON.stringify({
+        model: "gpt-4o-mini",
+        small: true,
+        messages: [{ role: "user", content: "hi" }],
+      });
+      const first = await postChat(base, "daywarn", body);
+      assert(first.status === 200, `soft day request ${first.status}`);
+      assert(first.headers.get("x-spendlight-budget-status") === "soft", "expected a soft warning");
+      const warning = first.headers.get("x-spendlight-budget-warning") ?? "";
+      assert(warning.includes("today UTC"), warning);
+      await first.text();
+      const mid = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
+      assert(mid.length === 2, `expected yesterday's warning plus a new one, got ${mid.length}`);
+
+      const second = await postChat(base, "daywarn", body);
+      assert(second.status === 200, `second soft request ${second.status}`);
+      await second.text();
+      const after = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
+      assert(after.length === 2, `soft_warn should dedupe inside the same day, got ${after.length}`);
+    },
+  );
+}
+
+async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "soft-life", mockUrl, { softUsd: 0.00001, hardUsd: 100 }, async (base, app) => {
+    const yesterday = new Date(Date.now() - 36 * 60 * 60 * 1000).toISOString();
+    app.db
+      .prepare(`INSERT INTO events (created_at, type, project, message) VALUES (?, 'soft_warn', ?, ?)`)
+      .run(yesterday, "life", "old warning");
+    seedSpend(app.db, yesterday, 0.001, "life");
+    const res = await postChat(
+      base,
+      "life",
+      JSON.stringify({ model: "gpt-4o-mini", small: true, messages: [{ role: "user", content: "hi" }] }),
+    );
+    assert(res.status === 200, `lifetime soft request ${res.status}`);
+    await res.text();
+    const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
+    assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
+  });
 }
 
 function readReq(req: IncomingMessage): Promise<string> {
