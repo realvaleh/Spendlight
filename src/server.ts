@@ -4,7 +4,7 @@ import { closeDb, listRequests, loadSummaryParts, openDb, type Db } from "./db.j
 import { evaluateBudget } from "./budget.js";
 import { dashboardHtml, FAVICON_SVG } from "./ui.js";
 import { badgeSvg, receiptMarkdown, receiptSvg } from "./receipts.js";
-import { proxyRequest, corsHeaders } from "./proxy.js";
+import { proxyRequest, corsHeaders, normalizeProjectTag } from "./proxy.js";
 
 export type App = {
   server: Server;
@@ -80,19 +80,20 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
     return sendJson(res, 200, buildSummary(db, config), req);
   }
   if (req.method === "GET" && url.pathname === "/api/export.csv") {
+    const project = queryProject(url);
     res.setHeader("cache-control", "no-cache");
-    res.setHeader("content-disposition", 'attachment; filename="spendlight-ledger.csv"');
-    return send(res, 200, "text/csv; charset=utf-8", ledgerCsv(listRequests(db)), req);
+    res.setHeader("content-disposition", `attachment; filename="${csvFilename(project)}"`);
+    return send(res, 200, "text/csv; charset=utf-8", ledgerCsv(listRequests(db, project)), req);
   }
   if (req.method === "GET" && url.pathname === "/receipt.md") {
-    return send(res, 200, "text/markdown; charset=utf-8", receiptMarkdown(buildSummary(db, config)), req);
+    return send(res, 200, "text/markdown; charset=utf-8", receiptMarkdown(buildSummary(db, config, queryProject(url))), req);
   }
   if (req.method === "GET" && url.pathname === "/receipt.svg") {
-    return send(res, 200, "image/svg+xml; charset=utf-8", receiptSvg(buildSummary(db, config)), req);
+    return send(res, 200, "image/svg+xml; charset=utf-8", receiptSvg(buildSummary(db, config, queryProject(url))), req);
   }
   if (req.method === "GET" && url.pathname === "/badge.svg") {
     res.setHeader("cache-control", "no-cache");
-    return send(res, 200, "image/svg+xml; charset=utf-8", badgeSvg(buildSummary(db, config)), req);
+    return send(res, 200, "image/svg+xml; charset=utf-8", badgeSvg(buildSummary(db, config, queryProject(url))), req);
   }
 
   if (url.pathname.startsWith("/v1/") || url.pathname === "/v1") {
@@ -103,14 +104,27 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
   sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } }, req);
 }
 
-export function buildSummary(db: Db, config: Config): Summary {
-  const parts = loadSummaryParts(db);
-  const budget = evaluateBudget(db, config, "default");
+export function buildSummary(db: Db, config: Config, project?: string): Summary {
+  const parts = loadSummaryParts(db, project);
+  const budget = evaluateBudget(db, config, project ?? "default");
   return {
     generatedAt: new Date().toISOString(),
     ...parts,
+    scopeProject: project === undefined ? null : project,
     budget,
   };
+}
+
+/** Absent `project` stays unscoped. Present values use request-tag rules and do not become `default`. */
+function queryProject(url: URL): string | undefined {
+  if (!url.searchParams.has("project")) return undefined;
+  return normalizeProjectTag(url.searchParams.get("project") ?? "");
+}
+
+function csvFilename(project: string | undefined): string {
+  if (!project) return "spendlight-ledger.csv";
+  const slug = project.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug ? `spendlight-${slug}.csv` : "spendlight-ledger.csv";
 }
 
 function send(res: ServerResponse, status: number, type: string, body: string, req: IncomingMessage): void {

@@ -205,11 +205,11 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 | URL | What |
 | --- | --- |
 | `/` | Dashboard (spend, budgets, recent requests) |
-| `/receipt.md` | Markdown receipt |
-| `/receipt.svg` | Paper-style SVG receipt |
-| `/badge.svg` | Shields-style badge for a local README |
+| `/receipt.md` | Markdown receipt (`?project=` scopes one tag) |
+| `/receipt.svg` | Paper-style SVG receipt (`?project=` scopes one tag) |
+| `/badge.svg` | Shields-style badge for a local README (`?project=` for one tag) |
 | `/api/summary` | JSON for the same numbers |
-| `/api/export.csv` | Full spend ledger as CSV |
+| `/api/export.csv` | Spend ledger as CSV (`?project=` for one tag) |
 | `/health` | Liveness |
 
 Sample receipt (checked in):
@@ -220,6 +220,15 @@ Sample receipt (checked in):
 curl -s http://127.0.0.1:8787/receipt.md
 curl -s http://127.0.0.1:8787/receipt.svg -o receipt.svg
 curl -s http://127.0.0.1:8787/badge.svg -o badge.svg
+```
+
+Pass `?project=<tag>` to scope the CSV, receipts, or badge to one `x-spendlight-project` tag. The tag is sanitized the same way as request tags. Omit it for the whole ledger. A tag that is unknown, or that sanitizes to nothing, returns an empty scope (no rows) rather than an error. The project badge compares that tag's window or lifetime spend to its project hard cap when configured, otherwise to the global hard cap. Scoped receipts still show global budget lines. By project on the dashboard links to the same three URLs.
+
+```bash
+curl -s "http://127.0.0.1:8787/api/export.csv?project=demo" -o demo.csv
+curl -s "http://127.0.0.1:8787/receipt.md?project=demo"
+curl -s "http://127.0.0.1:8787/receipt.svg?project=demo" -o demo-receipt.svg
+curl -s "http://127.0.0.1:8787/badge.svg?project=demo" -o demo-badge.svg
 ```
 
 Local README badge (only useful on a machine that can reach the proxy):

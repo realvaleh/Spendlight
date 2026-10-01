@@ -228,22 +228,30 @@ const REQUEST_COLUMNS = `id, created_at AS createdAt, project, model,
               cached_tokens AS cachedTokens, total_tokens AS totalTokens,
               cost_usd AS costUsd, status, error, upstream_id AS upstreamId, path, streamed`;
 
-export function listRecent(db: Db, limit = 50): LedgerRow[] {
-  const rows = db
-    .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests ORDER BY created_at DESC LIMIT ?`)
-    .all(limit) as LedgerRow[];
+export function listRecent(db: Db, limit = 50, project?: string): LedgerRow[] {
+  const rows = (
+    project == null
+      ? db.prepare(`SELECT ${REQUEST_COLUMNS} FROM requests ORDER BY created_at DESC LIMIT ?`).all(limit)
+      : db
+          .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests WHERE project = ? ORDER BY created_at DESC LIMIT ?`)
+          .all(project, limit)
+  ) as LedgerRow[];
   return rows.map(normalizeRow);
 }
 
-/** Full ledger, oldest first, for CSV export. */
-export function listRequests(db: Db): LedgerRow[] {
-  const rows = db
-    .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests ORDER BY created_at ASC, id ASC`)
-    .all() as LedgerRow[];
+/** Ledger rows, oldest first, for CSV export. Pass a project tag to export one bucket. */
+export function listRequests(db: Db, project?: string): LedgerRow[] {
+  const rows = (
+    project == null
+      ? db.prepare(`SELECT ${REQUEST_COLUMNS} FROM requests ORDER BY created_at ASC, id ASC`).all()
+      : db
+          .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests WHERE project = ? ORDER BY created_at ASC, id ASC`)
+          .all(project)
+  ) as LedgerRow[];
   return rows.map(normalizeRow);
 }
 
-export function loadSummaryParts(db: Db): {
+export function loadSummaryParts(db: Db, project?: string): {
   spendUsd: number;
   requests: number;
   tokens: number;
@@ -253,7 +261,9 @@ export function loadSummaryParts(db: Db): {
   recent: LedgerRow[];
   events: { createdAt: string; type: string; project: string; message: string }[];
 } {
-  const totals = db.prepare(`SELECT COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens FROM requests`).get() as {
+  const where = project == null ? "" : " WHERE project = ?";
+  const args = project == null ? [] : [project];
+  const totals = db.prepare(`SELECT COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens FROM requests${where}`).get(...args) as {
     spendUsd: number;
     requests: number;
     tokens: number;
@@ -261,21 +271,21 @@ export function loadSummaryParts(db: Db): {
   const byProject = db
     .prepare(
       `SELECT project, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens
-       FROM requests GROUP BY project ORDER BY spendUsd DESC`,
+       FROM requests${where} GROUP BY project ORDER BY spendUsd DESC`,
     )
-    .all() as { project: string; spendUsd: number; requests: number; tokens: number }[];
+    .all(...args) as { project: string; spendUsd: number; requests: number; tokens: number }[];
   const byModel = db
     .prepare(
       `SELECT model, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens
-       FROM requests GROUP BY model ORDER BY spendUsd DESC`,
+       FROM requests${where} GROUP BY model ORDER BY spendUsd DESC`,
     )
-    .all() as { model: string; spendUsd: number; requests: number; tokens: number }[];
+    .all(...args) as { model: string; spendUsd: number; requests: number; tokens: number }[];
   const daily = db
     .prepare(
       `SELECT substr(created_at, 1, 10) AS day, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests
-       FROM requests GROUP BY day ORDER BY day ASC`,
+       FROM requests${where} GROUP BY day ORDER BY day ASC`,
     )
-    .all() as { day: string; spendUsd: number; requests: number }[];
+    .all(...args) as { day: string; spendUsd: number; requests: number }[];
   const events = db
     .prepare(
       `SELECT created_at AS createdAt, type, project, message FROM events ORDER BY id DESC LIMIT 20`,
@@ -288,7 +298,7 @@ export function loadSummaryParts(db: Db): {
     byProject: byProject.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
     byModel: byModel.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
     daily: daily.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests) })),
-    recent: listRecent(db, 40),
+    recent: listRecent(db, 40, project),
     events,
   };
 }

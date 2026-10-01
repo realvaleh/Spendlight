@@ -74,6 +74,11 @@ export type BudgetDecision = {
 
 export type Summary = {
   generatedAt: string;
+  /**
+   * Set when the summary is limited to one project tag.
+   * Null is the full ledger. An empty string is a rejected query (matches nothing).
+   */
+  scopeProject: string | null;
   spendUsd: number;
   requests: number;
   tokens: number;
