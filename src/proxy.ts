@@ -414,15 +414,22 @@ function resolveProject(req: IncomingMessage, url: URL, body: Buffer): string {
   return "default";
 }
 
-/** Safe for headers, SQLite grouping, and dashboard HTML. Client-chosen tags are not auth. */
-export function sanitizeProject(value: string): string {
-  const cleaned = value
+/**
+ * Same character rules as request tags. Empty when nothing usable remains.
+ * Request tagging coerces that to `default`; export/receipt queries do not.
+ */
+export function normalizeProjectTag(value: string): string {
+  return value
     .replace(/[\r\n\0]/g, "")
     .replace(/[^A-Za-z0-9._/\- ]+/g, "")
     .trim()
     .slice(0, 64)
     .trim();
-  return cleaned || "default";
+}
+
+/** Safe for headers, SQLite grouping, and dashboard HTML. Client-chosen tags are not auth. */
+export function sanitizeProject(value: string): string {
+  return normalizeProjectTag(value) || "default";
 }
 
 function forwardHeaders(req: IncomingMessage, config: Config, contentLength: number): Record<string, string> {

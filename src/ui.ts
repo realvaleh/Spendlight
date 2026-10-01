@@ -68,7 +68,9 @@ export function dashboardHtml(): string {
     .row-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
     .links { display: flex; gap: 10px; flex-wrap: wrap; }
     a.btn { color: var(--ink); text-decoration: none; font-size: 12px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; background: #fff8ea; }
+    a.btn.mini { font-size: 11px; padding: 3px 8px; }
     a.btn:hover { border-color: var(--ink); }
+    .proj-links { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
     footer { margin-top: 22px; color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
     .empty { padding: 28px 8px; color: var(--muted); font-family: var(--serif); font-style: italic; }
     code { font-family: var(--mono); font-size: 12px; background: var(--paper-2); padding: 1px 5px; border-radius: 4px; }
@@ -208,7 +210,7 @@ export function dashboardHtml(): string {
       const proj = table(
         [{label:"Project"},{label:"Spend",num:true},{label:"Reqs",num:true}],
         s.byProject.map(p => [
-          esc(p.project) + '<div class="bar"><i style="width:' + (p.spendUsd / maxP * 100) + '%"></i></div>',
+          esc(p.project) + projectLinks(p.project) + '<div class="bar"><i style="width:' + (p.spendUsd / maxP * 100) + '%"></i></div>',
           fmtMoney(p.spendUsd),
           p.requests
         ])
@@ -233,6 +235,14 @@ export function dashboardHtml(): string {
       $("events").innerHTML = s.events.length
         ? s.events.map(e => "<li><strong>" + esc(e.type) + "</strong> · " + esc(e.project) + " · " + esc(e.message) + "</li>").join("")
         : '<li class="empty" style="border:0;padding-left:0">None yet.</li>';
+    }
+    function projectLinks(name) {
+      const q = encodeURIComponent(name);
+      return '<div class="proj-links">' +
+        '<a class="btn mini" href="/receipt.md?project=' + q + '">Markdown</a>' +
+        '<a class="btn mini" href="/receipt.svg?project=' + q + '">SVG</a>' +
+        '<a class="btn mini" href="/api/export.csv?project=' + q + '">CSV</a>' +
+        '</div>';
     }
     function budgetCopy(s) {
       const b = s.budget;

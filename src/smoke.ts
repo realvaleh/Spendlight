@@ -8,7 +8,7 @@ import { calendarDayBounds } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
-import { joinUpstream, sanitizeProject } from "./proxy.js";
+import { joinUpstream, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
   prompt_tokens: 100_000,
@@ -66,6 +66,9 @@ async function main(): Promise<void> {
   assert(!sanitizeProject("demo\r\nX-Injected: 1").includes("\n"), "CR/LF stripped from project");
   assert(!sanitizeProject("<script>alert(1)</script>").includes("<"), "HTML stripped from project");
   assert(sanitizeProject("   ") === "default", "blank project becomes default");
+  assert(normalizeProjectTag("  demo  ") === "demo", "query tag trims like a request tag");
+  assert(normalizeProjectTag("@@@") === "", "empty garbage stays empty for scoped queries");
+  assert(sanitizeProject("@@@") === "default", "request tags still fall back to default");
   assert(
     joinUpstream("https://api.openai.com/v1", "/v1//evil.example/x") ===
       "https://api.openai.com/v1/evil.example/x",
@@ -268,6 +271,9 @@ async function main(): Promise<void> {
     assert(dash.includes("/api/summary"), "dashboard missing summary fetch");
     assert(dash.includes('href="/api/export.csv"'), "dashboard missing csv download");
     assert(dash.includes("Download CSV"), "dashboard missing csv label");
+    assert(dash.includes('href="/receipt.md?project='), "dashboard missing scoped markdown link");
+    assert(dash.includes('href="/receipt.svg?project='), "dashboard missing scoped svg link");
+    assert(dash.includes('href="/api/export.csv?project='), "dashboard missing scoped csv link");
     assert(dash.includes("const esc"), "dashboard should HTML-escape untrusted fields");
     assert(dash.includes("Today ("), "dashboard should name the day window");
     assert(dash.includes("Estimated spend · lifetime"), "dashboard should label lifetime hero spend");
@@ -286,8 +292,9 @@ async function main(): Promise<void> {
     await testLifetimeStillAccumulates(dir, mockUrl);
     await testSoftWarnRefires(dir, mockUrl);
     await testSoftWarnLifetimeDedupe(dir, mockUrl);
+    await testProjectScope(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window");
+    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, project scope");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -394,6 +401,7 @@ type SmokeBudgets = {
   hardUsd: number | null;
   period?: "lifetime" | "day";
   timezone?: string;
+  projects?: Record<string, { softUsd: number | null; hardUsd: number | null }>;
 };
 
 async function withApp(
@@ -416,6 +424,7 @@ async function withApp(
         period: budgets.period,
         timezone: budgets.timezone,
         global: { softUsd: budgets.softUsd, hardUsd: budgets.hardUsd },
+        projects: budgets.projects,
       },
     }),
   );
@@ -780,6 +789,147 @@ async function testSoftWarnRefires(dir: string, mockUrl: string): Promise<void> 
       assert(after.length === 2, `soft_warn should dedupe inside the same day, got ${after.length}`);
     },
   );
+}
+
+async function testProjectScope(dir: string, mockUrl: string): Promise<void> {
+  await withApp(
+    dir,
+    "project-scope",
+    mockUrl,
+    {
+      softUsd: 1,
+      hardUsd: 10,
+      projects: { demo: { softUsd: 0.5, hardUsd: 2 } },
+    },
+    async (base, app) => {
+      const t0 = Date.parse("2026-01-15T12:00:00.000Z");
+      seedSpend(app.db, new Date(t0).toISOString(), 1.25, "demo");
+      seedSpend(app.db, new Date(t0 + 1000).toISOString(), 3, "other");
+      seedSpend(app.db, new Date(t0 + 2000).toISOString(), 0.5, "demo");
+
+      const allCsv = await fetch(`${base}/api/export.csv`);
+      assert(allCsv.status === 200, `unscoped csv ${allCsv.status}`);
+      assert((allCsv.headers.get("content-disposition") ?? "").includes("spendlight-ledger.csv"), "unscoped filename");
+      const allText = await allCsv.text();
+      const allLines = csvLines(allText);
+      assert(allLines.length === 4, `unscoped csv rows ${allLines.length}`);
+      assert(allLines.filter((line) => line.includes(",demo,")).length === 2, "unscoped csv demo rows");
+      assert(allLines.some((line) => line.includes(",other,")), "unscoped csv missing other");
+
+      const demoCsv = await fetch(`${base}/api/export.csv?project=demo`);
+      assert(demoCsv.status === 200, `demo csv ${demoCsv.status}`);
+      assert((demoCsv.headers.get("content-type") ?? "").includes("text/csv"), "demo csv type");
+      assert(
+        (demoCsv.headers.get("content-disposition") ?? "").includes("spendlight-demo.csv"),
+        demoCsv.headers.get("content-disposition") ?? "missing disposition",
+      );
+      const demoLines = csvLines(await demoCsv.text());
+      assert(demoLines.length === 3, `demo csv should be header + 2 rows, got ${demoLines.length}`);
+      assert(demoLines[0] === allLines[0], "scoped csv header changed");
+      assert(demoLines.every((line, i) => i === 0 || line.includes(",demo,")), "demo csv leaked another project");
+      assert(!demoLines.some((line) => line.includes(",other,")), "demo csv includes other");
+
+      const demoMd = await fetch(`${base}/receipt.md?project=demo`).then((r) => r.text());
+      assert(demoMd.includes("Project **demo**"), demoMd);
+      assert(demoMd.includes("| Total spend | $1.75 |"), demoMd);
+      assert(demoMd.includes("| `gpt-4o-mini` | $1.75 |"), demoMd);
+      assert(demoMd.includes("| Project hard | $2.00 |"), demoMd);
+      assert(demoMd.includes("| Project soft | $0.5000 |"), demoMd);
+      assert(demoMd.includes("| Global spend | $4.75 |"), demoMd);
+      assert(!demoMd.includes("| other |"), "scoped receipt listed another project");
+
+      const allMd = await fetch(`${base}/receipt.md`).then((r) => r.text());
+      assert(allMd.includes("| Total spend | $4.75 |"), allMd);
+      assert(allMd.includes("| other |"), "unscoped receipt missing other");
+      assert(!allMd.includes("Project **"), "unscoped receipt should not name a scope");
+      assert(!allMd.includes("Project hard"), "unscoped receipt should not add project cap lines");
+
+      const demoSvg = await fetch(`${base}/receipt.svg?project=demo`).then((r) => r.text());
+      assert(demoSvg.includes("spend receipt · demo"), demoSvg);
+      assert(demoSvg.includes("project hard"), demoSvg);
+      assert(demoSvg.includes("$1.75"), demoSvg);
+      assert(!demoSvg.includes("$3.00"), "scoped svg showed the other project's spend");
+
+      const demoBadge = await fetch(`${base}/badge.svg?project=demo`).then((r) => r.text());
+      assert(demoBadge.includes("$1.75 / $2.00"), demoBadge);
+      const otherBadge = await fetch(`${base}/badge.svg?project=other`).then((r) => r.text());
+      assert(otherBadge.includes("$3.00 / $10.00"), otherBadge);
+      const allBadge = await fetch(`${base}/badge.svg`).then((r) => r.text());
+      assert(allBadge.includes("$4.75 / $10.00"), allBadge);
+      assert(!allBadge.includes("today"), "lifetime badge should not say today");
+
+      const missingCsv = await fetch(`${base}/api/export.csv?project=missing-tag`);
+      assert(missingCsv.status === 200, `missing project csv ${missingCsv.status}`);
+      assert(csvLines(await missingCsv.text()).length === 1, "unknown project should be a header-only csv");
+      const missingMd = await fetch(`${base}/receipt.md?project=missing-tag`);
+      assert(missingMd.status === 200, `missing project receipt ${missingMd.status}`);
+      const missingText = await missingMd.text();
+      assert(missingText.includes("| Total spend | $0.000000 |"), missingText);
+      assert(!missingText.includes("gpt-4o-mini"), "unknown project receipt leaked models");
+
+      const garbage = await fetch(`${base}/receipt.md?project=${encodeURIComponent("@@@")}`);
+      assert(garbage.status === 200, `garbage project status ${garbage.status}`);
+      const garbageText = await garbage.text();
+      assert(garbageText.includes("Project **—**"), garbageText);
+      assert(garbageText.includes("| Total spend | $0.000000 |"), garbageText);
+      assert(!garbageText.includes("$1.75"), "garbage project query returned real spend");
+      const garbageCsv = await fetch(`${base}/api/export.csv?project=`);
+      assert(garbageCsv.status === 200, `empty project csv ${garbageCsv.status}`);
+      assert(csvLines(await garbageCsv.text()).length === 1, "empty project query should not dump the ledger");
+
+      const cleaned = await fetch(`${base}/api/export.csv?project=${encodeURIComponent("demo\r\n")}`);
+      assert(cleaned.status === 200, `sanitized project csv ${cleaned.status}`);
+      assert(csvLines(await cleaned.text()).length === 3, "trailing CR/LF should sanitize to the demo tag");
+      const injected = await fetch(`${base}/api/export.csv?project=${encodeURIComponent("demo\r\nX")}`);
+      assert(injected.status === 200, `injected project csv ${injected.status}`);
+      assert(csvLines(await injected.text()).length === 1, "a sanitized tag that matches nothing should be empty, not a 500");
+    },
+  );
+
+  await withApp(
+    dir,
+    "project-scope-day",
+    mockUrl,
+    {
+      softUsd: null,
+      hardUsd: 50,
+      period: "day",
+      timezone: "UTC",
+      projects: { demo: { softUsd: null, hardUsd: 2 } },
+    },
+    async (base, app) => {
+      const window = spendWindow(app.config);
+      assert(window, "day scope window");
+      seedSpend(app.db, new Date(Date.parse(window.startIso) - 1000).toISOString(), 9, "demo");
+      seedSpend(app.db, window.startIso, 1, "demo");
+      seedSpend(app.db, window.startIso, 4, "other");
+
+      const badge = await fetch(`${base}/badge.svg?project=demo`).then((r) => r.text());
+      assert(badge.includes("today $1.00 / $2.00"), badge);
+      assert(!badge.includes("$9"), "project badge used lifetime or yesterday's spend");
+
+      const md = await fetch(`${base}/receipt.md?project=demo`).then((r) => r.text());
+      assert(md.includes("| Total spend | $10.00 |"), md);
+      assert(md.includes("| Spend in window | $1.00 |"), md);
+      assert(md.includes("| Global spend in window | $5.00 |"), md);
+      assert(md.includes("| Project hard | $2.00 |"), md);
+      assert(!md.includes("| other |"), "day scoped receipt listed other");
+
+      const all = await fetch(`${base}/receipt.md`).then((r) => r.text());
+      assert(all.includes("| Total spend | $14.00 |"), all);
+      assert(all.includes("| Spend in window | $5.00 |"), all);
+      assert(!all.includes("Global spend in window"), "unscoped day receipt grew a global-window line");
+      assert(!all.includes("Project hard"), "unscoped day receipt showed a project cap");
+
+      const svg = await fetch(`${base}/receipt.svg?project=demo`).then((r) => r.text());
+      assert(svg.includes("$1.00 counted today") || svg.includes("$1.000000 counted today"), svg);
+      assert(svg.includes("project hard"), svg);
+    },
+  );
+}
+
+function csvLines(csv: string): string[] {
+  return csv.split(/\r?\n/).filter((line) => line.length > 0);
 }
 
 async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise<void> {
