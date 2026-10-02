@@ -66,17 +66,17 @@ function asString(raw: unknown): string | undefined {
 function parsePeriod(raw: string | undefined): BudgetPeriod {
   if (raw == null || raw.trim() === "") return "lifetime";
   const period = raw.trim();
-  if (period === "lifetime" || period === "day") return period;
+  if (period === "lifetime" || period === "day" || period === "month") return period;
   throw new Error(
-    `Invalid budget period "${period}". Expected "lifetime" or "day" (budgets.period or SPENDLIGHT_BUDGET_PERIOD).`,
+    `Invalid budget period "${period}". Expected "lifetime", "day", or "month" (budgets.period or SPENDLIGHT_BUDGET_PERIOD).`,
   );
 }
 
 function parseTimeZone(raw: string | undefined, period: BudgetPeriod): string {
   if (raw == null || raw.trim() === "") {
-    if (period === "day") {
+    if (period === "day" || period === "month") {
       console.warn(
-        'Spendlight: budget period is "day" but no timezone was set. Using UTC. Set budgets.timezone or SPENDLIGHT_BUDGET_TIMEZONE (IANA, e.g. America/New_York).',
+        `Spendlight: budget period is "${period}" but no timezone was set. Using UTC. Set budgets.timezone or SPENDLIGHT_BUDGET_TIMEZONE (IANA, e.g. America/New_York).`,
       );
     }
     return "UTC";
@@ -185,8 +185,8 @@ Env:
   SPENDLIGHT_CONFIG              Config JSON path
   SPENDLIGHT_SOFT_BUDGET_USD     Global soft budget
   SPENDLIGHT_HARD_BUDGET_USD     Global hard budget (kill-switch)
-  SPENDLIGHT_BUDGET_PERIOD       lifetime (default) or day
-  SPENDLIGHT_BUDGET_TIMEZONE     IANA zone when period is day (e.g. America/New_York)
+  SPENDLIGHT_BUDGET_PERIOD       lifetime (default), day, or month
+  SPENDLIGHT_BUDGET_TIMEZONE     IANA zone when period is day or month (e.g. America/New_York)
 
 Bind to 127.0.0.1 (the default). The dashboard, receipts, and /api/summary have no auth.
 `;

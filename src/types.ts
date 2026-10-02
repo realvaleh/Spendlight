@@ -9,8 +9,8 @@ export type BudgetLimit = {
   hardUsd: number | null;
 };
 
-/** `lifetime` sums the whole ledger. `day` sums the current calendar day in `timezone`. */
-export type BudgetPeriod = "lifetime" | "day";
+/** `lifetime` sums the whole ledger. `day` and `month` sum the current calendar window in `timezone`. */
+export type BudgetPeriod = "lifetime" | "day" | "month";
 
 export type Config = {
   host: string;
@@ -23,7 +23,7 @@ export type Config = {
     global: BudgetLimit;
     projects: Record<string, BudgetLimit>;
     period: BudgetPeriod;
-    /** IANA zone used when period is `day`. `UTC` when unset. */
+    /** IANA zone used when period is `day` or `month`. `UTC` when unset. */
     timezone: string;
   };
   pricing: Record<string, ModelPrice>;
@@ -66,9 +66,9 @@ export type BudgetDecision = {
   triggeredBy: "project" | "global" | null;
   period: BudgetPeriod;
   timezone: string;
-  /** Inclusive UTC start of the day window. Null when period is lifetime. */
+  /** Inclusive UTC start of the calendar window. Null when period is lifetime. */
   windowStart: string | null;
-  /** Exclusive UTC end of the day window. Null when period is lifetime. */
+  /** Exclusive UTC end of the calendar window. Null when period is lifetime. */
   windowEnd: string | null;
 };
 

@@ -8,6 +8,16 @@ export function calendarDayBounds(timeZone: string, now: Date): { start: Date; e
   };
 }
 
+/** Inclusive start and exclusive end of the calendar month containing `now`, as UTC instants. */
+export function calendarMonthBounds(timeZone: string, now: Date): { start: Date; end: Date } {
+  const today = calendarDate(timeZone, now);
+  const first = { year: today.year, month: today.month, day: 1 };
+  return {
+    start: zonedMidnightUtc(timeZone, first),
+    end: zonedMidnightUtc(timeZone, addCalendarMonths(first, 1)),
+  };
+}
+
 export function assertIanaTimeZone(timeZone: string): void {
   try {
     new Intl.DateTimeFormat("en-US", { timeZone }).format(0);
@@ -27,6 +37,11 @@ function calendarDate(timeZone: string, now: Date): Ymd {
 
 function addCalendarDays(date: Ymd, days: number): Ymd {
   const utc = new Date(Date.UTC(date.year, date.month - 1, date.day + days));
+  return { year: utc.getUTCFullYear(), month: utc.getUTCMonth() + 1, day: utc.getUTCDate() };
+}
+
+function addCalendarMonths(date: Ymd, months: number): Ymd {
+  const utc = new Date(Date.UTC(date.year, date.month - 1 + months, date.day));
   return { year: utc.getUTCFullYear(), month: utc.getUTCMonth() + 1, day: utc.getUTCDate() };
 }
 
