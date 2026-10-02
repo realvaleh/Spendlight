@@ -19,6 +19,13 @@
       }
     }
   },
+  "monthExample": {
+    "note": "Ignored by Spendlight. Set budgets.period to month to count the current calendar month; it resets at local midnight on the 1st.",
+    "period": "month",
+    "timezone": "America/New_York",
+    "global": { "softUsd": 50, "hardUsd": 100 },
+    "projects": { "demo": { "softUsd": 10, "hardUsd": 20 } }
+  },
   "pricing": {
     "gpt-4o-mini": { "inputPerMillion": 0.15, "outputPerMillion": 0.6, "cachedInputPerMillion": 0.075 }
   }

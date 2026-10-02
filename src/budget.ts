@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { BudgetDecision, BudgetLimit, BudgetPeriod, Config } from "./types.js";
 import type { Preflight } from "./pricing.js";
-import { calendarDayBounds } from "./day.js";
+import { calendarDayBounds, calendarMonthBounds } from "./day.js";
 import {
   insertReservation,
   purgeStaleReservations,
@@ -21,11 +21,15 @@ export type Admission = {
   reserveUsd: number;
 };
 
-/** Null for a lifetime budget. Otherwise the current calendar day in the configured timezone. */
+/** Null for a lifetime budget. Otherwise the current calendar day or month in the configured timezone. */
 export function spendWindow(config: Config, now = new Date()): SpendWindow | null {
-  if (config.budgets.period !== "day") return null;
-  const { start, end } = calendarDayBounds(config.budgets.timezone, now);
-  return { startIso: start.toISOString(), endIso: end.toISOString() };
+  const period = config.budgets.period;
+  if (period !== "day" && period !== "month") return null;
+  const bounds =
+    period === "day"
+      ? calendarDayBounds(config.budgets.timezone, now)
+      : calendarMonthBounds(config.budgets.timezone, now);
+  return { startIso: bounds.start.toISOString(), endIso: bounds.end.toISOString() };
 }
 
 export function evaluateBudget(db: Db, config: Config, project: string, now = new Date()): BudgetDecision {
@@ -136,7 +140,7 @@ export function admitMutating(
     const limit = triggeredBy === "project" ? snap.projectLimit.hardUsd : snap.globalLimit.hardUsd;
     if (preflight.promptCostUsd > room || (preflight.outputBounded && preflight.costUsd > room)) {
       const estimate = preflight.outputBounded ? preflight.costUsd : preflight.promptCostUsd;
-      const where = snap.period === "day" ? `, today ${snap.timezone}` : "";
+      const where = windowClause(snap);
       const label = triggeredBy === "project" ? project : "global";
       const message = `Spendlight hard budget exceeded (${triggeredBy} '${label}'${where}): preflight ${fmt(estimate)} exceeds remaining ${fmt(room)} (${fmt(spend)} / ${fmt(limit)}). Kill-switch is on; further completions are rejected.`;
       return {
@@ -239,7 +243,9 @@ function windowMeta(config: Config, window: SpendWindow | null): {
 }
 
 function windowClause(meta: { period: BudgetPeriod; timezone: string }): string {
-  return meta.period === "day" ? `, today ${meta.timezone}` : "";
+  if (meta.period === "day") return `, today ${meta.timezone}`;
+  if (meta.period === "month") return `, this month ${meta.timezone}`;
+  return "";
 }
 
 function hardMessage(

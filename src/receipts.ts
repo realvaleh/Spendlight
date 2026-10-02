@@ -61,28 +61,28 @@ export function receiptSvg(summary: Summary): string {
   const rowH = 22;
   const header = 168;
   const tableH = Math.max(rows.length, 1) * rowH;
-  const day = summary.budget.period === "day";
+  const windowLabel = calendarWindowLabel(summary.budget.period);
   const scoped = summary.scopeProject != null;
   const projectName = summary.scopeProject ?? "";
   const projectHard = scoped && projectName ? summary.budget.projectLimit.hardUsd : null;
   const projectSoft = scoped && projectName ? summary.budget.projectLimit.softUsd : null;
   const hardValue = projectHard != null ? projectHard : summary.budget.globalLimit.hardUsd;
-  const hardLabel = projectHard != null ? "project hard" : day ? "hard budget today" : "hard budget";
+  const hardLabel = projectHard != null ? "project hard" : windowLabel ? `hard budget ${windowLabel}` : "hard budget";
   const windowSpend = scoped ? summary.budget.projectSpend : summary.budget.globalSpend;
   const tail: string[] = [];
   if (scoped) {
-    const globalLabel = day ? "global today" : "global spend";
+    const globalLabel = windowLabel ? `global ${windowLabel}` : "global spend";
     tail.push(`${globalLabel} ${fmt(summary.budget.globalSpend)} / ${fmt(summary.budget.globalLimit.hardUsd)}`);
     if (projectSoft != null) tail.push(`project soft ${fmt(projectSoft)}`);
   }
-  const extra = (day ? 22 : 0) + tail.length * 22;
+  const extra = (windowLabel ? 22 : 0) + tail.length * 22;
   const height = header + tableH + 150 + extra;
   const total = fmt(summary.spendUsd);
   const hard = fmt(hardValue);
   const status = statusLabel(summary);
   const sub = scoped && projectName ? `spend receipt · ${truncate(projectName, 24)}` : "spend receipt";
   const aria = scoped && projectName ? `Spendlight receipt for ${projectName}` : "Spendlight receipt";
-  const tailY0 = header + tableH + 120 + (day ? 22 : 0);
+  const tailY0 = header + tableH + 120 + (windowLabel ? 22 : 0);
   const tailSvg = tail
     .map((line, i) => `<text x="48" y="${tailY0 + i * 22}" class="muted">${escapeXml(line)}</text>`)
     .join("\n");
@@ -125,7 +125,7 @@ export function receiptSvg(summary: Summary): string {
   <text x="432" y="${header + tableH + 48}" class="total amount">${escapeXml(total)}</text>
   <text x="48" y="${header + tableH + 76}" class="muted">requests ${summary.requests} · tokens ${summary.tokens.toLocaleString("en-US")}</text>
   <text x="48" y="${header + tableH + 98}" class="muted">${escapeXml(hardLabel)} ${escapeXml(hard)}</text>
-  ${day ? `<text x="48" y="${header + tableH + 120}" class="muted">window ${escapeXml(summary.budget.timezone)} · ${escapeXml(fmt(windowSpend))} counted today</text>` : ""}
+  ${windowLabel ? `<text x="48" y="${header + tableH + 120}" class="muted">window ${escapeXml(summary.budget.timezone)} · ${escapeXml(fmt(windowSpend))} counted ${escapeXml(windowLabel)}</text>` : ""}
   ${tailSvg}
   <text x="240" y="${height - 28}" text-anchor="middle" class="footer">keep the light on · estimates only</text>
   <style>
@@ -144,17 +144,17 @@ export function receiptSvg(summary: Summary): string {
 export function badgeSvg(summary: Summary): string {
   const status = summary.budget.status;
   const label = "spendlight";
-  const day = summary.budget.period === "day";
+  const windowLabel = calendarWindowLabel(summary.budget.period);
   const scoped = summary.scopeProject != null;
   const projectHard = scoped && summary.scopeProject ? summary.budget.projectLimit.hardUsd : null;
-  const spendN = day
+  const spendN = windowLabel
     ? scoped
       ? summary.budget.projectSpend
       : summary.budget.globalSpend
     : summary.spendUsd;
   const spend = fmt(spendN);
   const hard = projectHard != null ? projectHard : summary.budget.globalLimit.hardUsd;
-  const shown = day ? `today ${spend}` : spend;
+  const shown = windowLabel ? `${windowLabel} ${spend}` : spend;
   const value = hard != null ? `${shown} / ${fmt(hard)}` : shown;
   const aria = scoped && summary.scopeProject ? `${label} ${summary.scopeProject}: ${value}` : `${label}: ${value}`;
   const color = status === "hard" ? "#9b2c2c" : status === "soft" ? "#b8862a" : "#2f6f4e";
@@ -177,12 +177,19 @@ export function badgeSvg(summary: Summary): string {
 </svg>`;
 }
 
+function calendarWindowLabel(period: Summary["budget"]["period"]): "today" | "this month" | null {
+  if (period === "day") return "today";
+  if (period === "month") return "this month";
+  return null;
+}
+
 function windowRows(summary: Summary): string[] {
-  if (summary.budget.period !== "day") return [];
+  const label = calendarWindowLabel(summary.budget.period);
+  if (!label) return [];
   const scoped = summary.scopeProject != null;
   const spend = scoped ? summary.budget.projectSpend : summary.budget.globalSpend;
   const rows = [
-    `| Budget window | today (${summary.budget.timezone}) |`,
+    `| Budget window | ${label} (${summary.budget.timezone}) |`,
     `| Spend in window | ${fmt(spend)} |`,
   ];
   if (scoped) rows.push(`| Global spend in window | ${fmt(summary.budget.globalSpend)} |`);
@@ -199,7 +206,7 @@ function projectBudgetRows(summary: Summary): string[] {
 }
 
 function globalSpendRow(summary: Summary): string[] {
-  if (summary.scopeProject == null || summary.budget.period === "day") return [];
+  if (summary.scopeProject == null || calendarWindowLabel(summary.budget.period)) return [];
   return [`| Global spend | ${fmt(summary.budget.globalSpend)} |`];
 }
 
