@@ -8,6 +8,19 @@ export function calendarDayBounds(timeZone: string, now: Date): { start: Date; e
   };
 }
 
+/**
+ * Inclusive start and exclusive end of the ISO week containing `now`, as UTC instants.
+ * Weeks run Monday 00:00 through the next Monday 00:00 in `timeZone`.
+ */
+export function calendarWeekBounds(timeZone: string, now: Date): { start: Date; end: Date } {
+  const today = calendarDate(timeZone, now);
+  const monday = addCalendarDays(today, 1 - isoWeekday(today));
+  return {
+    start: zonedMidnightUtc(timeZone, monday),
+    end: zonedMidnightUtc(timeZone, addCalendarDays(monday, 7)),
+  };
+}
+
 /** Inclusive start and exclusive end of the calendar month containing `now`, as UTC instants. */
 export function calendarMonthBounds(timeZone: string, now: Date): { start: Date; end: Date } {
   const today = calendarDate(timeZone, now);
@@ -33,6 +46,13 @@ type Ymd = { year: number; month: number; day: number };
 function calendarDate(timeZone: string, now: Date): Ymd {
   const parts = zonedParts(timeZone, now);
   return { year: parts.year, month: parts.month, day: parts.day };
+}
+
+/** ISO weekday of a civil date: Monday = 1 … Sunday = 7. */
+function isoWeekday(date: Ymd): number {
+  const utc = new Date(Date.UTC(date.year, date.month - 1, date.day));
+  const sunday0 = utc.getUTCDay();
+  return sunday0 === 0 ? 7 : sunday0;
 }
 
 function addCalendarDays(date: Ymd, days: number): Ymd {

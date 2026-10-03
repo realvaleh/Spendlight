@@ -19,6 +19,13 @@
       }
     }
   },
+  "weekExample": {
+    "note": "Ignored by Spendlight. Set budgets.period to week to count the current ISO week (Monday–Sunday); it resets at local midnight on Monday.",
+    "period": "week",
+    "timezone": "America/New_York",
+    "global": { "softUsd": 20, "hardUsd": 40 },
+    "projects": { "demo": { "softUsd": 5, "hardUsd": 10 } }
+  },
   "monthExample": {
     "note": "Ignored by Spendlight. Set budgets.period to month to count the current calendar month; it resets at local midnight on the 1st.",
     "period": "month",

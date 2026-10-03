@@ -177,8 +177,9 @@ export function badgeSvg(summary: Summary): string {
 </svg>`;
 }
 
-function calendarWindowLabel(period: Summary["budget"]["period"]): "today" | "this month" | null {
+function calendarWindowLabel(period: Summary["budget"]["period"]): "today" | "this week" | "this month" | null {
   if (period === "day") return "today";
+  if (period === "week") return "this week";
   if (period === "month") return "this month";
   return null;
 }

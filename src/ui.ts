@@ -203,7 +203,7 @@ export function dashboardHtml(): string {
       const pct = hard ? Math.min(100, (spend / hard) * 100) : 0;
       $("meter").className = "meter " + s.budget.status;
       $("meter-bar").style.width = (hard ? pct : 0) + "%";
-      $("spend-k").textContent = (s.budget.period === "day" || s.budget.period === "month") ? "Estimated spend · lifetime" : "Estimated spend";
+      $("spend-k").textContent = (s.budget.period === "day" || s.budget.period === "week" || s.budget.period === "month") ? "Estimated spend · lifetime" : "Estimated spend";
       $("budget-copy").textContent = budgetCopy(s);
       spark(s.daily || []);
       const maxP = Math.max(...s.byProject.map(p => p.spendUsd), 1e-9);
@@ -250,7 +250,7 @@ export function dashboardHtml(): string {
       const soft = b.globalLimit.softUsd;
       const spend = b.globalSpend;
       const softBit = soft != null ? " · soft " + fmtMoney(soft) : "";
-      const head = b.period === "day" ? "Today (" + b.timezone + ") " : b.period === "month" ? "This month (" + b.timezone + ") " : "";
+      const head = b.period === "day" ? "Today (" + b.timezone + ") " : b.period === "week" ? "This week (" + b.timezone + ") " : b.period === "month" ? "This month (" + b.timezone + ") " : "";
       if (!head) {
         return hard == null
           ? "No global hard budget configured."
