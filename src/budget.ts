@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { BudgetDecision, BudgetLimit, BudgetPeriod, Config } from "./types.js";
 import type { Preflight } from "./pricing.js";
-import { calendarDayBounds, calendarMonthBounds } from "./day.js";
+import { calendarDayBounds, calendarMonthBounds, calendarWeekBounds } from "./day.js";
 import {
   insertReservation,
   purgeStaleReservations,
@@ -21,14 +21,19 @@ export type Admission = {
   reserveUsd: number;
 };
 
-/** Null for a lifetime budget. Otherwise the current calendar day or month in the configured timezone. */
+/** Null for a lifetime budget. Otherwise the current calendar day, ISO week, or month in the configured timezone. */
 export function spendWindow(config: Config, now = new Date()): SpendWindow | null {
   const period = config.budgets.period;
-  if (period !== "day" && period !== "month") return null;
+  const zone = config.budgets.timezone;
   const bounds =
     period === "day"
-      ? calendarDayBounds(config.budgets.timezone, now)
-      : calendarMonthBounds(config.budgets.timezone, now);
+      ? calendarDayBounds(zone, now)
+      : period === "week"
+        ? calendarWeekBounds(zone, now)
+        : period === "month"
+          ? calendarMonthBounds(zone, now)
+          : null;
+  if (!bounds) return null;
   return { startIso: bounds.start.toISOString(), endIso: bounds.end.toISOString() };
 }
 
@@ -244,6 +249,7 @@ function windowMeta(config: Config, window: SpendWindow | null): {
 
 function windowClause(meta: { period: BudgetPeriod; timezone: string }): string {
   if (meta.period === "day") return `, today ${meta.timezone}`;
+  if (meta.period === "week") return `, this week ${meta.timezone}`;
   if (meta.period === "month") return `, this month ${meta.timezone}`;
   return "";
 }

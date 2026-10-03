@@ -146,7 +146,7 @@ export SPENDLIGHT_HARD_BUDGET_USD=25
 
 Per-project limits live in `spendlight.config.json`. A request is blocked if **either** the project hard cap **or** the global hard cap is hit.
 
-Caps count the **whole ledger** unless you set a calendar window. `period` defaults to `lifetime` (omit it and nothing changes). `day` counts only rows whose timestamp falls on the current calendar day in an IANA timezone, and the window resets at local midnight. `month` counts only rows in the current calendar month in that same timezone, and the window resets at local midnight on the 1st. That is a daily or monthly kill-switch: soft $5 / hard $10 today, or soft $50 / hard $100 this month, without wiping the database. The dashboard hero total stays lifetime. The budget meter, kill-switch, reservation room, and soft-warn dedupe use the day or month window, so the next day or month can warn again.
+Caps count the **whole ledger** unless you set a calendar window. `period` defaults to `lifetime` (omit it and nothing changes). `day` counts only rows whose timestamp falls on the current calendar day in an IANA timezone, and the window resets at local midnight. `week` counts only rows in the current ISO week (Monday through Sunday) in that same timezone, and the window resets at local midnight on Monday. `month` counts only rows in the current calendar month in that same timezone, and the window resets at local midnight on the 1st. That is a daily, weekly, or monthly kill-switch: soft $5 / hard $10 today, soft $20 / hard $40 this week, or soft $50 / hard $100 this month, without wiping the database. The dashboard hero total stays lifetime. The budget meter, kill-switch, reservation room, and soft-warn dedupe use the day, week, or month window, so the next day, week, or month can warn again.
 
 ```json
 {
@@ -163,6 +163,23 @@ Caps count the **whole ledger** unless you set a calendar window. `period` defau
 
 ```bash
 export SPENDLIGHT_BUDGET_PERIOD=day
+export SPENDLIGHT_BUDGET_TIMEZONE=America/New_York
+```
+
+A calendar week uses the same timezone and the same soft/hard fields. The week is ISO: Monday 00:00 through the following Monday 00:00, local time.
+
+```json
+{
+  "budgets": {
+    "period": "week",
+    "timezone": "America/New_York",
+    "global": { "softUsd": 20, "hardUsd": 40 }
+  }
+}
+```
+
+```bash
+export SPENDLIGHT_BUDGET_PERIOD=week
 export SPENDLIGHT_BUDGET_TIMEZONE=America/New_York
 ```
 
@@ -183,7 +200,7 @@ export SPENDLIGHT_BUDGET_PERIOD=month
 export SPENDLIGHT_BUDGET_TIMEZONE=America/New_York
 ```
 
-Env overrides the file. An invalid timezone fails startup instead of quietly using UTC. If `period` is `day` or `month` and no timezone is set, Spendlight warns and uses UTC. Any other period fails startup.
+Env overrides the file. An invalid timezone fails startup instead of quietly using UTC. If `period` is `day`, `week`, or `month` and no timezone is set, Spendlight warns and uses UTC. Any other period fails startup.
 
 Tag the bucket on every call:
 
@@ -278,8 +295,8 @@ Spendlight is a **localhost reverse proxy that can spend your API key**. Treat t
 | `SPENDLIGHT_CONFIG` | `./spendlight.config.json` | Optional JSON config |
 | `SPENDLIGHT_SOFT_BUDGET_USD` | — | Global soft budget (warn) |
 | `SPENDLIGHT_HARD_BUDGET_USD` | — | Global hard budget (kill-switch) |
-| `SPENDLIGHT_BUDGET_PERIOD` | `lifetime` | `lifetime` (whole ledger), `day` (calendar day), or `month` (calendar month) |
-| `SPENDLIGHT_BUDGET_TIMEZONE` | `UTC` | IANA zone for a day or month window, e.g. `America/New_York` |
+| `SPENDLIGHT_BUDGET_PERIOD` | `lifetime` | `lifetime` (whole ledger), `day` (calendar day), `week` (ISO week, Monday–Sunday), or `month` (calendar month) |
+| `SPENDLIGHT_BUDGET_TIMEZONE` | `UTC` | IANA zone for a day, week, or month window, e.g. `America/New_York` |
 
 ## Smoke test
 

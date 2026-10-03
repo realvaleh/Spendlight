@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
 import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
-import { calendarDayBounds, calendarMonthBounds } from "./day.js";
+import { calendarDayBounds, calendarMonthBounds, calendarWeekBounds } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
@@ -276,6 +276,7 @@ async function main(): Promise<void> {
     assert(dash.includes('href="/api/export.csv?project='), "dashboard missing scoped csv link");
     assert(dash.includes("const esc"), "dashboard should HTML-escape untrusted fields");
     assert(dash.includes("Today ("), "dashboard should name the day window");
+    assert(dash.includes("This week ("), "dashboard should name the week window");
     assert(dash.includes("This month ("), "dashboard should name the month window");
     assert(dash.includes("Estimated spend · lifetime"), "dashboard should label lifetime hero spend");
 
@@ -286,21 +287,26 @@ async function main(): Promise<void> {
     await testBoundedRace(dir, mockUrl);
     await testStreamCutoff(dir, mockUrl);
     testCalendarDayBounds();
+    testCalendarWeekBounds();
     testCalendarMonthBounds();
     testBudgetConfig(dir);
     testDayLedgerWindow(dir);
+    testWeekLedgerWindow(dir);
     testMonthLedgerWindow(dir);
     testReservationOutsideDay(dir);
+    testReservationOutsideWeek(dir);
     testReservationOutsideMonth(dir);
     await testDayWindow(dir, mockUrl);
+    await testWeekWindow(dir, mockUrl);
     await testMonthWindow(dir, mockUrl);
     await testLifetimeStillAccumulates(dir, mockUrl);
     await testSoftWarnRefires(dir, mockUrl);
+    await testSoftWarnWeekRefires(dir, mockUrl);
     await testSoftWarnMonthRefires(dir, mockUrl);
     await testSoftWarnLifetimeDedupe(dir, mockUrl);
     await testProjectScope(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, month window, project scope");
+    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -405,7 +411,7 @@ async function testStreamCutoff(dir: string, mockUrl: string): Promise<void> {
 type SmokeBudgets = {
   softUsd: number | null;
   hardUsd: number | null;
-  period?: "lifetime" | "day" | "month";
+  period?: "lifetime" | "day" | "week" | "month";
   timezone?: string;
   projects?: Record<string, { softUsd: number | null; hardUsd: number | null }>;
 };
@@ -515,6 +521,43 @@ function testCalendarDayBounds(): void {
   const utc = calendarDayBounds("UTC", new Date("2026-09-30T15:00:00.000Z"));
   assert(utc.start.toISOString() === "2026-09-30T00:00:00.000Z", `utc start ${utc.start.toISOString()}`);
   assert(utc.end.toISOString() === "2026-10-01T00:00:00.000Z", `utc end ${utc.end.toISOString()}`);
+}
+
+function testCalendarWeekBounds(): void {
+  const mid = calendarWeekBounds("America/New_York", new Date("2026-09-30T15:00:00.000Z"));
+  assert(mid.start.toISOString() === "2026-09-28T04:00:00.000Z", `ny week start ${mid.start.toISOString()}`);
+  assert(mid.end.toISOString() === "2026-10-05T04:00:00.000Z", `ny week end ${mid.end.toISOString()}`);
+
+  const sundayNight = calendarWeekBounds("America/New_York", new Date("2026-09-28T03:30:00.000Z"));
+  assert(
+    sundayNight.start.toISOString() === "2026-09-21T04:00:00.000Z",
+    `ny sunday night start ${sundayNight.start.toISOString()}`,
+  );
+  assert(
+    sundayNight.end.toISOString() === "2026-09-28T04:00:00.000Z",
+    `ny sunday night end ${sundayNight.end.toISOString()}`,
+  );
+  const mondayMidnight = calendarWeekBounds("America/New_York", new Date("2026-09-28T04:00:00.000Z"));
+  assert(
+    mondayMidnight.start.toISOString() === "2026-09-28T04:00:00.000Z",
+    `ny monday start ${mondayMidnight.start.toISOString()}`,
+  );
+
+  const spring = calendarWeekBounds("America/New_York", new Date("2026-03-04T15:00:00.000Z"));
+  assert(spring.start.toISOString() === "2026-03-02T05:00:00.000Z", `spring week start ${spring.start.toISOString()}`);
+  assert(spring.end.toISOString() === "2026-03-09T04:00:00.000Z", `spring week end ${spring.end.toISOString()}`);
+
+  const fall = calendarWeekBounds("America/New_York", new Date("2026-10-28T15:00:00.000Z"));
+  assert(fall.start.toISOString() === "2026-10-26T04:00:00.000Z", `fall week start ${fall.start.toISOString()}`);
+  assert(fall.end.toISOString() === "2026-11-02T05:00:00.000Z", `fall week end ${fall.end.toISOString()}`);
+
+  const year = calendarWeekBounds("America/New_York", new Date("2026-01-01T15:00:00.000Z"));
+  assert(year.start.toISOString() === "2025-12-29T05:00:00.000Z", `year week start ${year.start.toISOString()}`);
+  assert(year.end.toISOString() === "2026-01-05T05:00:00.000Z", `year week end ${year.end.toISOString()}`);
+
+  const utc = calendarWeekBounds("UTC", new Date("2026-09-30T15:00:00.000Z"));
+  assert(utc.start.toISOString() === "2026-09-28T00:00:00.000Z", `utc week start ${utc.start.toISOString()}`);
+  assert(utc.end.toISOString() === "2026-10-05T00:00:00.000Z", `utc week end ${utc.end.toISOString()}`);
 }
 
 function testCalendarMonthBounds(): void {
@@ -649,15 +692,42 @@ function testBudgetConfig(dir: string): void {
     assert(monthOverride.budgets.period === "month", "env month overrides file lifetime");
     assert(monthOverride.budgets.timezone === "Asia/Tokyo", "env timezone overrides file for month");
 
+    warnings.length = 0;
     delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
     process.env.SPENDLIGHT_BUDGET_PERIOD = "week";
+    const weekDefault = loadConfig(barePath);
+    assert(weekDefault.budgets.period === "week", "week period from env");
+    assert(weekDefault.budgets.timezone === "UTC", "missing week timezone uses UTC");
+    assert(
+      warnings.some((w) => w.includes('"week"') && w.includes("UTC")),
+      `missing week timezone should warn, got ${warnings.join(" | ")}`,
+    );
+
+    const weekPath = join(dir, "week.json");
+    writeFileSync(
+      weekPath,
+      JSON.stringify({ budgets: { period: "week", timezone: "Europe/Berlin", global: { hardUsd: 1 } } }),
+    );
+    delete process.env.SPENDLIGHT_BUDGET_PERIOD;
+    const weekFile = loadConfig(weekPath);
+    assert(weekFile.budgets.period === "week", "week period from file");
+    assert(weekFile.budgets.timezone === "Europe/Berlin", "week timezone from file");
+
+    process.env.SPENDLIGHT_BUDGET_PERIOD = "week";
+    process.env.SPENDLIGHT_BUDGET_TIMEZONE = "Pacific/Auckland";
+    const weekOverride = loadConfig(path);
+    assert(weekOverride.budgets.period === "week", "env week overrides file lifetime");
+    assert(weekOverride.budgets.timezone === "Pacific/Auckland", "env timezone overrides file for week");
+
+    delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
+    process.env.SPENDLIGHT_BUDGET_PERIOD = "year";
     threw = false;
     try {
       loadConfig(barePath);
     } catch (err) {
       threw = true;
       const message = err instanceof Error ? err.message : String(err);
-      assert(message.includes("week"), message);
+      assert(message.includes("year"), message);
     }
     assert(threw, "invalid period must fail startup");
   } finally {
@@ -704,6 +774,47 @@ function testDayLedgerWindow(dir: string): void {
   assert(lifetime.globalSpend > 100, `lifetime spend should include other days, got ${lifetime.globalSpend}`);
   assert(lifetime.status === "hard", `lifetime should be hard, got ${lifetime.status}`);
   assert(!lifetime.message?.includes("today"), lifetime.message ?? "");
+  assert(lifetime.windowStart == null, "lifetime decision has no window");
+  closeDb(db);
+}
+
+function testWeekLedgerWindow(dir: string): void {
+  const configPath = join(dir, "ledger-week.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      dbPath: ":memory:",
+      budgets: {
+        period: "week",
+        timezone: "America/New_York",
+        global: { softUsd: 1, hardUsd: 5 },
+        projects: { demo: { softUsd: null, hardUsd: 10 } },
+      },
+    }),
+  );
+  const config = loadConfig(configPath);
+  const db = openDb(":memory:");
+  const now = new Date("2026-09-30T15:00:00.000Z");
+  const window = spendWindow(config, now);
+  assert(window, "week spend window");
+  assert(window.startIso === "2026-09-28T04:00:00.000Z", window.startIso);
+  assert(window.endIso === "2026-10-05T04:00:00.000Z", window.endIso);
+  seedSpend(db, window.startIso, 1, "demo");
+  seedSpend(db, new Date(Date.parse(window.startIso) + 60_000).toISOString(), 3, "demo");
+  seedSpend(db, new Date(Date.parse(window.startIso) - 1).toISOString(), 100, "demo");
+  seedSpend(db, window.endIso, 100, "demo");
+
+  const week = evaluateBudget(db, config, "demo", now);
+  assert(Math.abs(week.globalSpend - 4) < 1e-9, `week global spend ${week.globalSpend}`);
+  assert(Math.abs(week.projectSpend - 4) < 1e-9, `week project spend ${week.projectSpend}`);
+  assert(week.status === "soft", `expected soft inside the week window, got ${week.status}`);
+  assert(week.message?.includes("this week America/New_York"), week.message ?? "missing week soft message");
+  assert(week.windowStart === window.startIso, "week decision should expose the window");
+
+  const lifetime = evaluateBudget(db, { ...config, budgets: { ...config.budgets, period: "lifetime" } }, "demo", now);
+  assert(lifetime.globalSpend > 100, `lifetime spend should include other weeks, got ${lifetime.globalSpend}`);
+  assert(lifetime.status === "hard", `lifetime should be hard, got ${lifetime.status}`);
+  assert(!lifetime.message?.includes("this week"), lifetime.message ?? "");
   assert(lifetime.windowStart == null, "lifetime decision has no window");
   closeDb(db);
 }
@@ -790,6 +901,45 @@ function testReservationOutsideDay(dir: string): void {
   );
   const dayAdmit = admitMutating(db, config, "default", null, now);
   assert(dayAdmit.allowed, "day window should ignore a hold from before local midnight");
+  const lifeAdmit = admitMutating(
+    db,
+    { ...config, budgets: { ...config.budgets, period: "lifetime" } },
+    "default",
+    null,
+    now,
+  );
+  assert(!lifeAdmit.allowed, "lifetime should still count that in-flight hold");
+  closeDb(db);
+}
+
+function testReservationOutsideWeek(dir: string): void {
+  const configPath = join(dir, "res-week.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      dbPath: ":memory:",
+      budgets: {
+        period: "week",
+        timezone: "America/New_York",
+        global: { softUsd: null, hardUsd: 1 },
+      },
+    }),
+  );
+  const config = loadConfig(configPath);
+  const db = openDb(":memory:");
+  const now = new Date("2026-09-28T04:10:00.000Z");
+  const window = spendWindow(config, now);
+  assert(window?.startIso === "2026-09-28T04:00:00.000Z", window?.startIso ?? "no window");
+  const heldAt = new Date(now.getTime() - 11 * 60 * 1000).toISOString();
+  assert(heldAt < window.startIso, "hold should be before local midnight on Monday");
+  db.prepare(`INSERT INTO reservations (id, created_at, project, cost_usd) VALUES (?, ?, ?, ?)`).run(
+    "old-week-hold",
+    heldAt,
+    "default",
+    50,
+  );
+  const weekAdmit = admitMutating(db, config, "default", null, now);
+  assert(weekAdmit.allowed, "week window should ignore a hold from the previous week");
   const lifeAdmit = admitMutating(
     db,
     { ...config, budgets: { ...config.budgets, period: "lifetime" } },
@@ -888,6 +1038,64 @@ async function testDayWindow(dir: string, mockUrl: string): Promise<void> {
       assert(svg.includes("America/New_York"), "svg receipt missing timezone");
       const badge = await fetch(`${base}/badge.svg`).then((r) => r.text());
       assert(badge.includes("today"), "badge should show today's spend");
+      assert(!badge.includes("$9"), "badge should not use the lifetime total");
+    },
+  );
+}
+
+async function testWeekWindow(dir: string, mockUrl: string): Promise<void> {
+  await withApp(
+    dir,
+    "week-window",
+    mockUrl,
+    { softUsd: null, hardUsd: 0.04, period: "week", timezone: "America/New_York" },
+    async (base, app) => {
+      const window = spendWindow(app.config);
+      assert(window, "week config should expose a window");
+      seedSpend(app.db, new Date(Date.parse(window.startIso) - 1000).toISOString(), 9, "last-week");
+
+      const first = await postChat(
+        base,
+        "demo",
+        JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "hi" }] }),
+      );
+      assert(first.status === 200, `week window should admit despite last week's spend, got ${first.status}`);
+      await first.text();
+
+      const second = await postChat(
+        base,
+        "demo",
+        JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "again" }] }),
+      );
+      assert(second.status === 402, `week window should block once this week's spend hits hard, got ${second.status}`);
+      const blocked = (await second.json()) as { error?: { message?: string } };
+      assert(
+        blocked.error?.message?.includes("this week America/New_York") === true,
+        blocked.error?.message ?? "missing week kill-switch message",
+      );
+
+      const summary = await summaryOf(base);
+      assert(summary.spendUsd > 9, `lifetime hero should include last week, got ${summary.spendUsd}`);
+      assert(summary.budget.globalSpend < 1, `budget meter should be this week only, got ${summary.budget.globalSpend}`);
+      assert(
+        summary.budget.globalSpend >= 0.04,
+        `this week's spend should reach the hard cap, got ${summary.budget.globalSpend}`,
+      );
+      assert(summary.budget.status === "hard", summary.budget.status);
+      assert(summary.budget.period === "week", summary.budget.period);
+      assert(summary.budget.timezone === "America/New_York", summary.budget.timezone);
+      assert(summary.budget.windowStart === window.startIso, "summary window should be this week");
+      assert(summary.requests === 2, `seed plus admitted call, got ${summary.requests}`);
+
+      const md = await fetch(`${base}/receipt.md`).then((r) => r.text());
+      assert(md.includes("| Budget window | this week (America/New_York) |"), "markdown receipt missing week window");
+      assert(md.includes("Spend in window"), "markdown receipt missing window spend");
+      assert(!md.includes("today"), "week receipt should not say today");
+      const svg = await fetch(`${base}/receipt.svg`).then((r) => r.text());
+      assert(svg.includes("counted this week"), "svg receipt missing week window");
+      assert(svg.includes("America/New_York"), "svg receipt missing timezone");
+      const badge = await fetch(`${base}/badge.svg`).then((r) => r.text());
+      assert(badge.includes("this week"), "badge should show this week's spend");
       assert(!badge.includes("$9"), "badge should not use the lifetime total");
     },
   );
@@ -1006,6 +1214,43 @@ async function testSoftWarnRefires(dir: string, mockUrl: string): Promise<void> 
       await second.text();
       const after = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
       assert(after.length === 2, `soft_warn should dedupe inside the same day, got ${after.length}`);
+    },
+  );
+}
+
+async function testSoftWarnWeekRefires(dir: string, mockUrl: string): Promise<void> {
+  await withApp(
+    dir,
+    "soft-week",
+    mockUrl,
+    { softUsd: 0.00001, hardUsd: 100, period: "week", timezone: "UTC" },
+    async (base, app) => {
+      const window = spendWindow(app.config);
+      assert(window, "soft week window");
+      const lastWeek = new Date(Date.parse(window.startIso) - 1000).toISOString();
+      app.db
+        .prepare(`INSERT INTO events (created_at, type, project, message) VALUES (?, 'soft_warn', ?, ?)`)
+        .run(lastWeek, "weekwarn", "last week warning");
+      seedSpend(app.db, window.startIso, 0.001, "weekwarn");
+      const body = JSON.stringify({
+        model: "gpt-4o-mini",
+        small: true,
+        messages: [{ role: "user", content: "hi" }],
+      });
+      const first = await postChat(base, "weekwarn", body);
+      assert(first.status === 200, `soft week request ${first.status}`);
+      assert(first.headers.get("x-spendlight-budget-status") === "soft", "expected a soft warning");
+      const warning = first.headers.get("x-spendlight-budget-warning") ?? "";
+      assert(warning.includes("this week UTC"), warning);
+      await first.text();
+      const mid = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
+      assert(mid.length === 2, `expected last week's warning plus a new one, got ${mid.length}`);
+
+      const second = await postChat(base, "weekwarn", body);
+      assert(second.status === 200, `second soft week request ${second.status}`);
+      await second.text();
+      const after = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
+      assert(after.length === 2, `soft_warn should dedupe inside the same week, got ${after.length}`);
     },
   );
 }
