@@ -2,11 +2,13 @@ import type { Summary } from "./types.js";
 import { fmt } from "./budget.js";
 
 export function receiptMarkdown(summary: Summary): string {
-  const scoped = summary.scopeProject != null;
+  const projectScoped = summary.scopeProject != null;
+  const modelScoped = summary.scopeModel != null;
   const lines = [
     `# Spendlight receipt`,
     ``,
-    ...(scoped ? [`Project **${summary.scopeProject || "—"}**`, ``] : []),
+    ...(projectScoped ? [`Project **${summary.scopeProject || "—"}**`, ``] : []),
+    ...(modelScoped ? [`Model **${summary.scopeModel || "—"}**`, ``] : []),
     `Generated **${summary.generatedAt}**`,
     ``,
     `| | |`,
@@ -62,15 +64,16 @@ export function receiptSvg(summary: Summary): string {
   const header = 168;
   const tableH = Math.max(rows.length, 1) * rowH;
   const windowLabel = calendarWindowLabel(summary.budget.period);
-  const scoped = summary.scopeProject != null;
+  const projectScoped = summary.scopeProject != null;
+  const modelScoped = summary.scopeModel != null;
   const projectName = summary.scopeProject ?? "";
-  const projectHard = scoped && projectName ? summary.budget.projectLimit.hardUsd : null;
-  const projectSoft = scoped && projectName ? summary.budget.projectLimit.softUsd : null;
+  const projectHard = projectScoped && projectName ? summary.budget.projectLimit.hardUsd : null;
+  const projectSoft = projectScoped && projectName ? summary.budget.projectLimit.softUsd : null;
   const hardValue = projectHard != null ? projectHard : summary.budget.globalLimit.hardUsd;
   const hardLabel = projectHard != null ? "project hard" : windowLabel ? `hard budget ${windowLabel}` : "hard budget";
-  const windowSpend = scoped ? summary.budget.projectSpend : summary.budget.globalSpend;
+  const windowSpend = countedWindowSpend(summary);
   const tail: string[] = [];
-  if (scoped) {
+  if (projectScoped || modelScoped) {
     const globalLabel = windowLabel ? `global ${windowLabel}` : "global spend";
     tail.push(`${globalLabel} ${fmt(summary.budget.globalSpend)} / ${fmt(summary.budget.globalLimit.hardUsd)}`);
     if (projectSoft != null) tail.push(`project soft ${fmt(projectSoft)}`);
@@ -80,8 +83,9 @@ export function receiptSvg(summary: Summary): string {
   const total = fmt(summary.spendUsd);
   const hard = fmt(hardValue);
   const status = statusLabel(summary);
-  const sub = scoped && projectName ? `spend receipt · ${truncate(projectName, 24)}` : "spend receipt";
-  const aria = scoped && projectName ? `Spendlight receipt for ${projectName}` : "Spendlight receipt";
+  const scopeName = scopeLabel(summary);
+  const sub = scopeName ? `spend receipt · ${truncate(scopeName, 24)}` : "spend receipt";
+  const aria = scopeName ? `Spendlight receipt for ${scopeName}` : "Spendlight receipt";
   const tailY0 = header + tableH + 120 + (windowLabel ? 22 : 0);
   const tailSvg = tail
     .map((line, i) => `<text x="48" y="${tailY0 + i * 22}" class="muted">${escapeXml(line)}</text>`)
@@ -145,18 +149,15 @@ export function badgeSvg(summary: Summary): string {
   const status = summary.budget.status;
   const label = "spendlight";
   const windowLabel = calendarWindowLabel(summary.budget.period);
-  const scoped = summary.scopeProject != null;
-  const projectHard = scoped && summary.scopeProject ? summary.budget.projectLimit.hardUsd : null;
-  const spendN = windowLabel
-    ? scoped
-      ? summary.budget.projectSpend
-      : summary.budget.globalSpend
-    : summary.spendUsd;
+  const projectName = summary.scopeProject || "";
+  const projectHard = projectName ? summary.budget.projectLimit.hardUsd : null;
+  const spendN = windowLabel ? countedWindowSpend(summary) : summary.spendUsd;
   const spend = fmt(spendN);
   const hard = projectHard != null ? projectHard : summary.budget.globalLimit.hardUsd;
   const shown = windowLabel ? `${windowLabel} ${spend}` : spend;
   const value = hard != null ? `${shown} / ${fmt(hard)}` : shown;
-  const aria = scoped && summary.scopeProject ? `${label} ${summary.scopeProject}: ${value}` : `${label}: ${value}`;
+  const scopeName = scopeLabel(summary);
+  const aria = scopeName ? `${label} ${scopeName}: ${value}` : `${label}: ${value}`;
   const color = status === "hard" ? "#9b2c2c" : status === "soft" ? "#b8862a" : "#2f6f4e";
   const labelW = 82;
   const valueW = Math.max(78, value.length * 7.2 + 16);
@@ -187,14 +188,24 @@ function calendarWindowLabel(period: Summary["budget"]["period"]): "today" | "th
 function windowRows(summary: Summary): string[] {
   const label = calendarWindowLabel(summary.budget.period);
   if (!label) return [];
-  const scoped = summary.scopeProject != null;
-  const spend = scoped ? summary.budget.projectSpend : summary.budget.globalSpend;
+  const scoped = summary.scopeProject != null || summary.scopeModel != null;
   const rows = [
     `| Budget window | ${label} (${summary.budget.timezone}) |`,
-    `| Spend in window | ${fmt(spend)} |`,
+    `| Spend in window | ${fmt(countedWindowSpend(summary))} |`,
   ];
   if (scoped) rows.push(`| Global spend in window | ${fmt(summary.budget.globalSpend)} |`);
   return rows;
+}
+
+/** Window figure for the active export scope. Model scope uses the filtered window sum. */
+function countedWindowSpend(summary: Summary): number {
+  if (summary.scopeModel != null) return summary.scopeWindowSpend ?? 0;
+  if (summary.scopeProject != null) return summary.budget.projectSpend;
+  return summary.budget.globalSpend;
+}
+
+function scopeLabel(summary: Summary): string {
+  return [summary.scopeProject, summary.scopeModel].filter((value): value is string => Boolean(value)).join(" · ");
 }
 
 function projectBudgetRows(summary: Summary): string[] {
@@ -207,7 +218,8 @@ function projectBudgetRows(summary: Summary): string[] {
 }
 
 function globalSpendRow(summary: Summary): string[] {
-  if (summary.scopeProject == null || calendarWindowLabel(summary.budget.period)) return [];
+  const scoped = summary.scopeProject != null || summary.scopeModel != null;
+  if (!scoped || calendarWindowLabel(summary.budget.period)) return [];
   return [`| Global spend | ${fmt(summary.budget.globalSpend)} |`];
 }
 

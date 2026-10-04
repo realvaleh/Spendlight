@@ -1,10 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Config, LedgerRow, Summary } from "./types.js";
-import { closeDb, listRequests, loadSummaryParts, openDb, type Db } from "./db.js";
-import { evaluateBudget } from "./budget.js";
+import { closeDb, listRequests, loadSummaryParts, openDb, spendMatching, type Db } from "./db.js";
+import { evaluateBudget, spendWindow } from "./budget.js";
 import { dashboardHtml, FAVICON_SVG } from "./ui.js";
 import { badgeSvg, receiptMarkdown, receiptSvg } from "./receipts.js";
-import { proxyRequest, corsHeaders, normalizeProjectTag } from "./proxy.js";
+import { proxyRequest, corsHeaders, normalizeModelId, normalizeProjectTag } from "./proxy.js";
 
 export type App = {
   server: Server;
@@ -81,19 +81,20 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
   }
   if (req.method === "GET" && url.pathname === "/api/export.csv") {
     const project = queryProject(url);
+    const model = queryModel(url);
     res.setHeader("cache-control", "no-cache");
-    res.setHeader("content-disposition", `attachment; filename="${csvFilename(project)}"`);
-    return send(res, 200, "text/csv; charset=utf-8", ledgerCsv(listRequests(db, project)), req);
+    res.setHeader("content-disposition", `attachment; filename="${csvFilename(project, model)}"`);
+    return send(res, 200, "text/csv; charset=utf-8", ledgerCsv(listRequests(db, project, model)), req);
   }
   if (req.method === "GET" && url.pathname === "/receipt.md") {
-    return send(res, 200, "text/markdown; charset=utf-8", receiptMarkdown(buildSummary(db, config, queryProject(url))), req);
+    return send(res, 200, "text/markdown; charset=utf-8", receiptMarkdown(summaryFor(db, config, url)), req);
   }
   if (req.method === "GET" && url.pathname === "/receipt.svg") {
-    return send(res, 200, "image/svg+xml; charset=utf-8", receiptSvg(buildSummary(db, config, queryProject(url))), req);
+    return send(res, 200, "image/svg+xml; charset=utf-8", receiptSvg(summaryFor(db, config, url)), req);
   }
   if (req.method === "GET" && url.pathname === "/badge.svg") {
     res.setHeader("cache-control", "no-cache");
-    return send(res, 200, "image/svg+xml; charset=utf-8", badgeSvg(buildSummary(db, config, queryProject(url))), req);
+    return send(res, 200, "image/svg+xml; charset=utf-8", badgeSvg(summaryFor(db, config, url)), req);
   }
 
   if (url.pathname.startsWith("/v1/") || url.pathname === "/v1") {
@@ -104,15 +105,23 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
   sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } }, req);
 }
 
-export function buildSummary(db: Db, config: Config, project?: string): Summary {
-  const parts = loadSummaryParts(db, project);
+export function buildSummary(db: Db, config: Config, project?: string, model?: string): Summary {
+  const parts = loadSummaryParts(db, project, model);
   const budget = evaluateBudget(db, config, project ?? "default");
+  const window = model !== undefined ? spendWindow(config) : null;
+  const scopeWindowSpend = window ? spendMatching(db, project, model, window) : null;
   return {
     generatedAt: new Date().toISOString(),
     ...parts,
     scopeProject: project === undefined ? null : project,
+    scopeModel: model === undefined ? null : model,
+    scopeWindowSpend,
     budget,
   };
+}
+
+function summaryFor(db: Db, config: Config, url: URL): Summary {
+  return buildSummary(db, config, queryProject(url), queryModel(url));
 }
 
 /** Absent `project` stays unscoped. Present values use request-tag rules and do not become `default`. */
@@ -121,10 +130,23 @@ function queryProject(url: URL): string | undefined {
   return normalizeProjectTag(url.searchParams.get("project") ?? "");
 }
 
-function csvFilename(project: string | undefined): string {
-  if (!project) return "spendlight-ledger.csv";
-  const slug = project.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+/** Absent `model` stays unscoped. Present values use the same rules and do not become `default`. */
+function queryModel(url: URL): string | undefined {
+  if (!url.searchParams.has("model")) return undefined;
+  return normalizeModelId(url.searchParams.get("model") ?? "");
+}
+
+function csvFilename(project: string | undefined, model: string | undefined): string {
+  const slug = [project, model]
+    .filter((value): value is string => Boolean(value))
+    .map(fileSlug)
+    .filter(Boolean)
+    .join("-");
   return slug ? `spendlight-${slug}.csv` : "spendlight-ledger.csv";
+}
+
+function fileSlug(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
 function send(res: ServerResponse, status: number, type: string, body: string, req: IncomingMessage): void {

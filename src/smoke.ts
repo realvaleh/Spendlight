@@ -8,7 +8,7 @@ import { calendarDayBounds, calendarMonthBounds, calendarWeekBounds } from "./da
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
-import { joinUpstream, normalizeProjectTag, sanitizeProject } from "./proxy.js";
+import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
   prompt_tokens: 100_000,
@@ -69,6 +69,11 @@ async function main(): Promise<void> {
   assert(normalizeProjectTag("  demo  ") === "demo", "query tag trims like a request tag");
   assert(normalizeProjectTag("@@@") === "", "empty garbage stays empty for scoped queries");
   assert(sanitizeProject("@@@") === "default", "request tags still fall back to default");
+  assert(normalizeModelId("  gpt-4o-mini  ") === "gpt-4o-mini", "model query trims like a project tag");
+  assert(normalizeModelId("@@@") === "", "empty model garbage stays empty");
+  assert(normalizeModelId("gpt-4o-mini\r\nX") === "gpt-4o-miniX", "model query strips CR/LF without collapsing");
+  assert(normalizeModelId("") === "", "blank model query stays blank");
+  assert(normalizeModelId("no-such-model") === "no-such-model", "unknown model ids are not rewritten to default");
   assert(
     joinUpstream("https://api.openai.com/v1", "/v1//evil.example/x") ===
       "https://api.openai.com/v1/evil.example/x",
@@ -274,6 +279,9 @@ async function main(): Promise<void> {
     assert(dash.includes('href="/receipt.md?project='), "dashboard missing scoped markdown link");
     assert(dash.includes('href="/receipt.svg?project='), "dashboard missing scoped svg link");
     assert(dash.includes('href="/api/export.csv?project='), "dashboard missing scoped csv link");
+    assert(dash.includes('href="/receipt.md?model='), "dashboard missing model markdown link");
+    assert(dash.includes('href="/receipt.svg?model='), "dashboard missing model svg link");
+    assert(dash.includes('href="/api/export.csv?model='), "dashboard missing model csv link");
     assert(dash.includes("const esc"), "dashboard should HTML-escape untrusted fields");
     assert(dash.includes("Today ("), "dashboard should name the day window");
     assert(dash.includes("This week ("), "dashboard should name the week window");
@@ -305,8 +313,9 @@ async function main(): Promise<void> {
     await testSoftWarnMonthRefires(dir, mockUrl);
     await testSoftWarnLifetimeDedupe(dir, mockUrl);
     await testProjectScope(dir, mockUrl);
+    await testModelScope(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope");
+    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -487,11 +496,11 @@ async function summaryOf(base: string): Promise<{
   };
 }
 
-function seedSpend(db: Db, createdAt: string, costUsd: number, project: string): void {
+function seedSpend(db: Db, createdAt: string, costUsd: number, project: string, model = "gpt-4o-mini"): void {
   insertRequest(db, {
     createdAt,
     project,
-    model: "gpt-4o-mini",
+    model,
     usage: { promptTokens: 1, completionTokens: 0, cachedTokens: 0, totalTokens: 1 },
     costUsd,
     status: 200,
@@ -1425,6 +1434,187 @@ async function testProjectScope(dir: string, mockUrl: string): Promise<void> {
       const svg = await fetch(`${base}/receipt.svg?project=demo`).then((r) => r.text());
       assert(svg.includes("$1.00 counted today") || svg.includes("$1.000000 counted today"), svg);
       assert(svg.includes("project hard"), svg);
+    },
+  );
+}
+
+async function testModelScope(dir: string, mockUrl: string): Promise<void> {
+  await withApp(
+    dir,
+    "model-scope",
+    mockUrl,
+    {
+      softUsd: 1,
+      hardUsd: 10,
+      projects: { demo: { softUsd: 0.5, hardUsd: 2 } },
+    },
+    async (base, app) => {
+      const t0 = Date.parse("2026-02-01T12:00:00.000Z");
+      seedSpend(app.db, new Date(t0).toISOString(), 1.25, "demo", "gpt-4o-mini");
+      seedSpend(app.db, new Date(t0 + 1000).toISOString(), 2, "demo", "gpt-4o");
+      seedSpend(app.db, new Date(t0 + 2000).toISOString(), 3, "other", "gpt-4o-mini");
+      seedSpend(app.db, new Date(t0 + 3000).toISOString(), 0.5, "other", "gpt-4o");
+
+      const allCsv = await fetch(`${base}/api/export.csv`);
+      assert(allCsv.status === 200, `unscoped model csv ${allCsv.status}`);
+      assert((allCsv.headers.get("content-disposition") ?? "").includes("spendlight-ledger.csv"), "unscoped filename");
+      const allLines = csvLines(await allCsv.text());
+      assert(allLines.length === 5, `unscoped csv rows ${allLines.length}`);
+      assert(allLines.filter((line) => line.includes(",gpt-4o-mini,")).length === 2, "unscoped csv mini rows");
+      assert(allLines.filter((line) => line.includes(",gpt-4o,")).length === 2, "unscoped csv gpt-4o rows");
+
+      const miniCsv = await fetch(`${base}/api/export.csv?model=gpt-4o-mini`);
+      assert(miniCsv.status === 200, `mini csv ${miniCsv.status}`);
+      assert((miniCsv.headers.get("content-type") ?? "").includes("text/csv"), "mini csv type");
+      assert(
+        (miniCsv.headers.get("content-disposition") ?? "").includes("spendlight-gpt-4o-mini.csv"),
+        miniCsv.headers.get("content-disposition") ?? "missing model disposition",
+      );
+      const miniLines = csvLines(await miniCsv.text());
+      assert(miniLines.length === 3, `mini csv should be header + 2 rows, got ${miniLines.length}`);
+      assert(miniLines[0] === allLines[0], "model csv header changed");
+      assert(miniLines.every((line, i) => i === 0 || line.includes(",gpt-4o-mini,")), "mini csv leaked another model");
+      assert(!miniLines.some((line) => line.includes(",gpt-4o,")), "mini csv includes gpt-4o");
+      assert(miniLines.some((line) => line.includes(",demo,")), "mini csv missing demo");
+      assert(miniLines.some((line) => line.includes(",other,")), "mini csv missing other");
+
+      const miniMd = await fetch(`${base}/receipt.md?model=gpt-4o-mini`).then((r) => r.text());
+      assert(miniMd.includes("Model **gpt-4o-mini**"), miniMd);
+      assert(!miniMd.includes("Project **"), "model receipt should not name a project scope");
+      assert(miniMd.includes("| Total spend | $4.25 |"), miniMd);
+      assert(miniMd.includes("| `gpt-4o-mini` | $4.25 |"), miniMd);
+      assert(!miniMd.includes("| `gpt-4o` |"), "model receipt listed another model");
+      assert(miniMd.includes("| Global spend | $6.75 |"), miniMd);
+      assert(!miniMd.includes("| Project hard |"), "model receipt should not invent a project cap");
+
+      const allMd = await fetch(`${base}/receipt.md`).then((r) => r.text());
+      assert(allMd.includes("| Total spend | $6.75 |"), allMd);
+      assert(allMd.includes("| `gpt-4o` |"), "unscoped receipt missing gpt-4o");
+      assert(!allMd.includes("Model **"), "unscoped receipt should not name a model scope");
+
+      const miniSvg = await fetch(`${base}/receipt.svg?model=gpt-4o-mini`).then((r) => r.text());
+      assert(miniSvg.includes("spend receipt · gpt-4o-mini"), miniSvg);
+      assert(miniSvg.includes("$4.25"), miniSvg);
+      assert(miniSvg.includes("global spend"), miniSvg);
+      assert(!miniSvg.includes("$2.00"), "model svg showed the other model's spend");
+
+      const miniBadge = await fetch(`${base}/badge.svg?model=gpt-4o-mini`).then((r) => r.text());
+      assert(miniBadge.includes("$4.25 / $10.00"), miniBadge);
+      const fourBadge = await fetch(`${base}/badge.svg?model=gpt-4o`).then((r) => r.text());
+      assert(fourBadge.includes("$2.50 / $10.00"), fourBadge);
+
+      const bothCsv = await fetch(`${base}/api/export.csv?project=demo&model=gpt-4o-mini`);
+      assert(bothCsv.status === 200, `project+model csv ${bothCsv.status}`);
+      assert(
+        (bothCsv.headers.get("content-disposition") ?? "").includes("spendlight-demo-gpt-4o-mini.csv"),
+        bothCsv.headers.get("content-disposition") ?? "missing combined disposition",
+      );
+      const bothLines = csvLines(await bothCsv.text());
+      assert(bothLines.length === 2, `project+model csv should be header + 1 row, got ${bothLines.length}`);
+      assert(bothLines[1]?.includes(",demo,gpt-4o-mini,"), bothLines[1] ?? "missing AND row");
+      assert(!bothLines.some((line) => line.includes(",other,")), "AND csv leaked other project");
+      assert(!bothLines.some((line) => line.includes(",gpt-4o,")), "AND csv leaked gpt-4o");
+
+      const bothMd = await fetch(`${base}/receipt.md?project=demo&model=gpt-4o-mini`).then((r) => r.text());
+      assert(bothMd.includes("Project **demo**"), bothMd);
+      assert(bothMd.includes("Model **gpt-4o-mini**"), bothMd);
+      assert(bothMd.includes("| Total spend | $1.25 |"), bothMd);
+      assert(bothMd.includes("| Project hard | $2.00 |"), bothMd);
+      assert(!bothMd.includes("| other |"), "AND receipt listed another project");
+      assert(!bothMd.includes("| `gpt-4o` |"), "AND receipt listed another model");
+      const bothBadge = await fetch(`${base}/badge.svg?project=demo&model=gpt-4o-mini`).then((r) => r.text());
+      assert(bothBadge.includes("$1.25 / $2.00"), bothBadge);
+
+      const swapped = await fetch(`${base}/api/export.csv?model=gpt-4o&project=other`);
+      const swappedLines = csvLines(await swapped.text());
+      assert(swappedLines.length === 2, `swapped AND rows ${swappedLines.length}`);
+      assert(swappedLines[1]?.includes(",other,gpt-4o,"), swappedLines[1] ?? "missing swapped AND row");
+      assert(
+        (swapped.headers.get("content-disposition") ?? "").includes("spendlight-other-gpt-4o.csv"),
+        swapped.headers.get("content-disposition") ?? "missing swapped disposition",
+      );
+
+      const missingCsv = await fetch(`${base}/api/export.csv?model=missing-model`);
+      assert(missingCsv.status === 200, `missing model csv ${missingCsv.status}`);
+      assert(
+        (missingCsv.headers.get("content-disposition") ?? "").includes("spendlight-missing-model.csv"),
+        "unknown model filename",
+      );
+      assert(csvLines(await missingCsv.text()).length === 1, "unknown model should be a header-only csv");
+      const missingMd = await fetch(`${base}/receipt.md?model=missing-model`);
+      assert(missingMd.status === 200, `missing model receipt ${missingMd.status}`);
+      const missingText = await missingMd.text();
+      assert(missingText.includes("Model **missing-model**"), missingText);
+      assert(missingText.includes("| Total spend | $0.000000 |"), missingText);
+      assert(!missingText.includes("gpt-4o-mini"), "unknown model receipt leaked rows");
+      assert(!missingText.includes("$1.25"), "unknown model receipt returned real spend");
+
+      const garbage = await fetch(`${base}/receipt.md?model=${encodeURIComponent("@@@")}`);
+      assert(garbage.status === 200, `garbage model status ${garbage.status}`);
+      const garbageText = await garbage.text();
+      assert(garbageText.includes("Model **—**"), garbageText);
+      assert(garbageText.includes("| Total spend | $0.000000 |"), garbageText);
+      assert(!garbageText.includes("$4.25"), "garbage model query returned real spend");
+      const garbageCsv = await fetch(`${base}/api/export.csv?model=`);
+      assert(garbageCsv.status === 200, `empty model csv ${garbageCsv.status}`);
+      assert(csvLines(await garbageCsv.text()).length === 1, "empty model query should not dump the ledger");
+      assert(
+        (garbageCsv.headers.get("content-disposition") ?? "").includes("spendlight-ledger.csv"),
+        "empty model filename should not invent a slug",
+      );
+
+      const cleaned = await fetch(`${base}/api/export.csv?model=${encodeURIComponent("gpt-4o-mini\r\n")}`);
+      assert(cleaned.status === 200, `sanitized model csv ${cleaned.status}`);
+      assert(csvLines(await cleaned.text()).length === 3, "trailing CR/LF should sanitize to gpt-4o-mini");
+      const injected = await fetch(`${base}/api/export.csv?model=${encodeURIComponent("gpt-4o-mini\r\nX")}`);
+      assert(injected.status === 200, `injected model csv ${injected.status}`);
+      assert(csvLines(await injected.text()).length === 1, "a sanitized model that matches nothing should be empty, not a 500");
+      const disposition = injected.headers.get("content-disposition") ?? "";
+      assert(!disposition.includes("\n") && !disposition.includes("\r"), "model filename kept a line break");
+    },
+  );
+
+  await withApp(
+    dir,
+    "model-scope-day",
+    mockUrl,
+    {
+      softUsd: null,
+      hardUsd: 50,
+      period: "day",
+      timezone: "UTC",
+      projects: { demo: { softUsd: null, hardUsd: 2 } },
+    },
+    async (base, app) => {
+      const window = spendWindow(app.config);
+      assert(window, "model day window");
+      const yesterday = new Date(Date.parse(window.startIso) - 1000).toISOString();
+      seedSpend(app.db, yesterday, 9, "demo", "gpt-4o-mini");
+      seedSpend(app.db, window.startIso, 1, "demo", "gpt-4o-mini");
+      seedSpend(app.db, window.startIso, 4, "demo", "gpt-4o");
+      seedSpend(app.db, window.startIso, 2, "other", "gpt-4o-mini");
+
+      const badge = await fetch(`${base}/badge.svg?model=gpt-4o-mini`).then((r) => r.text());
+      assert(badge.includes("today $3.00 / $50.00"), badge);
+      assert(!badge.includes("$9"), "model badge used lifetime or yesterday's spend");
+
+      const md = await fetch(`${base}/receipt.md?model=gpt-4o-mini`).then((r) => r.text());
+      assert(md.includes("| Total spend | $12.00 |"), md);
+      assert(md.includes("| Spend in window | $3.00 |"), md);
+      assert(md.includes("| Global spend in window | $7.00 |"), md);
+      assert(!md.includes("| `gpt-4o` |"), "day model receipt listed gpt-4o");
+
+      const both = await fetch(`${base}/receipt.md?project=demo&model=gpt-4o-mini`).then((r) => r.text());
+      assert(both.includes("| Total spend | $10.00 |"), both);
+      assert(both.includes("| Spend in window | $1.00 |"), both);
+      assert(both.includes("| Global spend in window | $7.00 |"), both);
+      assert(both.includes("| Project hard | $2.00 |"), both);
+
+      const bothBadge = await fetch(`${base}/badge.svg?project=demo&model=gpt-4o-mini`).then((r) => r.text());
+      assert(bothBadge.includes("today $1.00 / $2.00"), bothBadge);
+
+      const svg = await fetch(`${base}/receipt.svg?model=gpt-4o-mini`).then((r) => r.text());
+      assert(svg.includes("$3.00 counted today"), svg);
     },
   );
 }
