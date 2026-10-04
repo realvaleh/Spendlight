@@ -427,6 +427,14 @@ export function normalizeProjectTag(value: string): string {
     .trim();
 }
 
+/**
+ * Same character rules as project tags. Empty when nothing usable remains.
+ * Export queries keep that empty string; they do not rewrite it to `unknown` or `default`.
+ */
+export function normalizeModelId(value: string): string {
+  return normalizeProjectTag(value);
+}
+
 /** Safe for headers, SQLite grouping, and dashboard HTML. Client-chosen tags are not auth. */
 export function sanitizeProject(value: string): string {
   return normalizeProjectTag(value) || "default";

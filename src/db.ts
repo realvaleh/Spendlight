@@ -228,30 +228,54 @@ const REQUEST_COLUMNS = `id, created_at AS createdAt, project, model,
               cached_tokens AS cachedTokens, total_tokens AS totalTokens,
               cost_usd AS costUsd, status, error, upstream_id AS upstreamId, path, streamed`;
 
-export function listRecent(db: Db, limit = 50, project?: string): LedgerRow[] {
-  const rows = (
-    project == null
-      ? db.prepare(`SELECT ${REQUEST_COLUMNS} FROM requests ORDER BY created_at DESC LIMIT ?`).all(limit)
-      : db
-          .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests WHERE project = ? ORDER BY created_at DESC LIMIT ?`)
-          .all(project, limit)
-  ) as LedgerRow[];
+export function listRecent(db: Db, limit = 50, project?: string, model?: string): LedgerRow[] {
+  const { clause, args } = requestWhere({ project, model });
+  const rows = db
+    .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests${clause} ORDER BY created_at DESC LIMIT ?`)
+    .all(...args, limit) as LedgerRow[];
   return rows.map(normalizeRow);
 }
 
-/** Ledger rows, oldest first, for CSV export. Pass a project tag to export one bucket. */
-export function listRequests(db: Db, project?: string): LedgerRow[] {
-  const rows = (
-    project == null
-      ? db.prepare(`SELECT ${REQUEST_COLUMNS} FROM requests ORDER BY created_at ASC, id ASC`).all()
-      : db
-          .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests WHERE project = ? ORDER BY created_at ASC, id ASC`)
-          .all(project)
-  ) as LedgerRow[];
+/** Ledger rows, oldest first, for CSV export. Pass a project and/or model to export one slice. */
+export function listRequests(db: Db, project?: string, model?: string): LedgerRow[] {
+  const { clause, args } = requestWhere({ project, model });
+  const rows = db
+    .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests${clause} ORDER BY created_at ASC, id ASC`)
+    .all(...args) as LedgerRow[];
   return rows.map(normalizeRow);
 }
 
-export function loadSummaryParts(db: Db, project?: string): {
+/** Sum cost for an export scope. Undefined project or model leaves that dimension unscoped. */
+export function spendMatching(db: Db, project?: string, model?: string, window?: SpendWindow | null): number {
+  const { clause, args } = requestWhere({ project, model }, window);
+  const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM requests${clause}`).get(...args) as { s: number };
+  return Number(row.s) || 0;
+}
+
+function requestWhere(
+  scope: { project?: string; model?: string },
+  window?: SpendWindow | null,
+): { clause: string; args: string[] } {
+  const clauses: string[] = [];
+  const args: string[] = [];
+  if (scope.project != null) {
+    clauses.push("project = ?");
+    args.push(scope.project);
+  }
+  if (scope.model != null) {
+    clauses.push("model = ?");
+    args.push(scope.model);
+  }
+  if (window) {
+    clauses.push("created_at >= ?");
+    args.push(window.startIso);
+    clauses.push("created_at < ?");
+    args.push(window.endIso);
+  }
+  return { clause: clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "", args };
+}
+
+export function loadSummaryParts(db: Db, project?: string, model?: string): {
   spendUsd: number;
   requests: number;
   tokens: number;
@@ -261,9 +285,8 @@ export function loadSummaryParts(db: Db, project?: string): {
   recent: LedgerRow[];
   events: { createdAt: string; type: string; project: string; message: string }[];
 } {
-  const where = project == null ? "" : " WHERE project = ?";
-  const args = project == null ? [] : [project];
-  const totals = db.prepare(`SELECT COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens FROM requests${where}`).get(...args) as {
+  const { clause, args } = requestWhere({ project, model });
+  const totals = db.prepare(`SELECT COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens FROM requests${clause}`).get(...args) as {
     spendUsd: number;
     requests: number;
     tokens: number;
@@ -271,19 +294,19 @@ export function loadSummaryParts(db: Db, project?: string): {
   const byProject = db
     .prepare(
       `SELECT project, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens
-       FROM requests${where} GROUP BY project ORDER BY spendUsd DESC`,
+       FROM requests${clause} GROUP BY project ORDER BY spendUsd DESC`,
     )
     .all(...args) as { project: string; spendUsd: number; requests: number; tokens: number }[];
   const byModel = db
     .prepare(
       `SELECT model, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens
-       FROM requests${where} GROUP BY model ORDER BY spendUsd DESC`,
+       FROM requests${clause} GROUP BY model ORDER BY spendUsd DESC`,
     )
     .all(...args) as { model: string; spendUsd: number; requests: number; tokens: number }[];
   const daily = db
     .prepare(
       `SELECT substr(created_at, 1, 10) AS day, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests
-       FROM requests${where} GROUP BY day ORDER BY day ASC`,
+       FROM requests${clause} GROUP BY day ORDER BY day ASC`,
     )
     .all(...args) as { day: string; spendUsd: number; requests: number }[];
   const events = db
@@ -298,7 +321,7 @@ export function loadSummaryParts(db: Db, project?: string): {
     byProject: byProject.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
     byModel: byModel.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
     daily: daily.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests) })),
-    recent: listRecent(db, 40, project),
+    recent: listRecent(db, 40, project, model),
     events,
   };
 }

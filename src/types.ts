@@ -79,6 +79,16 @@ export type Summary = {
    * Null is the full ledger. An empty string is a rejected query (matches nothing).
    */
   scopeProject: string | null;
+  /**
+   * Set when the summary is limited to one upstream model id.
+   * Null is every model. An empty string is a rejected query (matches nothing).
+   */
+  scopeModel: string | null;
+  /**
+   * Model-scoped spend inside the calendar window (AND the project when one is set).
+   * Null when the summary is not model-scoped, or the budget period is lifetime.
+   */
+  scopeWindowSpend: number | null;
   spendUsd: number;
   requests: number;
   tokens: number;

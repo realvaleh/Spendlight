@@ -218,7 +218,11 @@ export function dashboardHtml(): string {
       $("by-project").innerHTML = proj || '<div class="empty">No projects yet.</div>';
       const models = table(
         [{label:"Model"},{label:"Spend",num:true},{label:"Tokens",num:true}],
-        s.byModel.map(m => ["<code>" + esc(m.model) + "</code>", fmtMoney(m.spendUsd), fmtInt(m.tokens)])
+        s.byModel.map(m => [
+          "<code>" + esc(m.model) + "</code>" + modelLinks(m.model),
+          fmtMoney(m.spendUsd),
+          fmtInt(m.tokens)
+        ])
       );
       $("by-model").innerHTML = models || '<div class="empty">No models yet.</div>';
       const recent = table(
@@ -242,6 +246,14 @@ export function dashboardHtml(): string {
         '<a class="btn mini" href="/receipt.md?project=' + q + '">Markdown</a>' +
         '<a class="btn mini" href="/receipt.svg?project=' + q + '">SVG</a>' +
         '<a class="btn mini" href="/api/export.csv?project=' + q + '">CSV</a>' +
+        '</div>';
+    }
+    function modelLinks(name) {
+      const q = encodeURIComponent(name);
+      return '<div class="proj-links">' +
+        '<a class="btn mini" href="/receipt.md?model=' + q + '">Markdown</a>' +
+        '<a class="btn mini" href="/receipt.svg?model=' + q + '">SVG</a>' +
+        '<a class="btn mini" href="/api/export.csv?model=' + q + '">CSV</a>' +
         '</div>';
     }
     function budgetCopy(s) {

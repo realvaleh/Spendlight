@@ -239,11 +239,11 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 | URL | What |
 | --- | --- |
 | `/` | Dashboard (spend, budgets, recent requests) |
-| `/receipt.md` | Markdown receipt (`?project=` scopes one tag) |
-| `/receipt.svg` | Paper-style SVG receipt (`?project=` scopes one tag) |
-| `/badge.svg` | Shields-style badge for a local README (`?project=` for one tag) |
+| `/receipt.md` | Markdown receipt (`?project=` scopes one tag, `?model=` scopes one model) |
+| `/receipt.svg` | Paper-style SVG receipt (`?project=` scopes one tag, `?model=` scopes one model) |
+| `/badge.svg` | Shields-style badge for a local README (`?project=` or `?model=`) |
 | `/api/summary` | JSON for the same numbers |
-| `/api/export.csv` | Spend ledger as CSV (`?project=` for one tag) |
+| `/api/export.csv` | Spend ledger as CSV (`?project=` or `?model=`) |
 | `/health` | Liveness |
 
 Sample receipt (checked in):
@@ -263,6 +263,15 @@ curl -s "http://127.0.0.1:8787/api/export.csv?project=demo" -o demo.csv
 curl -s "http://127.0.0.1:8787/receipt.md?project=demo"
 curl -s "http://127.0.0.1:8787/receipt.svg?project=demo" -o demo-receipt.svg
 curl -s "http://127.0.0.1:8787/badge.svg?project=demo" -o demo-badge.svg
+```
+
+Pass `?model=<id>` the same way to scope the CSV, receipts, or badge to one upstream model id. Sanitization matches project tags. Omit it for every model. An unknown id, or a value that sanitizes to nothing, returns an empty scope rather than the full ledger — it is not rewritten to `default`. When both `project` and `model` are set, a row must match both. There is no per-model budget: a model badge compares that model's window or lifetime spend to the global hard cap, or to the project hard cap when `project` is set too. CSV filenames include the model slug (and the project slug when both are set). By model on the dashboard links to Markdown, SVG, and CSV.
+
+```bash
+curl -s "http://127.0.0.1:8787/api/export.csv?model=gpt-4o-mini" -o gpt-4o-mini.csv
+curl -s "http://127.0.0.1:8787/receipt.md?model=gpt-4o-mini"
+curl -s "http://127.0.0.1:8787/receipt.svg?model=gpt-4o-mini" -o gpt-4o-mini-receipt.svg
+curl -s "http://127.0.0.1:8787/badge.svg?model=gpt-4o-mini" -o gpt-4o-mini-badge.svg
 ```
 
 Local README badge (only useful on a machine that can reach the proxy):
