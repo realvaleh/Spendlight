@@ -65,6 +65,68 @@ function addCalendarMonths(date: Ymd, months: number): Ymd {
   return { year: utc.getUTCFullYear(), month: utc.getUTCMonth() + 1, day: utc.getUTCDate() };
 }
 
+export type CivilTime = {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+  millisecond?: number;
+};
+
+/** A civil time that falls in a DST spring-forward gap. */
+export class SkippedLocalTimeError extends Error {
+  constructor(readonly timeZone: string) {
+    super(`That local time does not exist in ${timeZone}`);
+    this.name = "SkippedLocalTimeError";
+  }
+}
+
+/**
+ * Civil time in `timeZone` as a UTC instant.
+ * When the local clock repeats (DST overlap), the earlier offset is used.
+ */
+export function utcFromCivilTime(timeZone: string, civil: CivilTime): Date {
+  const millisecond = civil.millisecond ?? 0;
+  const utcGuess = new Date(
+    Date.UTC(civil.year, civil.month - 1, civil.day, civil.hour, civil.minute, civil.second, millisecond),
+  );
+  const offset = zoneOffsetMs(timeZone, utcGuess);
+  let instant = new Date(utcGuess.getTime() - offset);
+  const corrected = zoneOffsetMs(timeZone, instant);
+  if (corrected !== offset) instant = new Date(utcGuess.getTime() - corrected);
+  const parts = zonedParts(timeZone, instant);
+  if (
+    parts.year !== civil.year ||
+    parts.month !== civil.month ||
+    parts.day !== civil.day ||
+    parts.hour !== civil.hour ||
+    parts.minute !== civil.minute ||
+    parts.second !== civil.second
+  ) {
+    throw new SkippedLocalTimeError(timeZone);
+  }
+  return instant;
+}
+
+/**
+ * `YYYY-MM-DD` when `date` is local midnight in `timeZone`.
+ * Otherwise `YYYY-MM-DD HH:mm:ss`, with milliseconds when the instant has them.
+ */
+export function formatCivil(timeZone: string, date: Date): string {
+  const parts = zonedParts(timeZone, date);
+  const ymd = `${String(parts.year).padStart(4, "0")}-${pad2(parts.month)}-${pad2(parts.day)}`;
+  const ms = date.getUTCMilliseconds();
+  if (parts.hour === 0 && parts.minute === 0 && parts.second === 0 && ms === 0) return ymd;
+  const clock = `${pad2(parts.hour)}:${pad2(parts.minute)}:${pad2(parts.second)}`;
+  return ms === 0 ? `${ymd} ${clock}` : `${ymd} ${clock}.${String(ms).padStart(3, "0")}`;
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
 /**
  * Local midnight as a UTC instant. The offset is taken at the candidate instant and
  * corrected once so a DST transition later that day does not shift midnight.

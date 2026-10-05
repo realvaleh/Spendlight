@@ -1,10 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Config, LedgerRow, Summary } from "./types.js";
-import { closeDb, listRequests, loadSummaryParts, openDb, spendMatching, type Db } from "./db.js";
+import { closeDb, listRequests, loadSummaryParts, openDb, spendMatching, type CreatedRange, type Db } from "./db.js";
 import { evaluateBudget, spendWindow } from "./budget.js";
 import { dashboardHtml, FAVICON_SVG } from "./ui.js";
 import { badgeSvg, receiptMarkdown, receiptSvg } from "./receipts.js";
 import { proxyRequest, corsHeaders, normalizeModelId, normalizeProjectTag } from "./proxy.js";
+import { parseExportRange, type ParsedExportRange } from "./range.js";
 
 export type App = {
   server: Server;
@@ -77,20 +78,28 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
     return sendJson(res, 200, { ok: true, service: "spendlight" }, req);
   }
   if (req.method === "GET" && url.pathname === "/api/summary") {
-    return sendJson(res, 200, buildSummary(db, config), req);
+    const parsed = exportRangeOr400(url, config, res, req);
+    if (!parsed) return;
+    return sendJson(res, 200, summaryFor(db, config, url, parsed.range), req);
   }
   if (req.method === "GET" && url.pathname === "/api/export.csv") {
+    const parsed = exportRangeOr400(url, config, res, req);
+    if (!parsed) return;
     const project = queryProject(url);
     const model = queryModel(url);
     res.setHeader("cache-control", "no-cache");
-    res.setHeader("content-disposition", `attachment; filename="${csvFilename(project, model)}"`);
-    return send(res, 200, "text/csv; charset=utf-8", ledgerCsv(listRequests(db, project, model)), req);
+    res.setHeader("content-disposition", `attachment; filename="${csvFilename(project, model, parsed.range?.slug)}"`);
+    return send(res, 200, "text/csv; charset=utf-8", ledgerCsv(listRequests(db, project, model, parsed.range)), req);
   }
   if (req.method === "GET" && url.pathname === "/receipt.md") {
-    return send(res, 200, "text/markdown; charset=utf-8", receiptMarkdown(summaryFor(db, config, url)), req);
+    const parsed = exportRangeOr400(url, config, res, req);
+    if (!parsed) return;
+    return send(res, 200, "text/markdown; charset=utf-8", receiptMarkdown(summaryFor(db, config, url, parsed.range)), req);
   }
   if (req.method === "GET" && url.pathname === "/receipt.svg") {
-    return send(res, 200, "image/svg+xml; charset=utf-8", receiptSvg(summaryFor(db, config, url)), req);
+    const parsed = exportRangeOr400(url, config, res, req);
+    if (!parsed) return;
+    return send(res, 200, "image/svg+xml; charset=utf-8", receiptSvg(summaryFor(db, config, url, parsed.range)), req);
   }
   if (req.method === "GET" && url.pathname === "/badge.svg") {
     res.setHeader("cache-control", "no-cache");
@@ -105,8 +114,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
   sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } }, req);
 }
 
-export function buildSummary(db: Db, config: Config, project?: string, model?: string): Summary {
-  const parts = loadSummaryParts(db, project, model);
+export function buildSummary(
+  db: Db,
+  config: Config,
+  project?: string,
+  model?: string,
+  range?: CreatedRange | null,
+): Summary {
+  const parts = loadSummaryParts(db, project, model, range);
   const budget = evaluateBudget(db, config, project ?? "default");
   const window = model !== undefined ? spendWindow(config) : null;
   const scopeWindowSpend = window ? spendMatching(db, project, model, window) : null;
@@ -115,13 +130,30 @@ export function buildSummary(db: Db, config: Config, project?: string, model?: s
     ...parts,
     scopeProject: project === undefined ? null : project,
     scopeModel: model === undefined ? null : model,
+    scopeSince: range?.sinceIso ?? null,
+    scopeUntil: range?.untilIso ?? null,
     scopeWindowSpend,
     budget,
   };
 }
 
-function summaryFor(db: Db, config: Config, url: URL): Summary {
-  return buildSummary(db, config, queryProject(url), queryModel(url));
+function summaryFor(db: Db, config: Config, url: URL, range?: CreatedRange | null): Summary {
+  return buildSummary(db, config, queryProject(url), queryModel(url), range);
+}
+
+/** Writes a 400 and returns undefined when `since`, `until`, or `window` is invalid. */
+function exportRangeOr400(
+  url: URL,
+  config: Config,
+  res: ServerResponse,
+  req: IncomingMessage,
+): Extract<ParsedExportRange, { ok: true }> | undefined {
+  const parsed = parseExportRange(url, config);
+  if (!parsed.ok) {
+    sendJson(res, 400, parsed.error, req);
+    return undefined;
+  }
+  return parsed;
 }
 
 /** Absent `project` stays unscoped. Present values use request-tag rules and do not become `default`. */
@@ -136,8 +168,8 @@ function queryModel(url: URL): string | undefined {
   return normalizeModelId(url.searchParams.get("model") ?? "");
 }
 
-function csvFilename(project: string | undefined, model: string | undefined): string {
-  const slug = [project, model]
+function csvFilename(project: string | undefined, model: string | undefined, rangeSlug?: string | null): string {
+  const slug = [project, model, rangeSlug]
     .filter((value): value is string => Boolean(value))
     .map(fileSlug)
     .filter(Boolean)

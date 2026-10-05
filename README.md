@@ -239,11 +239,11 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 | URL | What |
 | --- | --- |
 | `/` | Dashboard (spend, budgets, recent requests) |
-| `/receipt.md` | Markdown receipt (`?project=` scopes one tag, `?model=` scopes one model) |
-| `/receipt.svg` | Paper-style SVG receipt (`?project=` scopes one tag, `?model=` scopes one model) |
-| `/badge.svg` | Shields-style badge for a local README (`?project=` or `?model=`) |
-| `/api/summary` | JSON for the same numbers |
-| `/api/export.csv` | Spend ledger as CSV (`?project=` or `?model=`) |
+| `/receipt.md` | Markdown receipt (`?project=`, `?model=`, optional `?since=` / `?until=` / `?window=current`) |
+| `/receipt.svg` | Paper-style SVG receipt (same scope parameters as the markdown receipt) |
+| `/badge.svg` | Shields-style badge for a local README (`?project=` or `?model=`; time parameters are ignored) |
+| `/api/summary` | JSON for the same numbers (same scope parameters as the receipts) |
+| `/api/export.csv` | Spend ledger as CSV (same scope parameters as the receipts) |
 | `/health` | Liveness |
 
 Sample receipt (checked in):
@@ -272,6 +272,17 @@ curl -s "http://127.0.0.1:8787/api/export.csv?model=gpt-4o-mini" -o gpt-4o-mini.
 curl -s "http://127.0.0.1:8787/receipt.md?model=gpt-4o-mini"
 curl -s "http://127.0.0.1:8787/receipt.svg?model=gpt-4o-mini" -o gpt-4o-mini-receipt.svg
 curl -s "http://127.0.0.1:8787/badge.svg?model=gpt-4o-mini" -o gpt-4o-mini-badge.svg
+```
+
+Pass `?since=` and `?until=` to limit the CSV, Markdown receipt, SVG receipt, or `/api/summary` to a time slice. `/api/summary` takes `project` and `model` the same way as the receipts. Either time bound can be omitted. The filters combine: a row has to match every one that is set. The range is half-open, `since` inclusive and `until` exclusive. A bare `YYYY-MM-DD` is midnight in the budget timezone (`budgets.timezone` / `SPENDLIGHT_BUDGET_TIMEZONE`, UTC when unset), the same zone calendar budget windows use. A datetime with `Z` or a numeric offset is that absolute instant. A datetime with no offset is civil time in the budget timezone. Omit both bounds for the whole ledger.
+
+`?window=current` is shorthand for the active day, week, or month budget window. It is a 400 when the budget period is `lifetime`, and it cannot be combined with `since` or `until`. An unparseable value, or a range where `since` is not earlier than `until`, is a 400 JSON error (`invalid_request_error` / `invalid_time_range`) rather than the full ledger. Receipts name the covered range. CSV filenames add a range slug next to any project or model slug. The badge ignores these parameters and still compares budget-window or lifetime spend to the configured hard cap. The kill-switch still counts the configured lifetime total or calendar window.
+
+```bash
+curl -s "http://127.0.0.1:8787/api/export.csv?since=2026-10-01&until=2026-10-05" -o october-week.csv
+curl -s "http://127.0.0.1:8787/receipt.md?project=demo&since=2026-10-04"
+curl -s "http://127.0.0.1:8787/receipt.svg?model=gpt-4o-mini&since=2026-10-01&until=2026-11-01" -o month-receipt.svg
+curl -s "http://127.0.0.1:8787/api/summary?window=current"
 ```
 
 Local README badge (only useful on a machine that can reach the proxy):

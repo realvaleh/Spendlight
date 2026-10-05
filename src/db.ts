@@ -77,6 +77,15 @@ export function purgeStaleReservations(db: Db, now = Date.now()): void {
 /** Half-open UTC range. When set, only rows inside it count toward a budget. */
 export type SpendWindow = { startIso: string; endIso: string };
 
+/**
+ * Half-open `created_at` filter for exports and summaries.
+ * A null side is unbounded. This does not change budget windows.
+ */
+export type CreatedRange = {
+  sinceIso: string | null;
+  untilIso: string | null;
+};
+
 export function reservedSpend(db: Db, project?: string, window?: SpendWindow | null): number {
   if (!window) {
     if (project) {
@@ -228,17 +237,17 @@ const REQUEST_COLUMNS = `id, created_at AS createdAt, project, model,
               cached_tokens AS cachedTokens, total_tokens AS totalTokens,
               cost_usd AS costUsd, status, error, upstream_id AS upstreamId, path, streamed`;
 
-export function listRecent(db: Db, limit = 50, project?: string, model?: string): LedgerRow[] {
-  const { clause, args } = requestWhere({ project, model });
+export function listRecent(db: Db, limit = 50, project?: string, model?: string, range?: CreatedRange | null): LedgerRow[] {
+  const { clause, args } = requestWhere({ project, model }, range);
   const rows = db
     .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests${clause} ORDER BY created_at DESC LIMIT ?`)
     .all(...args, limit) as LedgerRow[];
   return rows.map(normalizeRow);
 }
 
-/** Ledger rows, oldest first, for CSV export. Pass a project and/or model to export one slice. */
-export function listRequests(db: Db, project?: string, model?: string): LedgerRow[] {
-  const { clause, args } = requestWhere({ project, model });
+/** Ledger rows, oldest first, for CSV export. Pass a project, model, and/or time range to export one slice. */
+export function listRequests(db: Db, project?: string, model?: string, range?: CreatedRange | null): LedgerRow[] {
+  const { clause, args } = requestWhere({ project, model }, range);
   const rows = db
     .prepare(`SELECT ${REQUEST_COLUMNS} FROM requests${clause} ORDER BY created_at ASC, id ASC`)
     .all(...args) as LedgerRow[];
@@ -247,14 +256,15 @@ export function listRequests(db: Db, project?: string, model?: string): LedgerRo
 
 /** Sum cost for an export scope. Undefined project or model leaves that dimension unscoped. */
 export function spendMatching(db: Db, project?: string, model?: string, window?: SpendWindow | null): number {
-  const { clause, args } = requestWhere({ project, model }, window);
+  const range = window ? { sinceIso: window.startIso, untilIso: window.endIso } : null;
+  const { clause, args } = requestWhere({ project, model }, range);
   const row = db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM requests${clause}`).get(...args) as { s: number };
   return Number(row.s) || 0;
 }
 
 function requestWhere(
   scope: { project?: string; model?: string },
-  window?: SpendWindow | null,
+  range?: CreatedRange | null,
 ): { clause: string; args: string[] } {
   const clauses: string[] = [];
   const args: string[] = [];
@@ -266,16 +276,18 @@ function requestWhere(
     clauses.push("model = ?");
     args.push(scope.model);
   }
-  if (window) {
+  if (range?.sinceIso) {
     clauses.push("created_at >= ?");
-    args.push(window.startIso);
+    args.push(range.sinceIso);
+  }
+  if (range?.untilIso) {
     clauses.push("created_at < ?");
-    args.push(window.endIso);
+    args.push(range.untilIso);
   }
   return { clause: clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "", args };
 }
 
-export function loadSummaryParts(db: Db, project?: string, model?: string): {
+export function loadSummaryParts(db: Db, project?: string, model?: string, range?: CreatedRange | null): {
   spendUsd: number;
   requests: number;
   tokens: number;
@@ -285,7 +297,7 @@ export function loadSummaryParts(db: Db, project?: string, model?: string): {
   recent: LedgerRow[];
   events: { createdAt: string; type: string; project: string; message: string }[];
 } {
-  const { clause, args } = requestWhere({ project, model });
+  const { clause, args } = requestWhere({ project, model }, range);
   const totals = db.prepare(`SELECT COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens FROM requests${clause}`).get(...args) as {
     spendUsd: number;
     requests: number;
@@ -321,7 +333,7 @@ export function loadSummaryParts(db: Db, project?: string, model?: string): {
     byProject: byProject.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
     byModel: byModel.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
     daily: daily.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests) })),
-    recent: listRecent(db, 40, project, model),
+    recent: listRecent(db, 40, project, model, range),
     events,
   };
 }

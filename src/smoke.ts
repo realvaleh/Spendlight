@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
 import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
-import { calendarDayBounds, calendarMonthBounds, calendarWeekBounds } from "./day.js";
+import { calendarDayBounds, calendarMonthBounds, calendarWeekBounds, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
@@ -314,8 +314,9 @@ async function main(): Promise<void> {
     await testSoftWarnLifetimeDedupe(dir, mockUrl);
     await testProjectScope(dir, mockUrl);
     await testModelScope(dir, mockUrl);
+    await testTimeScope(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope");
+    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -1621,6 +1622,359 @@ async function testModelScope(dir: string, mockUrl: string): Promise<void> {
 
 function csvLines(csv: string): string[] {
   return csv.split(/\r?\n/).filter((line) => line.length > 0);
+}
+
+async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
+  const midnight = utcFromCivilTime("America/New_York", { year: 2026, month: 10, day: 4, hour: 0, minute: 0, second: 0 });
+  assert(midnight.toISOString() === "2026-10-04T04:00:00.000Z", `ny midnight ${midnight.toISOString()}`);
+  const fold = utcFromCivilTime("America/New_York", { year: 2026, month: 11, day: 1, hour: 1, minute: 30, second: 0 });
+  assert(fold.toISOString() === "2026-11-01T05:30:00.000Z", `dst overlap ${fold.toISOString()}`);
+  let skipped = false;
+  try {
+    utcFromCivilTime("America/New_York", { year: 2026, month: 3, day: 8, hour: 2, minute: 30, second: 0 });
+  } catch (err) {
+    skipped = err instanceof SkippedLocalTimeError;
+  }
+  assert(skipped, "spring-forward gap should be rejected");
+
+  await withApp(dir, "time-scope", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
+    seedSpend(app.db, "2026-10-01T00:00:00.000Z", 1, "demo", "gpt-4o-mini");
+    seedSpend(app.db, "2026-10-03T12:00:00.000Z", 2, "demo", "gpt-4o");
+    seedSpend(app.db, "2026-10-03T18:00:00.000Z", 4, "other", "gpt-4o-mini");
+    seedSpend(app.db, "2026-10-05T00:00:00.000Z", 8, "demo", "gpt-4o-mini");
+
+    const allCsv = await fetch(`${base}/api/export.csv`);
+    assert(allCsv.status === 200, `unscoped csv ${allCsv.status}`);
+    assert((allCsv.headers.get("content-disposition") ?? "").includes("spendlight-ledger.csv"), "time tests changed the unscoped filename");
+    assert(csvLines(await allCsv.text()).length === 5, "unscoped csv should still be the whole ledger");
+    const allMd = await fetch(`${base}/receipt.md`).then((r) => r.text());
+    assert(!allMd.includes("Covered **"), "unscoped receipt should not name a time slice");
+    const allSummary = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+      spendUsd: number;
+      scopeSince: string | null;
+      scopeUntil: string | null;
+      budget: { globalSpend: number };
+    };
+    assert(Math.abs(allSummary.spendUsd - 15) < 1e-6, `unscoped summary spend ${allSummary.spendUsd}`);
+    assert(allSummary.scopeSince == null && allSummary.scopeUntil == null, "unscoped summary should not set a time slice");
+    assert(Math.abs(allSummary.budget.globalSpend - 15) < 1e-6, `lifetime budget spend ${allSummary.budget.globalSpend}`);
+
+    const sinceCsv = await fetch(`${base}/api/export.csv?since=2026-10-03`);
+    assert(sinceCsv.status === 200, `since csv ${sinceCsv.status}`);
+    assert(
+      (sinceCsv.headers.get("content-disposition") ?? "").includes("spendlight-since-2026-10-03.csv"),
+      sinceCsv.headers.get("content-disposition") ?? "missing since filename",
+    );
+    const sinceLines = csvLines(await sinceCsv.text());
+    assert(sinceLines.length === 4, `since csv rows ${sinceLines.length}`);
+    assert(!sinceLines.some((line) => line.startsWith("2026-10-01T")), "since csv included the earlier row");
+    assert(sinceLines.some((line) => line.startsWith("2026-10-05T00:00:00.000Z")), "since csv dropped the open end");
+    const sinceMd = await fetch(`${base}/receipt.md?since=2026-10-03`).then((r) => r.text());
+    assert(sinceMd.includes("Covered **from 2026-10-03 inclusive (UTC)**"), sinceMd);
+    assert(sinceMd.includes("| Total spend | $14.00 |"), sinceMd);
+    assert(!sinceMd.includes("2026-10-01T00:00:00.000Z"), "since receipt listed the earlier request");
+    const sinceSummary = (await fetch(`${base}/api/summary?since=2026-10-03`).then((r) => r.json())) as {
+      spendUsd: number;
+      requests: number;
+      scopeSince: string | null;
+      scopeUntil: string | null;
+      budget: { globalSpend: number; status: string };
+    };
+    assert(Math.abs(sinceSummary.spendUsd - 14) < 1e-6, `since summary spend ${sinceSummary.spendUsd}`);
+    assert(sinceSummary.requests === 3, `since summary requests ${sinceSummary.requests}`);
+    assert(sinceSummary.scopeSince === "2026-10-03T00:00:00.000Z", sinceSummary.scopeSince ?? "missing since");
+    assert(sinceSummary.scopeUntil == null, "since-only summary should leave until open");
+    assert(Math.abs(sinceSummary.budget.globalSpend - 15) < 1e-6, "since filter changed the kill-switch spend");
+
+    const untilCsv = await fetch(`${base}/api/export.csv?until=2026-10-03`);
+    assert(untilCsv.status === 200, `until csv ${untilCsv.status}`);
+    assert(
+      (untilCsv.headers.get("content-disposition") ?? "").includes("spendlight-until-2026-10-03.csv"),
+      untilCsv.headers.get("content-disposition") ?? "missing until filename",
+    );
+    const untilLines = csvLines(await untilCsv.text());
+    assert(untilLines.length === 2, `until csv should be header + the Oct 1 row, got ${untilLines.length}`);
+    assert(untilLines[1]?.startsWith("2026-10-01T00:00:00.000Z,demo,gpt-4o-mini,"), untilLines[1] ?? "missing until row");
+    const untilMd = await fetch(`${base}/receipt.md?until=2026-10-03`).then((r) => r.text());
+    assert(untilMd.includes("Covered **before 2026-10-03 (UTC)**"), untilMd);
+    assert(untilMd.includes("| Total spend | $1.00 |"), untilMd);
+    assert(!untilMd.includes("2026-10-03T12:00:00.000Z"), "until receipt included the exclusive bound");
+
+    const bothCsv = await fetch(`${base}/api/export.csv?since=2026-10-03&until=2026-10-05`);
+    assert(bothCsv.status === 200, `both csv ${bothCsv.status}`);
+    assert(
+      (bothCsv.headers.get("content-disposition") ?? "").includes("spendlight-2026-10-03_2026-10-05.csv"),
+      bothCsv.headers.get("content-disposition") ?? "missing range filename",
+    );
+    const bothLines = csvLines(await bothCsv.text());
+    assert(bothLines.length === 3, `both csv rows ${bothLines.length}`);
+    assert(bothLines.some((line) => line.startsWith("2026-10-03T12:00:00.000Z")), "both csv missing the inclusive start");
+    assert(bothLines.some((line) => line.startsWith("2026-10-03T18:00:00.000Z")), "both csv missing the later in-range row");
+    assert(!bothLines.some((line) => line.startsWith("2026-10-05T")), "both csv included the exclusive until");
+    assert(!bothLines.some((line) => line.startsWith("2026-10-01T")), "both csv included the row before since");
+    const bothMd = await fetch(`${base}/receipt.md?since=2026-10-03&until=2026-10-05`).then((r) => r.text());
+    assert(bothMd.includes("Covered **2026-10-03 inclusive to 2026-10-05 exclusive (UTC)**"), bothMd);
+    assert(bothMd.includes("| Total spend | $6.00 |"), bothMd);
+    const bothSvg = await fetch(`${base}/receipt.svg?since=2026-10-03&until=2026-10-05`).then((r) => r.text());
+    assert(bothSvg.includes("2026-10-03 → 2026-10-05 · UTC"), bothSvg);
+    assert(bothSvg.includes("$6.00"), bothSvg);
+    assert(!bothSvg.includes("$8.00"), "ranged svg showed the excluded row");
+
+    const clockCsv = await fetch(`${base}/api/export.csv?since=2026-10-03T15:00:00Z&until=2026-10-05T00:00:00Z`);
+    assert(clockCsv.status === 200, `datetime csv ${clockCsv.status}`);
+    assert(
+      (clockCsv.headers.get("content-disposition") ?? "").includes("spendlight-2026-10-03T150000_2026-10-05.csv"),
+      clockCsv.headers.get("content-disposition") ?? "missing datetime filename",
+    );
+    const clockLines = csvLines(await clockCsv.text());
+    assert(clockLines.length === 2, `datetime csv rows ${clockLines.length}`);
+    assert(clockLines[1]?.startsWith("2026-10-03T18:00:00.000Z,other,gpt-4o-mini,"), clockLines[1] ?? "missing datetime row");
+    const clockMd = await fetch(`${base}/receipt.md?since=2026-10-03T15:00:00Z&until=2026-10-05T00:00:00Z`).then((r) => r.text());
+    assert(clockMd.includes("Covered **2026-10-03 15:00:00 inclusive to 2026-10-05 exclusive (UTC)**"), clockMd);
+    assert(clockMd.includes("| Total spend | $4.00 |"), clockMd);
+
+    const andCsv = await fetch(`${base}/api/export.csv?project=demo&model=gpt-4o-mini&since=2026-10-01&until=2026-10-05`);
+    assert(andCsv.status === 200, `project+model+range csv ${andCsv.status}`);
+    assert(
+      (andCsv.headers.get("content-disposition") ?? "").includes("spendlight-demo-gpt-4o-mini-2026-10-01_2026-10-05.csv"),
+      andCsv.headers.get("content-disposition") ?? "missing combined filename",
+    );
+    const andLines = csvLines(await andCsv.text());
+    assert(andLines.length === 2, `combined csv rows ${andLines.length}`);
+    assert(andLines[1]?.includes(",demo,gpt-4o-mini,"), andLines[1] ?? "missing combined row");
+    assert(andLines[1]?.startsWith("2026-10-01T00:00:00.000Z"), "combined csv picked the wrong row");
+    const andMd = await fetch(`${base}/receipt.md?project=demo&model=gpt-4o-mini&since=2026-10-01&until=2026-10-05`).then((r) => r.text());
+    assert(andMd.includes("Project **demo**"), andMd);
+    assert(andMd.includes("Model **gpt-4o-mini**"), andMd);
+    assert(andMd.includes("Covered **2026-10-01 inclusive to 2026-10-05 exclusive (UTC)**"), andMd);
+    assert(andMd.includes("| Total spend | $1.00 |"), andMd);
+    assert(andMd.includes("| Global spend | $15.00 |"), andMd);
+    assert(!andMd.includes("| other |"), "combined receipt listed another project");
+    assert(!andMd.includes("| `gpt-4o` |"), "combined receipt listed another model");
+    const andSummary = (await fetch(`${base}/api/summary?project=demo&model=gpt-4o-mini&since=2026-10-01&until=2026-10-05`).then((r) => r.json())) as {
+      spendUsd: number;
+      requests: number;
+      scopeProject: string | null;
+      scopeModel: string | null;
+      scopeSince: string | null;
+      scopeUntil: string | null;
+      budget: { globalSpend: number };
+      byProject: { project: string }[];
+      byModel: { model: string }[];
+    };
+    assert(Math.abs(andSummary.spendUsd - 1) < 1e-6, `combined summary spend ${andSummary.spendUsd}`);
+    assert(andSummary.requests === 1, `combined summary requests ${andSummary.requests}`);
+    assert(andSummary.scopeProject === "demo", andSummary.scopeProject ?? "missing project");
+    assert(andSummary.scopeModel === "gpt-4o-mini", andSummary.scopeModel ?? "missing model");
+    assert(andSummary.scopeSince === "2026-10-01T00:00:00.000Z", andSummary.scopeSince ?? "missing since");
+    assert(andSummary.scopeUntil === "2026-10-05T00:00:00.000Z", andSummary.scopeUntil ?? "missing until");
+    assert(Math.abs(andSummary.budget.globalSpend - 15) < 1e-6, "combined filters changed kill-switch spend");
+    assert(andSummary.byProject.length === 1 && andSummary.byProject[0]?.project === "demo", "combined summary leaked projects");
+    assert(andSummary.byModel.length === 1 && andSummary.byModel[0]?.model === "gpt-4o-mini", "combined summary leaked models");
+
+    const badge = await fetch(`${base}/badge.svg?since=2026-10-05&until=2026-10-06`);
+    assert(badge.status === 200, `badge should ignore a time slice, got ${badge.status}`);
+    const badgeText = await badge.text();
+    assert(badgeText.includes("$15.00 / $100.00"), badgeText);
+    assert(!badgeText.includes("2026-10-05"), "badge rendered the time slice");
+    const badBadge = await fetch(`${base}/badge.svg?since=yesterday`);
+    assert(badBadge.status === 200, `badge should ignore an invalid time slice, got ${badBadge.status}`);
+
+    await expectRange400(`${base}/api/export.csv?since=yesterday`, "since", "Invalid since");
+    await expectRange400(`${base}/api/export.csv?since=`, "since", "Invalid since");
+    await expectRange400(`${base}/api/export.csv?until=2026-02-31`, "until", "does not exist");
+    await expectRange400(`${base}/api/export.csv?since=2026-13-01`, "since", "does not exist");
+    await expectRange400(`${base}/api/export.csv?since=2026-10-04T25:00:00Z`, "since", "does not exist");
+    await expectRange400(`${base}/api/export.csv?since=2026-10-05&until=2026-10-03`, null, "earlier than until");
+    await expectRange400(`${base}/api/export.csv?since=2026-10-03&until=2026-10-03`, null, "earlier than until");
+    await expectRange400(`${base}/receipt.md?since=nope`, "since", "Invalid since");
+    await expectRange400(`${base}/receipt.svg?until=2026-02-31`, "until", "does not exist");
+    await expectRange400(`${base}/api/summary?since=2026-10-05&until=2026-10-01`, null, "earlier than until");
+    await expectRange400(`${base}/api/export.csv?window=current`, "window", "lifetime");
+    await expectRange400(`${base}/receipt.md?window=later`, "window", "current");
+    await expectRange400(`${base}/api/summary?window=current&since=2026-10-01`, "window", "cannot be combined");
+  });
+
+  await withApp(
+    dir,
+    "time-scope-ny",
+    mockUrl,
+    { softUsd: null, hardUsd: 100, timezone: "America/New_York" },
+    async (base, app) => {
+      seedSpend(app.db, "2026-10-04T03:59:59.000Z", 9, "demo", "gpt-4o-mini");
+      seedSpend(app.db, "2026-10-04T04:00:00.000Z", 1, "demo", "gpt-4o-mini");
+      seedSpend(app.db, "2026-10-04T16:00:00.000Z", 2, "other", "gpt-4o");
+      seedSpend(app.db, "2026-10-05T04:00:00.000Z", 4, "demo", "gpt-4o-mini");
+
+      const sinceCsv = await fetch(`${base}/api/export.csv?since=2026-10-04`);
+      assert(sinceCsv.status === 200, `ny since csv ${sinceCsv.status}`);
+      assert(
+        (sinceCsv.headers.get("content-disposition") ?? "").includes("spendlight-since-2026-10-04.csv"),
+        sinceCsv.headers.get("content-disposition") ?? "ny since filename used the UTC instant",
+      );
+      const sinceLines = csvLines(await sinceCsv.text());
+      assert(sinceLines.length === 4, `ny since rows ${sinceLines.length}`);
+      assert(!sinceLines.some((line) => line.startsWith("2026-10-04T03:59:59.000Z")), "ny since included the previous local day");
+      const sinceMd = await fetch(`${base}/receipt.md?since=2026-10-04`).then((r) => r.text());
+      assert(sinceMd.includes("Covered **from 2026-10-04 inclusive (America/New_York)**"), sinceMd);
+      assert(sinceMd.includes("| Total spend | $7.00 |"), sinceMd);
+
+      const untilCsv = await fetch(`${base}/api/export.csv?until=2026-10-05`);
+      assert(
+        (untilCsv.headers.get("content-disposition") ?? "").includes("spendlight-until-2026-10-05.csv"),
+        untilCsv.headers.get("content-disposition") ?? "ny until filename",
+      );
+      const untilLines = csvLines(await untilCsv.text());
+      assert(untilLines.length === 4, `ny until rows ${untilLines.length}`);
+      assert(!untilLines.some((line) => line.startsWith("2026-10-05T04:00:00.000Z")), "ny until included local midnight");
+      const untilMd = await fetch(`${base}/receipt.md?until=2026-10-05`).then((r) => r.text());
+      assert(untilMd.includes("Covered **before 2026-10-05 (America/New_York)**"), untilMd);
+      assert(untilMd.includes("| Total spend | $12.00 |"), untilMd);
+
+      const bothCsv = await fetch(`${base}/api/export.csv?since=2026-10-04&until=2026-10-05`);
+      assert(bothCsv.status === 200, `ny both csv ${bothCsv.status}`);
+      assert(
+        (bothCsv.headers.get("content-disposition") ?? "").includes("spendlight-2026-10-04_2026-10-05.csv"),
+        bothCsv.headers.get("content-disposition") ?? "ny range filename",
+      );
+      const bothLines = csvLines(await bothCsv.text());
+      assert(bothLines.length === 3, `ny both rows ${bothLines.length}`);
+      assert(bothLines.some((line) => line.startsWith("2026-10-04T04:00:00.000Z")), "ny both excluded local midnight");
+      assert(bothLines.some((line) => line.startsWith("2026-10-04T16:00:00.000Z")), "ny both excluded the afternoon row");
+      assert(!bothLines.some((line) => line.startsWith("2026-10-04T03:59:59.000Z")), "ny both included the previous evening");
+      assert(!bothLines.some((line) => line.startsWith("2026-10-05T04:00:00.000Z")), "ny both included the next local midnight");
+      const bothMd = await fetch(`${base}/receipt.md?since=2026-10-04&until=2026-10-05`).then((r) => r.text());
+      assert(bothMd.includes("Covered **2026-10-04 inclusive to 2026-10-05 exclusive (America/New_York)**"), bothMd);
+      assert(bothMd.includes("| Total spend | $3.00 |"), bothMd);
+      const bothSvg = await fetch(`${base}/receipt.svg?since=2026-10-04&until=2026-10-05`).then((r) => r.text());
+      assert(bothSvg.includes("2026-10-04 → 2026-10-05 · America/New_York"), bothSvg);
+      const bothSummary = (await fetch(`${base}/api/summary?since=2026-10-04&until=2026-10-05`).then((r) => r.json())) as {
+        scopeSince: string | null;
+        scopeUntil: string | null;
+        budget: { globalSpend: number; timezone: string };
+      };
+      assert(bothSummary.scopeSince === "2026-10-04T04:00:00.000Z", bothSummary.scopeSince ?? "missing ny since");
+      assert(bothSummary.scopeUntil === "2026-10-05T04:00:00.000Z", bothSummary.scopeUntil ?? "missing ny until");
+      assert(bothSummary.budget.timezone === "America/New_York", bothSummary.budget.timezone);
+      assert(Math.abs(bothSummary.budget.globalSpend - 16) < 1e-6, "ny slice changed kill-switch spend");
+
+      const offset = (await fetch(`${base}/api/summary?since=2026-10-04T00:00:00-04:00&until=2026-10-05T00:00:00-04:00`).then((r) => r.json())) as {
+        spendUsd: number;
+        scopeSince: string | null;
+        scopeUntil: string | null;
+      };
+      assert(offset.scopeSince === "2026-10-04T04:00:00.000Z", offset.scopeSince ?? "offset since");
+      assert(offset.scopeUntil === "2026-10-05T04:00:00.000Z", offset.scopeUntil ?? "offset until");
+      assert(Math.abs(offset.spendUsd - 3) < 1e-6, `offset range spend ${offset.spendUsd}`);
+
+      const civil = (await fetch(`${base}/api/summary?since=2026-10-04T12:00:00&until=2026-10-05`).then((r) => r.json())) as {
+        spendUsd: number;
+        requests: number;
+        scopeSince: string | null;
+      };
+      assert(civil.scopeSince === "2026-10-04T16:00:00.000Z", civil.scopeSince ?? "civil since");
+      assert(civil.requests === 1, `civil datetime requests ${civil.requests}`);
+      assert(Math.abs(civil.spendUsd - 2) < 1e-6, `civil datetime spend ${civil.spendUsd}`);
+
+      const andCsv = await fetch(`${base}/api/export.csv?project=demo&model=gpt-4o-mini&since=2026-10-04&until=2026-10-05`);
+      assert(
+        (andCsv.headers.get("content-disposition") ?? "").includes("spendlight-demo-gpt-4o-mini-2026-10-04_2026-10-05.csv"),
+        andCsv.headers.get("content-disposition") ?? "ny combined filename",
+      );
+      const andLines = csvLines(await andCsv.text());
+      assert(andLines.length === 2, `ny combined rows ${andLines.length}`);
+      assert(andLines[1]?.startsWith("2026-10-04T04:00:00.000Z,demo,gpt-4o-mini,"), andLines[1] ?? "ny combined row");
+      const andMd = await fetch(`${base}/receipt.md?project=demo&model=gpt-4o-mini&since=2026-10-04&until=2026-10-05`).then((r) => r.text());
+      assert(andMd.includes("| Total spend | $1.00 |"), andMd);
+      assert(andMd.includes("| Global spend | $16.00 |"), andMd);
+      assert(andMd.includes("America/New_York"), andMd);
+
+      await expectRange400(`${base}/receipt.md?since=2026-03-08T02:30:00`, "since", "America/New_York");
+    },
+  );
+
+  await withApp(
+    dir,
+    "time-scope-day",
+    mockUrl,
+    { softUsd: null, hardUsd: 50, period: "day", timezone: "America/New_York" },
+    async (base, app) => {
+      const window = spendWindow(app.config);
+      assert(window, "day window for export scope");
+      const today = civilYmd("America/New_York", new Date(window.startIso));
+      const tomorrow = civilYmd("America/New_York", new Date(window.endIso));
+      const yesterday = civilYmd("America/New_York", new Date(Date.parse(window.startIso) - 1000));
+      seedSpend(app.db, new Date(Date.parse(window.startIso) - 1000).toISOString(), 9, "demo");
+      seedSpend(app.db, window.startIso, 1, "demo");
+
+      const currentCsv = await fetch(`${base}/api/export.csv?window=current`);
+      assert(currentCsv.status === 200, `window=current csv ${currentCsv.status}`);
+      assert(
+        (currentCsv.headers.get("content-disposition") ?? "").includes(`spendlight-${today}_${tomorrow}.csv`),
+        currentCsv.headers.get("content-disposition") ?? "window filename",
+      );
+      const currentLines = csvLines(await currentCsv.text());
+      assert(currentLines.length === 2, `window=current rows ${currentLines.length}`);
+      assert(currentLines[1]?.startsWith(window.startIso), currentLines[1] ?? "window csv row");
+      const currentSummary = (await fetch(`${base}/api/summary?window=current`).then((r) => r.json())) as {
+        spendUsd: number;
+        scopeSince: string | null;
+        scopeUntil: string | null;
+        budget: { globalSpend: number; status: string; period: string };
+      };
+      assert(Math.abs(currentSummary.spendUsd - 1) < 1e-6, `window summary spend ${currentSummary.spendUsd}`);
+      assert(currentSummary.scopeSince === window.startIso, currentSummary.scopeSince ?? "missing window since");
+      assert(currentSummary.scopeUntil === window.endIso, currentSummary.scopeUntil ?? "missing window until");
+      assert(Math.abs(currentSummary.budget.globalSpend - 1) < 1e-6, `window budget spend ${currentSummary.budget.globalSpend}`);
+      assert(currentSummary.budget.status === "ok", currentSummary.budget.status);
+      assert(currentSummary.budget.period === "day", currentSummary.budget.period);
+
+      const slice = (await fetch(`${base}/api/summary?since=${yesterday}&until=${today}`).then((r) => r.json())) as {
+        spendUsd: number;
+        budget: { globalSpend: number; status: string };
+      };
+      assert(Math.abs(slice.spendUsd - 9) < 1e-6, `yesterday slice spend ${slice.spendUsd}`);
+      assert(Math.abs(slice.budget.globalSpend - 1) < 1e-6, "export slice replaced the day budget");
+      assert(slice.budget.status === "ok", slice.budget.status);
+      const sliceMd = await fetch(`${base}/receipt.md?since=${yesterday}&until=${today}`).then((r) => r.text());
+      assert(sliceMd.includes(`Covered **${yesterday} inclusive to ${today} exclusive (America/New_York)**`), sliceMd);
+      assert(sliceMd.includes("| Total spend | $9.00 |"), sliceMd);
+      assert(sliceMd.includes("| Budget window | today (America/New_York) |"), sliceMd);
+      assert(sliceMd.includes("| Spend in window | $1.00 |"), sliceMd);
+      const plain = (await fetch(`${base}/api/summary`).then((r) => r.json())) as { spendUsd: number; scopeSince: string | null };
+      assert(plain.spendUsd > 9, `unscoped day summary should stay lifetime, got ${plain.spendUsd}`);
+      assert(plain.scopeSince == null, "unscoped summary picked up window=current");
+    },
+  );
+}
+
+async function expectRange400(url: string, param: string | null, snippet: string): Promise<void> {
+  const res = await fetch(url);
+  const text = await res.text();
+  assert(res.status === 400, `${url} status ${res.status}: ${text.slice(0, 240)}`);
+  assert((res.headers.get("content-type") ?? "").includes("application/json"), `${url} content-type ${res.headers.get("content-type")}`);
+  assert(!text.includes("promptTokens"), `${url} returned a ledger: ${text.slice(0, 180)}`);
+  const body = JSON.parse(text) as {
+    error?: { message?: string; type?: string; param?: string | null; code?: string };
+  };
+  assert(body.error?.type === "invalid_request_error", text);
+  assert(body.error?.code === "invalid_time_range", text);
+  assert(body.error?.param === param, `${url} param ${String(body.error?.param)}: ${body.error?.message}`);
+  assert((body.error?.message ?? "").includes(snippet), body.error?.message ?? text);
+}
+
+function civilYmd(timeZone: string, date: Date): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const map: Record<string, string> = {};
+  for (const part of parts) {
+    if (part.type !== "literal") map[part.type] = part.value;
+  }
+  return `${map.year}-${map.month}-${map.day}`;
 }
 
 async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise<void> {
