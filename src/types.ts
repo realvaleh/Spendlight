@@ -85,8 +85,19 @@ export type Summary = {
    */
   scopeModel: string | null;
   /**
+   * Inclusive UTC instant when the summary is limited to a time slice.
+   * Null when that side is open, or when no time slice was requested.
+   */
+  scopeSince: string | null;
+  /**
+   * Exclusive UTC instant when the summary is limited to a time slice.
+   * Null when that side is open, or when no time slice was requested.
+   */
+  scopeUntil: string | null;
+  /**
    * Model-scoped spend inside the calendar window (AND the project when one is set).
    * Null when the summary is not model-scoped, or the budget period is lifetime.
+   * This is the kill-switch window, not an export `since`/`until` slice.
    */
   scopeWindowSpend: number | null;
   spendUsd: number;

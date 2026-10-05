@@ -1,9 +1,11 @@
 import type { Summary } from "./types.js";
 import { fmt } from "./budget.js";
+import { formatCivil } from "./day.js";
 
 export function receiptMarkdown(summary: Summary): string {
   const projectScoped = summary.scopeProject != null;
   const modelScoped = summary.scopeModel != null;
+  const covered = coveredPhrase(summary);
   const lines = [
     `# Spendlight receipt`,
     ``,
@@ -11,6 +13,7 @@ export function receiptMarkdown(summary: Summary): string {
     ...(modelScoped ? [`Model **${summary.scopeModel || "—"}**`, ``] : []),
     `Generated **${summary.generatedAt}**`,
     ``,
+    ...(covered ? [`Covered **${covered}**`, ``] : []),
     `| | |`,
     `| --- | ---: |`,
     `| Total spend | ${fmt(summary.spendUsd)} |`,
@@ -61,7 +64,9 @@ export function receiptMarkdown(summary: Summary): string {
 export function receiptSvg(summary: Summary): string {
   const rows = summary.byModel.slice(0, 8);
   const rowH = 22;
-  const header = 168;
+  const covered = coveredSvg(summary);
+  const rangeH = covered ? 22 : 0;
+  const header = 168 + rangeH;
   const tableH = Math.max(rows.length, 1) * rowH;
   const windowLabel = calendarWindowLabel(summary.budget.period);
   const projectScoped = summary.scopeProject != null;
@@ -85,7 +90,8 @@ export function receiptSvg(summary: Summary): string {
   const status = statusLabel(summary);
   const scopeName = scopeLabel(summary);
   const sub = scopeName ? `spend receipt · ${truncate(scopeName, 24)}` : "spend receipt";
-  const aria = scopeName ? `Spendlight receipt for ${scopeName}` : "Spendlight receipt";
+  const ariaBase = scopeName ? `Spendlight receipt for ${scopeName}` : "Spendlight receipt";
+  const aria = covered ? `${ariaBase}, ${covered}` : ariaBase;
   const tailY0 = header + tableH + 120 + (windowLabel ? 22 : 0);
   const tailSvg = tail
     .map((line, i) => `<text x="48" y="${tailY0 + i * 22}" class="muted">${escapeXml(line)}</text>`)
@@ -122,7 +128,8 @@ export function receiptSvg(summary: Summary): string {
   <text x="432" y="122" class="item amount">${escapeXml(summary.generatedAt.slice(0, 19).replace("T", " "))}Z</text>
   <text x="48" y="144" class="muted">status</text>
   <text x="432" y="144" class="item amount">${escapeXml(status)}</text>
-  <path d="M48 158 H432" stroke="#1c1610" stroke-opacity="0.2" stroke-dasharray="3 5"/>
+  ${covered ? `<text x="48" y="166" class="muted">${escapeXml(truncate(covered, 58))}</text>` : ""}
+  <path d="M48 ${158 + rangeH} H432" stroke="#1c1610" stroke-opacity="0.2" stroke-dasharray="3 5"/>
   ${modelLines}
   <path d="M48 ${header + tableH + 18} H432" stroke="#1c1610" stroke-opacity="0.35"/>
   <text x="48" y="${header + tableH + 48}" class="total-label">TOTAL</text>
@@ -206,6 +213,33 @@ function countedWindowSpend(summary: Summary): number {
 
 function scopeLabel(summary: Summary): string {
   return [summary.scopeProject, summary.scopeModel].filter((value): value is string => Boolean(value)).join(" · ");
+}
+
+/** Prose range for a shared markdown receipt. Null when the receipt covers the whole ledger. */
+function coveredPhrase(summary: Summary): string | null {
+  const since = boundLabel(summary.scopeSince, summary.budget.timezone);
+  const until = boundLabel(summary.scopeUntil, summary.budget.timezone);
+  const zone = summary.budget.timezone;
+  if (since && until) return `${since} inclusive to ${until} exclusive (${zone})`;
+  if (since) return `from ${since} inclusive (${zone})`;
+  if (until) return `before ${until} (${zone})`;
+  return null;
+}
+
+/** One SVG line. Dates are civil time in the budget timezone; the zone is named on the line. */
+function coveredSvg(summary: Summary): string | null {
+  const since = boundLabel(summary.scopeSince, summary.budget.timezone);
+  const until = boundLabel(summary.scopeUntil, summary.budget.timezone);
+  if (!since && !until) return null;
+  const zone = summary.budget.timezone;
+  if (since && until) return `${since} → ${until} · ${zone}`;
+  if (since) return `from ${since} · ${zone}`;
+  return `before ${until} · ${zone}`;
+}
+
+function boundLabel(iso: string | null, timeZone: string): string | null {
+  if (!iso) return null;
+  return formatCivil(timeZone, new Date(iso));
 }
 
 function projectBudgetRows(summary: Summary): string[] {
