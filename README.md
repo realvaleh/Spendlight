@@ -238,7 +238,7 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 
 | URL | What |
 | --- | --- |
-| `/` | Dashboard (spend, budgets, recent requests) |
+| `/` | Dashboard (spend, budgets, spend by day, recent requests) |
 | `/receipt.md` | Markdown receipt (`?project=`, `?model=`, optional `?since=` / `?until=` / `?window=current`) |
 | `/receipt.svg` | Paper-style SVG receipt (same scope parameters as the markdown receipt) |
 | `/badge.svg` | Shields-style badge for a local README (`?project=` or `?model=`; time parameters are ignored) |
@@ -278,11 +278,17 @@ Pass `?since=` and `?until=` to limit the CSV, Markdown receipt, SVG receipt, or
 
 `?window=current` is shorthand for the active day, week, or month budget window. It is a 400 when the budget period is `lifetime`, and it cannot be combined with `since` or `until`. An unparseable value, or a range where `since` is not earlier than `until`, is a 400 JSON error (`invalid_request_error` / `invalid_time_range`) rather than the full ledger. Receipts name the covered range. CSV filenames add a range slug next to any project or model slug. The badge ignores these parameters and still compares budget-window or lifetime spend to the configured hard cap. The kill-switch still counts the configured lifetime total or calendar window.
 
+`/api/summary` adds a `daily` array: one object per calendar day in the budget timezone (`budgets.timezone` / `SPENDLIGHT_BUDGET_TIMEZONE`, UTC when unset), oldest first. Each object is `{ "day": "YYYY-MM-DD", "spendUsd": <number>, "requests": <number> }`. `day` is the civil date in that timezone, so a 23-hour or 25-hour DST day is still a single entry, and a row just before local midnight stays on the previous day. The same `project`, `model`, `since`, `until`, and `window` filters apply to the totals and to `daily`. With no query, every field the summary already returned is still present. `daily` is empty when the ledger has no requests and `since` is open.
+
+Quiet days inside the covered span are included, with `spendUsd: 0` and `requests: 0`, rather than omitted. The span starts on the local day of `since` when that bound is set, otherwise on the local day of the earliest matching request. It ends on the last local day the half-open range touches when `until` is set (a bound exactly at local midnight does not include that new day), otherwise on the later of today in the budget timezone and the latest matching request. A partial first or last day still counts as that one day, and only requests inside the slice contribute to it. The dashboard **Spend by day** card shows the last 14 local days through today, filling any day the summary did not list as zero. Each day links to that day's Markdown receipt and CSV via `since=<day>&until=<next day>`, which is local midnight to the next local midnight.
+
 ```bash
 curl -s "http://127.0.0.1:8787/api/export.csv?since=2026-10-01&until=2026-10-05" -o october-week.csv
 curl -s "http://127.0.0.1:8787/receipt.md?project=demo&since=2026-10-04"
 curl -s "http://127.0.0.1:8787/receipt.svg?model=gpt-4o-mini&since=2026-10-01&until=2026-11-01" -o month-receipt.svg
 curl -s "http://127.0.0.1:8787/api/summary?window=current"
+curl -s "http://127.0.0.1:8787/api/summary?since=2026-10-01&until=2026-10-15"
+curl -s "http://127.0.0.1:8787/receipt.md?since=2026-10-04&until=2026-10-05"
 ```
 
 Local README badge (only useful on a machine that can reach the proxy):

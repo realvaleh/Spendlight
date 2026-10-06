@@ -60,6 +60,24 @@ function addCalendarDays(date: Ymd, days: number): Ymd {
   return { year: utc.getUTCFullYear(), month: utc.getUTCMonth() + 1, day: utc.getUTCDate() };
 }
 
+/** `YYYY-MM-DD` civil date of `date` in `timeZone`. A 23h or 25h local day is still one key. */
+export function calendarDayKey(timeZone: string, date: Date): string {
+  return formatYmd(zonedParts(timeZone, date));
+}
+
+/** Shift a `YYYY-MM-DD` key by whole calendar days. The step does not depend on DST length. */
+export function shiftCalendarDay(day: string, delta: number): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!match) throw new Error(`Invalid calendar day "${day}".`);
+  return formatYmd(
+    addCalendarDays({ year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) }, delta),
+  );
+}
+
+function formatYmd(date: Ymd): string {
+  return `${String(date.year).padStart(4, "0")}-${pad2(date.month)}-${pad2(date.day)}`;
+}
+
 function addCalendarMonths(date: Ymd, months: number): Ymd {
   const utc = new Date(Date.UTC(date.year, date.month - 1 + months, date.day));
   return { year: utc.getUTCFullYear(), month: utc.getUTCMonth() + 1, day: utc.getUTCDate() };

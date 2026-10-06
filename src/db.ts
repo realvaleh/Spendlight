@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { calendarDayKey, shiftCalendarDay } from "./day.js";
 import type { LedgerRow, Usage } from "./types.js";
 
 export type Db = DatabaseSync;
@@ -287,7 +288,14 @@ function requestWhere(
   return { clause: clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "", args };
 }
 
-export function loadSummaryParts(db: Db, project?: string, model?: string, range?: CreatedRange | null): {
+export function loadSummaryParts(
+  db: Db,
+  project?: string,
+  model?: string,
+  range?: CreatedRange | null,
+  timeZone = "UTC",
+  now = new Date(),
+): {
   spendUsd: number;
   requests: number;
   tokens: number;
@@ -315,12 +323,9 @@ export function loadSummaryParts(db: Db, project?: string, model?: string, range
        FROM requests${clause} GROUP BY model ORDER BY spendUsd DESC`,
     )
     .all(...args) as { model: string; spendUsd: number; requests: number; tokens: number }[];
-  const daily = db
-    .prepare(
-      `SELECT substr(created_at, 1, 10) AS day, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests
-       FROM requests${clause} GROUP BY day ORDER BY day ASC`,
-    )
-    .all(...args) as { day: string; spendUsd: number; requests: number }[];
+  const stamps = db
+    .prepare(`SELECT created_at AS createdAt, cost_usd AS costUsd FROM requests${clause}`)
+    .all(...args) as { createdAt: string; costUsd: number }[];
   const events = db
     .prepare(
       `SELECT created_at AS createdAt, type, project, message FROM events ORDER BY id DESC LIMIT 20`,
@@ -332,10 +337,59 @@ export function loadSummaryParts(db: Db, project?: string, model?: string, range
     tokens: Number(totals.tokens) || 0,
     byProject: byProject.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
     byModel: byModel.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
-    daily: daily.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests) })),
+    daily: dailySeries(stamps, timeZone, range, now),
     recent: listRecent(db, 40, project, model, range),
     events,
   };
+}
+
+/**
+ * One row per local calendar day in the covered span, oldest first.
+ * Quiet days inside that span are included as zeros. An unset `since` starts
+ * at the earliest matching request; an unset `until` runs through today in
+ * `timeZone` (or the latest request, when that is later).
+ */
+function dailySeries(
+  rows: { createdAt: string; costUsd: number }[],
+  timeZone: string,
+  range: CreatedRange | null | undefined,
+  now: Date,
+): { day: string; spendUsd: number; requests: number }[] {
+  const buckets = new Map<string, { spendUsd: number; requests: number }>();
+  let earliest: string | null = null;
+  let latest: string | null = null;
+  for (const row of rows) {
+    const day = calendarDayKey(timeZone, new Date(row.createdAt));
+    const bucket = buckets.get(day) ?? { spendUsd: 0, requests: 0 };
+    bucket.spendUsd += Number(row.costUsd) || 0;
+    bucket.requests += 1;
+    buckets.set(day, bucket);
+    if (!earliest || day < earliest) earliest = day;
+    if (!latest || day > latest) latest = day;
+  }
+
+  const start = range?.sinceIso ? calendarDayKey(timeZone, new Date(range.sinceIso)) : earliest;
+  let end: string | null;
+  if (range?.untilIso) {
+    end = calendarDayKey(timeZone, new Date(Date.parse(range.untilIso) - 1));
+  } else if (!latest) {
+    end = range?.sinceIso ? calendarDayKey(timeZone, now) : null;
+  } else {
+    const today = calendarDayKey(timeZone, now);
+    end = latest > today ? latest : today;
+  }
+  if (!start || !end || start > end) return [];
+
+  const out: { day: string; spendUsd: number; requests: number }[] = [];
+  for (let day = start; day <= end; day = shiftCalendarDay(day, 1)) {
+    const bucket = buckets.get(day);
+    out.push({
+      day,
+      spendUsd: roundUsd(bucket?.spendUsd ?? 0),
+      requests: bucket?.requests ?? 0,
+    });
+  }
+  return out;
 }
 
 function normalizeRow(row: LedgerRow): LedgerRow {
