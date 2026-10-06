@@ -121,12 +121,13 @@ export function buildSummary(
   model?: string,
   range?: CreatedRange | null,
 ): Summary {
-  const parts = loadSummaryParts(db, project, model, range);
+  const now = new Date();
+  const parts = loadSummaryParts(db, project, model, range, config.budgets.timezone, now);
   const budget = evaluateBudget(db, config, project ?? "default");
   const window = model !== undefined ? spendWindow(config) : null;
   const scopeWindowSpend = window ? spendMatching(db, project, model, window) : null;
   return {
-    generatedAt: new Date().toISOString(),
+    generatedAt: now.toISOString(),
     ...parts,
     scopeProject: project === undefined ? null : project,
     scopeModel: model === undefined ? null : model,

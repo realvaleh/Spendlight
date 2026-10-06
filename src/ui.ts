@@ -62,6 +62,9 @@ export function dashboardHtml(): string {
     td.num, th.num { text-align: right; font-family: var(--mono); }
     .bar { height: 6px; background: var(--paper-2); border-radius: 99px; margin-top: 6px; }
     .bar > i { display: block; height: 100%; background: var(--ink); border-radius: 99px; opacity: .75; }
+    table.compact td { padding: 6px 10px 6px 0; }
+    table.compact td:last-child, table.compact th:last-child { padding-right: 0; }
+    .day-today { color: var(--gold); font-weight: 650; }
     .spark { width: 100%; height: 72px; display: none; }
     .spark polyline { fill: none; stroke: var(--gold); stroke-width: 2; }
     .spark polygon { fill: rgba(184,134,42,.12); }
@@ -133,6 +136,14 @@ export function dashboardHtml(): string {
 
     <article class="card" style="margin-bottom:18px">
       <div class="row-head">
+        <div class="k">Spend by day</div>
+        <div class="sub" id="daily-sub">last 14 days</div>
+      </div>
+      <div id="by-day" class="empty">No days yet.</div>
+    </article>
+
+    <article class="card" style="margin-bottom:18px">
+      <div class="row-head">
         <div class="k">Recent requests</div>
         <div class="sub">auto-refresh 3s</div>
       </div>
@@ -165,12 +176,13 @@ export function dashboardHtml(): string {
       el.className = "pill " + status;
       el.textContent = status === "hard" ? "kill-switch" : status === "soft" ? "soft warning" : "all clear";
     }
-        function spark(daily) {
+    function spark(daily) {
       const svg = $("spark");
       if (!daily || daily.length < 2) { svg.innerHTML = ""; svg.style.display = "none"; return; }
-      svg.style.display = "block";
       const vals = daily.map(d => d.spendUsd);
-      const max = Math.max(...vals, 1e-9);
+      const max = Math.max(...vals, 0);
+      if (max <= 0) { svg.innerHTML = ""; svg.style.display = "none"; return; }
+      svg.style.display = "block";
       const w = 300, h = 72, p = 4;
       const pts = vals.map((v, i) => {
         const x = p + (i * (w - p * 2)) / Math.max(vals.length - 1, 1);
@@ -181,11 +193,48 @@ export function dashboardHtml(): string {
       const poly = p + "," + (h - p) + " " + line + " " + (w - p) + "," + (h - p);
       svg.innerHTML = '<polygon points="' + poly + '"></polygon><polyline points="' + line + '"></polyline>';
     }
-    function table(headers, rows) {
+    function table(headers, rows, className) {
       if (!rows.length) return null;
       const thead = "<tr>" + headers.map(h => "<th" + (h.num ? ' class="num"' : "") + ">" + h.label + "</th>").join("") + "</tr>";
       const body = rows.map(r => "<tr>" + r.map((c, i) => "<td" + (headers[i].num ? ' class="num"' : "") + ">" + c + "</td>").join("") + "</tr>").join("");
-      return "<table><thead>" + thead + "</thead><tbody>" + body + "</tbody></table>";
+      return "<table" + (className ? ' class="' + className + '"' : "") + "><thead>" + thead + "</thead><tbody>" + body + "</tbody></table>";
+    }
+    function ymdInZone(date, timeZone) {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: timeZone || "UTC", year: "numeric", month: "2-digit", day: "2-digit"
+      }).formatToParts(date);
+      const map = {};
+      for (const p of parts) if (p.type !== "literal") map[p.type] = p.value;
+      return map.year + "-" + map.month + "-" + map.day;
+    }
+    function addYmd(day, delta) {
+      const bits = day.split("-").map(Number);
+      const utc = new Date(Date.UTC(bits[0], bits[1] - 1, bits[2] + delta));
+      const mm = String(utc.getUTCMonth() + 1).padStart(2, "0");
+      const dd = String(utc.getUTCDate()).padStart(2, "0");
+      return utc.getUTCFullYear() + "-" + mm + "-" + dd;
+    }
+    function lastFortnight(s) {
+      const zone = (s.budget && s.budget.timezone) || "UTC";
+      const end = ymdInZone(new Date(s.generatedAt), zone);
+      const byDay = {};
+      for (const d of s.daily || []) byDay[d.day] = d;
+      const rows = [];
+      for (let i = 13; i >= 0; i--) {
+        const day = addYmd(end, -i);
+        const found = byDay[day];
+        rows.push(found
+          ? { day: day, spendUsd: found.spendUsd, requests: found.requests }
+          : { day: day, spendUsd: 0, requests: 0 });
+      }
+      return rows;
+    }
+    function dayLinks(day) {
+      const q = "since=" + encodeURIComponent(day) + "&until=" + encodeURIComponent(addYmd(day, 1));
+      return '<div class="proj-links">' +
+        '<a class="btn mini" href="/receipt.md?' + q + '">Markdown</a>' +
+        '<a class="btn mini" href="/api/export.csv?' + q + '">CSV</a>' +
+        '</div>';
     }
     async function tick() {
       const s = await fetch("/api/summary").then(r => r.json());
@@ -205,7 +254,27 @@ export function dashboardHtml(): string {
       $("meter-bar").style.width = (hard ? pct : 0) + "%";
       $("spend-k").textContent = (s.budget.period === "day" || s.budget.period === "week" || s.budget.period === "month") ? "Estimated spend · lifetime" : "Estimated spend";
       $("budget-copy").textContent = budgetCopy(s);
-      spark(s.daily || []);
+      const zone = (s.budget && s.budget.timezone) || "UTC";
+      const fortnight = lastFortnight(s);
+      const fortnightSpend = fortnight.reduce((sum, d) => sum + Number(d.spendUsd || 0), 0);
+      const today = ymdInZone(new Date(s.generatedAt), zone);
+      $("daily-sub").textContent = fortnightSpend
+        ? "last 14 days · " + zone
+        : "last 14 days · " + zone + " · no spend";
+      const maxD = Math.max(...fortnight.map(d => d.spendUsd), 1e-9);
+      const dailyRows = table(
+        [{label:"Day"},{label:"Spend",num:true},{label:"Reqs",num:true},{label:"That day"}],
+        fortnight.map(d => [
+          '<span class="' + (d.day === today ? "day-today" : "") + '">' + esc(d.day) + "</span>",
+          (d.spendUsd ? fmtMoney(d.spendUsd) : "$0.00") + '<div class="bar"><i style="width:' + (d.spendUsd / maxD * 100) + "%;background:" + (d.day === today ? "var(--gold)" : "var(--ink)") + '"></i></div>',
+          fmtInt(d.requests),
+          dayLinks(d.day)
+        ]),
+        "compact"
+      );
+      $("by-day").className = "";
+      $("by-day").innerHTML = dailyRows || '<div class="empty">No days yet.</div>';
+      spark(fortnight);
       const maxP = Math.max(...s.byProject.map(p => p.spendUsd), 1e-9);
       const proj = table(
         [{label:"Project"},{label:"Spend",num:true},{label:"Reqs",num:true}],

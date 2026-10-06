@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
 import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
-import { calendarDayBounds, calendarMonthBounds, calendarWeekBounds, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
+import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
@@ -287,6 +287,13 @@ async function main(): Promise<void> {
     assert(dash.includes("This week ("), "dashboard should name the week window");
     assert(dash.includes("This month ("), "dashboard should name the month window");
     assert(dash.includes("Estimated spend · lifetime"), "dashboard should label lifetime hero spend");
+    assert(dash.includes("Spend by day"), "dashboard missing spend-by-day");
+    assert(dash.includes("last 14 days"), "dashboard should label the daily window");
+    assert(dash.includes("function dayLinks"), "dashboard missing per-day receipt links");
+    assert(dash.includes('href="/receipt.md?'), "dashboard day links should include the markdown receipt");
+    assert(dash.includes('href="/api/export.csv?'), "dashboard day links should include csv");
+    assert(dash.includes("since="), "dashboard day links should set since");
+    assert(dash.includes("until="), "dashboard day links should set until");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -315,8 +322,9 @@ async function main(): Promise<void> {
     await testProjectScope(dir, mockUrl);
     await testModelScope(dir, mockUrl);
     await testTimeScope(dir, mockUrl);
+    await testDailyDst(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope");
+    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -1658,6 +1666,21 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
     assert(Math.abs(allSummary.spendUsd - 15) < 1e-6, `unscoped summary spend ${allSummary.spendUsd}`);
     assert(allSummary.scopeSince == null && allSummary.scopeUntil == null, "unscoped summary should not set a time slice");
     assert(Math.abs(allSummary.budget.globalSpend - 15) < 1e-6, `lifetime budget spend ${allSummary.budget.globalSpend}`);
+    const allDaily = (await fetch(`${base}/api/summary`).then((r) => r.json())) as DailySummary;
+    assertSummaryFields(allDaily, "unscoped");
+    assertContiguous(allDaily.daily, "unscoped utc");
+    assert(allDaily.daily[0]?.day === "2026-10-01", `unscoped daily should start at the first spend day, got ${allDaily.daily[0]?.day}`);
+    const utcToday = calendarDayKey("UTC", new Date(allDaily.generatedAt));
+    const utcEnd = utcToday > "2026-10-05" ? utcToday : "2026-10-05";
+    assert(allDaily.daily.at(-1)?.day === utcEnd, `unscoped daily end ${allDaily.daily.at(-1)?.day} !== ${utcEnd}`);
+    assertDaily(sliceDaily(allDaily.daily, "2026-10-01", "2026-10-06"), [
+      { day: "2026-10-01", spendUsd: 1, requests: 1 },
+      { day: "2026-10-02", spendUsd: 0, requests: 0 },
+      { day: "2026-10-03", spendUsd: 6, requests: 2 },
+      { day: "2026-10-04", spendUsd: 0, requests: 0 },
+      { day: "2026-10-05", spendUsd: 8, requests: 1 },
+    ], "utc unscoped");
+    assert(Math.abs(sumDaily(allDaily.daily) - allDaily.spendUsd) < 1e-6, "unscoped daily spend drifted from the ledger");
 
     const sinceCsv = await fetch(`${base}/api/export.csv?since=2026-10-03`);
     assert(sinceCsv.status === 200, `since csv ${sinceCsv.status}`);
@@ -1719,6 +1742,13 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
     assert(bothSvg.includes("2026-10-03 → 2026-10-05 · UTC"), bothSvg);
     assert(bothSvg.includes("$6.00"), bothSvg);
     assert(!bothSvg.includes("$8.00"), "ranged svg showed the excluded row");
+    const rangedDaily = (await fetch(`${base}/api/summary?since=2026-10-03&until=2026-10-05`).then((r) => r.json())) as DailySummary;
+    assertDaily(rangedDaily.daily, [
+      { day: "2026-10-03", spendUsd: 6, requests: 2 },
+      { day: "2026-10-04", spendUsd: 0, requests: 0 },
+    ], "utc ranged");
+    assert(Math.abs(sumDaily(rangedDaily.daily) - rangedDaily.spendUsd) < 1e-6, "ranged daily spend drifted");
+    assert(Math.abs(rangedDaily.budget.globalSpend - 15) < 1e-6, "daily range changed kill-switch spend");
 
     const clockCsv = await fetch(`${base}/api/export.csv?since=2026-10-03T15:00:00Z&until=2026-10-05T00:00:00Z`);
     assert(clockCsv.status === 200, `datetime csv ${clockCsv.status}`);
@@ -1857,6 +1887,16 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       assert(bothSummary.scopeUntil === "2026-10-05T04:00:00.000Z", bothSummary.scopeUntil ?? "missing ny until");
       assert(bothSummary.budget.timezone === "America/New_York", bothSummary.budget.timezone);
       assert(Math.abs(bothSummary.budget.globalSpend - 16) < 1e-6, "ny slice changed kill-switch spend");
+      const nyDay = (await fetch(`${base}/api/summary?since=2026-10-04&until=2026-10-05`).then((r) => r.json())) as DailySummary;
+      assertDaily(nyDay.daily, [{ day: "2026-10-04", spendUsd: 3, requests: 2 }], "ny local day");
+      const nySpan = (await fetch(`${base}/api/summary?since=2026-10-03&until=2026-10-06`).then((r) => r.json())) as DailySummary;
+      assertDaily(nySpan.daily, [
+        { day: "2026-10-03", spendUsd: 9, requests: 1 },
+        { day: "2026-10-04", spendUsd: 3, requests: 2 },
+        { day: "2026-10-05", spendUsd: 4, requests: 1 },
+      ], "ny midnight span");
+      assert(nySpan.daily.find((d) => d.day === "2026-10-03")?.requests === 1, "row just before local midnight was not counted on the previous day");
+      assert(nySpan.daily.find((d) => d.day === "2026-10-04")?.spendUsd === 3, "local-midnight row was not counted on the new day");
 
       const offset = (await fetch(`${base}/api/summary?since=2026-10-04T00:00:00-04:00&until=2026-10-05T00:00:00-04:00`).then((r) => r.json())) as {
         spendUsd: number;
@@ -1875,6 +1915,8 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       assert(civil.scopeSince === "2026-10-04T16:00:00.000Z", civil.scopeSince ?? "civil since");
       assert(civil.requests === 1, `civil datetime requests ${civil.requests}`);
       assert(Math.abs(civil.spendUsd - 2) < 1e-6, `civil datetime spend ${civil.spendUsd}`);
+      const partial = (await fetch(`${base}/api/summary?since=2026-10-04T12:00:00&until=2026-10-05`).then((r) => r.json())) as DailySummary;
+      assertDaily(partial.daily, [{ day: "2026-10-04", spendUsd: 2, requests: 1 }], "ny partial day");
 
       const andCsv = await fetch(`${base}/api/export.csv?project=demo&model=gpt-4o-mini&since=2026-10-04&until=2026-10-05`);
       assert(
@@ -1888,6 +1930,19 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       assert(andMd.includes("| Total spend | $1.00 |"), andMd);
       assert(andMd.includes("| Global spend | $16.00 |"), andMd);
       assert(andMd.includes("America/New_York"), andMd);
+      const andDaily = (await fetch(`${base}/api/summary?project=demo&model=gpt-4o-mini&since=2026-10-03&until=2026-10-06`).then((r) => r.json())) as DailySummary;
+      assert(andDaily.scopeProject === "demo", "combined daily dropped the project scope");
+      assert(andDaily.scopeModel === "gpt-4o-mini", "combined daily dropped the model scope");
+      assertDaily(andDaily.daily, [
+        { day: "2026-10-03", spendUsd: 9, requests: 1 },
+        { day: "2026-10-04", spendUsd: 1, requests: 1 },
+        { day: "2026-10-05", spendUsd: 4, requests: 1 },
+      ], "ny project+model+range");
+      assert(Math.abs(andDaily.spendUsd - 14) < 1e-6, `combined daily total ${andDaily.spendUsd}`);
+      assert(Math.abs(sumDaily(andDaily.daily) - andDaily.spendUsd) < 1e-6, "combined daily spend drifted");
+      assert(andDaily.byProject.length === 1 && andDaily.byProject[0]?.project === "demo", "combined daily leaked projects");
+      assert(andDaily.byModel.length === 1 && andDaily.byModel[0]?.model === "gpt-4o-mini", "combined daily leaked models");
+      assert(Math.abs(andDaily.budget.globalSpend - 16) < 1e-6, "combined daily changed kill-switch spend");
 
       await expectRange400(`${base}/receipt.md?since=2026-03-08T02:30:00`, "since", "America/New_York");
     },
@@ -1928,6 +1983,16 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       assert(Math.abs(currentSummary.budget.globalSpend - 1) < 1e-6, `window budget spend ${currentSummary.budget.globalSpend}`);
       assert(currentSummary.budget.status === "ok", currentSummary.budget.status);
       assert(currentSummary.budget.period === "day", currentSummary.budget.period);
+      const currentDaily = (await fetch(`${base}/api/summary?window=current`).then((r) => r.json())) as DailySummary;
+      assertDaily(currentDaily.daily, [{ day: today, spendUsd: 1, requests: 1 }], "window=current");
+      const windowScoped = (await fetch(`${base}/api/summary?project=demo&model=gpt-4o-mini&window=current`).then((r) => r.json())) as DailySummary;
+      assertDaily(windowScoped.daily, [{ day: today, spendUsd: 1, requests: 1 }], "window=current project+model");
+      const windowMiss = (await fetch(`${base}/api/summary?project=demo&model=gpt-4o&window=current`).then((r) => r.json())) as DailySummary;
+      assert(windowMiss.requests === 0, `window model miss requests ${windowMiss.requests}`);
+      assertDaily(windowMiss.daily, [{ day: today, spendUsd: 0, requests: 0 }], "window=current quiet day");
+      assert(Math.abs(windowMiss.budget.globalSpend - 1) < 1e-6, "window daily filter changed the day budget");
+      const yesterdayDaily = (await fetch(`${base}/api/summary?since=${yesterday}&until=${today}`).then((r) => r.json())) as DailySummary;
+      assertDaily(yesterdayDaily.daily, [{ day: yesterday, spendUsd: 9, requests: 1 }], "yesterday local day");
 
       const slice = (await fetch(`${base}/api/summary?since=${yesterday}&until=${today}`).then((r) => r.json())) as {
         spendUsd: number;
@@ -1946,6 +2011,171 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       assert(plain.scopeSince == null, "unscoped summary picked up window=current");
     },
   );
+}
+
+type DailyRow = { day: string; spendUsd: number; requests: number };
+
+type DailySummary = {
+  generatedAt: string;
+  spendUsd: number;
+  requests: number;
+  scopeProject: string | null;
+  scopeModel: string | null;
+  daily: DailyRow[];
+  byProject: { project: string }[];
+  byModel: { model: string }[];
+  budget: { globalSpend: number };
+} & Record<string, unknown>;
+
+const SUMMARY_FIELDS = [
+  "generatedAt",
+  "scopeProject",
+  "scopeModel",
+  "scopeSince",
+  "scopeUntil",
+  "scopeWindowSpend",
+  "spendUsd",
+  "requests",
+  "tokens",
+  "budget",
+  "byProject",
+  "byModel",
+  "daily",
+  "recent",
+  "events",
+] as const;
+
+const BUDGET_FIELDS = [
+  "allowed",
+  "status",
+  "project",
+  "projectSpend",
+  "globalSpend",
+  "projectLimit",
+  "globalLimit",
+  "message",
+  "triggeredBy",
+  "period",
+  "timezone",
+  "windowStart",
+  "windowEnd",
+] as const;
+
+function assertSummaryFields(summary: Record<string, unknown>, label: string): void {
+  for (const key of SUMMARY_FIELDS) assert(key in summary, `${label} summary missing ${key}`);
+  const budget = summary.budget as Record<string, unknown>;
+  assert(budget && typeof budget === "object", `${label} summary missing budget`);
+  for (const key of BUDGET_FIELDS) assert(key in budget, `${label} budget missing ${key}`);
+  for (const side of ["projectLimit", "globalLimit"] as const) {
+    const limit = budget[side] as Record<string, unknown>;
+    assert(limit && "softUsd" in limit && "hardUsd" in limit, `${label} ${side} missing soft/hard`);
+  }
+  for (const key of ["byProject", "byModel", "daily", "recent", "events"] as const) {
+    assert(Array.isArray(summary[key]), `${label} ${key} is not an array`);
+  }
+  const projects = summary.byProject as Record<string, unknown>[];
+  if (projects[0]) {
+    for (const key of ["project", "spendUsd", "requests", "tokens"]) {
+      assert(key in projects[0], `${label} byProject missing ${key}`);
+    }
+  }
+  const models = summary.byModel as Record<string, unknown>[];
+  if (models[0]) {
+    for (const key of ["model", "spendUsd", "requests", "tokens"]) {
+      assert(key in models[0], `${label} byModel missing ${key}`);
+    }
+  }
+  const daily = summary.daily as Record<string, unknown>[];
+  if (daily[0]) {
+    for (const key of ["day", "spendUsd", "requests"]) assert(key in daily[0], `${label} daily missing ${key}`);
+  }
+  const recent = summary.recent as Record<string, unknown>[];
+  if (recent[0]) {
+    for (const key of [
+      "id",
+      "createdAt",
+      "project",
+      "model",
+      "promptTokens",
+      "completionTokens",
+      "cachedTokens",
+      "totalTokens",
+      "costUsd",
+      "status",
+      "error",
+      "upstreamId",
+      "path",
+      "streamed",
+    ]) {
+      assert(key in recent[0], `${label} recent missing ${key}`);
+    }
+  }
+}
+
+function assertDaily(daily: DailyRow[], expected: DailyRow[], label: string): void {
+  assert(
+    daily.length === expected.length,
+    `${label} days [${daily.map((d) => d.day).join(",")}] expected [${expected.map((d) => d.day).join(",")}]`,
+  );
+  for (let i = 0; i < expected.length; i++) {
+    const got = daily[i];
+    const want = expected[i]!;
+    assert(got?.day === want.day, `${label} day ${i} ${got?.day} !== ${want.day}`);
+    assert(Math.abs((got?.spendUsd ?? NaN) - want.spendUsd) < 1e-6, `${label} ${want.day} spend ${got?.spendUsd}`);
+    assert(got?.requests === want.requests, `${label} ${want.day} requests ${got?.requests}`);
+  }
+}
+
+function assertContiguous(daily: DailyRow[], label: string): void {
+  for (let i = 1; i < daily.length; i++) {
+    const prev = daily[i - 1]!.day;
+    assert(daily[i]!.day === shiftCalendarDay(prev, 1), `${label} gap after ${prev} (${daily[i]!.day})`);
+  }
+}
+
+function sliceDaily(daily: DailyRow[], from: string, untilDay: string): DailyRow[] {
+  return daily.filter((d) => d.day >= from && d.day < untilDay);
+}
+
+function sumDaily(daily: DailyRow[]): number {
+  return daily.reduce((sum, row) => sum + row.spendUsd, 0);
+}
+
+async function testDailyDst(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "daily-dst", mockUrl, { softUsd: null, hardUsd: 1000, timezone: "America/New_York" }, async (base, app) => {
+    seedSpend(app.db, "2026-03-08T04:59:59.000Z", 1, "demo");
+    seedSpend(app.db, "2026-03-08T05:00:00.000Z", 2, "demo");
+    seedSpend(app.db, "2026-03-08T06:30:00.000Z", 4, "demo");
+    seedSpend(app.db, "2026-03-08T07:30:00.000Z", 8, "demo");
+    seedSpend(app.db, "2026-03-09T03:30:00.000Z", 16, "demo");
+    seedSpend(app.db, "2026-03-09T04:00:00.000Z", 32, "demo");
+    seedSpend(app.db, "2026-11-01T03:59:59.000Z", 1, "demo");
+    seedSpend(app.db, "2026-11-01T04:00:00.000Z", 2, "demo");
+    seedSpend(app.db, "2026-11-01T05:30:00.000Z", 4, "demo");
+    seedSpend(app.db, "2026-11-01T06:30:00.000Z", 8, "demo");
+    seedSpend(app.db, "2026-11-02T04:30:00.000Z", 16, "demo");
+    seedSpend(app.db, "2026-11-02T05:00:00.000Z", 32, "demo");
+
+    const spring = (await fetch(`${base}/api/summary?since=2026-03-08&until=2026-03-09`).then((r) => r.json())) as DailySummary;
+    assertDaily(spring.daily, [{ day: "2026-03-08", spendUsd: 30, requests: 4 }], "spring-forward day");
+    assert(Math.abs(spring.spendUsd - 30) < 1e-6, `spring spend ${spring.spendUsd}`);
+    assert(Math.abs(spring.budget.globalSpend - 126) < 1e-6, "dst slice changed kill-switch spend");
+    const springCsv = csvLines(await fetch(`${base}/api/export.csv?since=2026-03-08&until=2026-03-09`).then((r) => r.text()));
+    assert(springCsv.length === 5, `spring csv rows ${springCsv.length}`);
+    assert(springCsv.some((line) => line.startsWith("2026-03-09T03:30:00.000Z")), "spring day dropped the late local evening");
+    assert(!springCsv.some((line) => line.startsWith("2026-03-09T04:00:00.000Z")), "spring day included the next local midnight");
+    assert(!springCsv.some((line) => line.startsWith("2026-03-08T04:59:59.000Z")), "spring day included the previous local day");
+
+    const fall = (await fetch(`${base}/api/summary?since=2026-11-01&until=2026-11-02`).then((r) => r.json())) as DailySummary;
+    assertDaily(fall.daily, [{ day: "2026-11-01", spendUsd: 30, requests: 4 }], "fall-back day");
+    const fallSpan = (await fetch(`${base}/api/summary?since=2026-10-31&until=2026-11-03`).then((r) => r.json())) as DailySummary;
+    assertDaily(fallSpan.daily, [
+      { day: "2026-10-31", spendUsd: 1, requests: 1 },
+      { day: "2026-11-01", spendUsd: 30, requests: 4 },
+      { day: "2026-11-02", spendUsd: 32, requests: 1 },
+    ], "fall-back midnight span");
+    assert(Math.abs(fall.budget.globalSpend - 126) < 1e-6, "fall slice changed kill-switch spend");
+  });
 }
 
 async function expectRange400(url: string, param: string | null, snippet: string): Promise<void> {

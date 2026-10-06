@@ -106,6 +106,15 @@ export type Summary = {
   budget: BudgetDecision;
   byProject: { project: string; spendUsd: number; requests: number; tokens: number }[];
   byModel: { model: string; spendUsd: number; requests: number; tokens: number }[];
+  /**
+   * Spend by calendar day in the budget timezone (`UTC` when unset).
+   * `day` is `YYYY-MM-DD`. Every local day in the covered span is present,
+   * including days with no matching requests (`spendUsd: 0`, `requests: 0`).
+   * The span starts on the local day of `scopeSince` when set, otherwise the
+   * local day of the earliest in-scope request (empty when both are absent).
+   * It ends on the last local day touched by the half-open `scopeUntil` when
+   * set, otherwise the later of today in that timezone and the latest request.
+   */
   daily: { day: string; spendUsd: number; requests: number }[];
   recent: LedgerRow[];
   events: { createdAt: string; type: string; project: string; message: string }[];
