@@ -303,13 +303,12 @@ export function dashboardHtml(): string {
       );
       $("by-model").innerHTML = models || '<div class="empty">No models yet.</div>';
       const pairs = table(
-        [{label:"Project"},{label:"Model"},{label:"Spend",num:true},{label:"Reqs",num:true},{label:"Receipt"}],
+        [{label:"Project"},{label:"Model"},{label:"Spend",num:true},{label:"Reqs",num:true}],
         (s.byProjectModel || []).map(p => [
-          esc(p.project),
+          esc(p.project) + pairLinks(p.project, p.model),
           "<code>" + esc(p.model) + "</code>",
           fmtMoney(p.spendUsd),
-          fmtInt(p.requests),
-          pairLinks(p.project, p.model)
+          fmtInt(p.requests)
         ])
       );
       $("by-pair").className = "";
