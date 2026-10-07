@@ -107,6 +107,12 @@ export type Summary = {
   byProject: { project: string; spendUsd: number; requests: number; tokens: number }[];
   byModel: { model: string; spendUsd: number; requests: number; tokens: number }[];
   /**
+   * Spend grouped by project tag and model id, highest `spendUsd` first.
+   * Equal spend breaks ties by project, then model. The same project, model,
+   * and time filters as the rest of the summary apply. Empty when nothing matches.
+   */
+  byProjectModel: { project: string; model: string; spendUsd: number; requests: number; tokens: number }[];
+  /**
    * Spend by calendar day in the budget timezone (`UTC` when unset).
    * `day` is `YYYY-MM-DD`. Every local day in the covered span is present,
    * including days with no matching requests (`spendUsd: 0`, `requests: 0`).

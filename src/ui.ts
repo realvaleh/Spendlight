@@ -136,6 +136,14 @@ export function dashboardHtml(): string {
 
     <article class="card" style="margin-bottom:18px">
       <div class="row-head">
+        <div class="k">By project and model</div>
+        <div class="sub">highest spend first</div>
+      </div>
+      <div id="by-pair" class="empty">No project and model pairs yet.</div>
+    </article>
+
+    <article class="card" style="margin-bottom:18px">
+      <div class="row-head">
         <div class="k">Spend by day</div>
         <div class="sub" id="daily-sub">last 14 days</div>
       </div>
@@ -294,6 +302,17 @@ export function dashboardHtml(): string {
         ])
       );
       $("by-model").innerHTML = models || '<div class="empty">No models yet.</div>';
+      const pairs = table(
+        [{label:"Project"},{label:"Model"},{label:"Spend",num:true},{label:"Reqs",num:true}],
+        (s.byProjectModel || []).map(p => [
+          esc(p.project) + pairLinks(p.project, p.model),
+          "<code>" + esc(p.model) + "</code>",
+          fmtMoney(p.spendUsd),
+          fmtInt(p.requests)
+        ])
+      );
+      $("by-pair").className = "";
+      $("by-pair").innerHTML = pairs || '<div class="empty">No project and model pairs yet.</div>';
       const recent = table(
         [{label:"When"},{label:"Project"},{label:"Model"},{label:"Tokens",num:true},{label:"Cost",num:true}],
         s.recent.map(r => [
@@ -323,6 +342,14 @@ export function dashboardHtml(): string {
         '<a class="btn mini" href="/receipt.md?model=' + q + '">Markdown</a>' +
         '<a class="btn mini" href="/receipt.svg?model=' + q + '">SVG</a>' +
         '<a class="btn mini" href="/api/export.csv?model=' + q + '">CSV</a>' +
+        '</div>';
+    }
+    function pairLinks(project, model) {
+      const q = "project=" + encodeURIComponent(project) + "&model=" + encodeURIComponent(model);
+      return '<div class="proj-links">' +
+        '<a class="btn mini" href="/receipt.md?' + q + '">Markdown</a>' +
+        '<a class="btn mini" href="/receipt.svg?' + q + '">SVG</a>' +
+        '<a class="btn mini" href="/api/export.csv?' + q + '">CSV</a>' +
         '</div>';
     }
     function budgetCopy(s) {
