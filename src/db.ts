@@ -301,6 +301,7 @@ export function loadSummaryParts(
   tokens: number;
   byProject: { project: string; spendUsd: number; requests: number; tokens: number }[];
   byModel: { model: string; spendUsd: number; requests: number; tokens: number }[];
+  byProjectModel: { project: string; model: string; spendUsd: number; requests: number; tokens: number }[];
   daily: { day: string; spendUsd: number; requests: number }[];
   recent: LedgerRow[];
   events: { createdAt: string; type: string; project: string; message: string }[];
@@ -323,6 +324,12 @@ export function loadSummaryParts(
        FROM requests${clause} GROUP BY model ORDER BY spendUsd DESC`,
     )
     .all(...args) as { model: string; spendUsd: number; requests: number; tokens: number }[];
+  const byProjectModel = db
+    .prepare(
+      `SELECT project, model, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens
+       FROM requests${clause} GROUP BY project, model ORDER BY spendUsd DESC, project ASC, model ASC`,
+    )
+    .all(...args) as { project: string; model: string; spendUsd: number; requests: number; tokens: number }[];
   const stamps = db
     .prepare(`SELECT created_at AS createdAt, cost_usd AS costUsd FROM requests${clause}`)
     .all(...args) as { createdAt: string; costUsd: number }[];
@@ -337,6 +344,12 @@ export function loadSummaryParts(
     tokens: Number(totals.tokens) || 0,
     byProject: byProject.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
     byModel: byModel.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
+    byProjectModel: byProjectModel.map((r) => ({
+      ...r,
+      spendUsd: Number(r.spendUsd),
+      requests: Number(r.requests),
+      tokens: Number(r.tokens),
+    })),
     daily: dailySeries(stamps, timeZone, range, now),
     recent: listRecent(db, 40, project, model, range),
     events,

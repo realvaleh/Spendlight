@@ -294,6 +294,17 @@ async function main(): Promise<void> {
     assert(dash.includes('href="/api/export.csv?'), "dashboard day links should include csv");
     assert(dash.includes("since="), "dashboard day links should set since");
     assert(dash.includes("until="), "dashboard day links should set until");
+    assert(dash.includes("By project and model"), "dashboard missing project-model card");
+    assert(dash.includes("highest spend first"), "dashboard should order project-model pairs by spend");
+    assert(dash.includes('id="by-pair"'), "dashboard missing project-model mount");
+    assert(dash.includes("function pairLinks"), "dashboard missing project-model receipt links");
+    assert(
+      dash.includes('"project=" + encodeURIComponent(project) + "&model=" + encodeURIComponent(model)'),
+      "dashboard pair links should set project and model",
+    );
+    assert(dash.includes('href="/receipt.md?\' + q'), "dashboard pair links should include the markdown receipt");
+    assert(dash.includes('href="/receipt.svg?\' + q'), "dashboard pair links should include the svg receipt");
+    assert(dash.includes('href="/api/export.csv?\' + q'), "dashboard pair links should include csv");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -323,8 +334,9 @@ async function main(): Promise<void> {
     await testModelScope(dir, mockUrl);
     await testTimeScope(dir, mockUrl);
     await testDailyDst(dir, mockUrl);
+    await testProjectModelPairs(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown");
+    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -1681,6 +1693,12 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       { day: "2026-10-05", spendUsd: 8, requests: 1 },
     ], "utc unscoped");
     assert(Math.abs(sumDaily(allDaily.daily) - allDaily.spendUsd) < 1e-6, "unscoped daily spend drifted from the ledger");
+    assertPairs(allDaily.byProjectModel, [
+      { project: "demo", model: "gpt-4o-mini", spendUsd: 9, requests: 2, tokens: 2 },
+      { project: "other", model: "gpt-4o-mini", spendUsd: 4, requests: 1, tokens: 1 },
+      { project: "demo", model: "gpt-4o", spendUsd: 2, requests: 1, tokens: 1 },
+    ], "utc unscoped");
+    assert(Math.abs(sumPairs(allDaily.byProjectModel) - allDaily.spendUsd) < 1e-6, "unscoped pair spend drifted from the ledger");
 
     const sinceCsv = await fetch(`${base}/api/export.csv?since=2026-10-03`);
     assert(sinceCsv.status === 200, `since csv ${sinceCsv.status}`);
@@ -1702,11 +1720,17 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       scopeSince: string | null;
       scopeUntil: string | null;
       budget: { globalSpend: number; status: string };
+      byProjectModel: PairRow[];
     };
     assert(Math.abs(sinceSummary.spendUsd - 14) < 1e-6, `since summary spend ${sinceSummary.spendUsd}`);
     assert(sinceSummary.requests === 3, `since summary requests ${sinceSummary.requests}`);
     assert(sinceSummary.scopeSince === "2026-10-03T00:00:00.000Z", sinceSummary.scopeSince ?? "missing since");
     assert(sinceSummary.scopeUntil == null, "since-only summary should leave until open");
+    assertPairs(sinceSummary.byProjectModel, [
+      { project: "demo", model: "gpt-4o-mini", spendUsd: 8, requests: 1, tokens: 1 },
+      { project: "other", model: "gpt-4o-mini", spendUsd: 4, requests: 1, tokens: 1 },
+      { project: "demo", model: "gpt-4o", spendUsd: 2, requests: 1, tokens: 1 },
+    ], "since");
     assert(Math.abs(sinceSummary.budget.globalSpend - 15) < 1e-6, "since filter changed the kill-switch spend");
 
     const untilCsv = await fetch(`${base}/api/export.csv?until=2026-10-03`);
@@ -1748,6 +1772,11 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       { day: "2026-10-04", spendUsd: 0, requests: 0 },
     ], "utc ranged");
     assert(Math.abs(sumDaily(rangedDaily.daily) - rangedDaily.spendUsd) < 1e-6, "ranged daily spend drifted");
+    assertPairs(rangedDaily.byProjectModel, [
+      { project: "other", model: "gpt-4o-mini", spendUsd: 4, requests: 1, tokens: 1 },
+      { project: "demo", model: "gpt-4o", spendUsd: 2, requests: 1, tokens: 1 },
+    ], "utc ranged");
+    assert(Math.abs(sumPairs(rangedDaily.byProjectModel) - rangedDaily.spendUsd) < 1e-6, "ranged pair spend drifted");
     assert(Math.abs(rangedDaily.budget.globalSpend - 15) < 1e-6, "daily range changed kill-switch spend");
 
     const clockCsv = await fetch(`${base}/api/export.csv?since=2026-10-03T15:00:00Z&until=2026-10-05T00:00:00Z`);
@@ -1791,6 +1820,7 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       budget: { globalSpend: number };
       byProject: { project: string }[];
       byModel: { model: string }[];
+      byProjectModel: PairRow[];
     };
     assert(Math.abs(andSummary.spendUsd - 1) < 1e-6, `combined summary spend ${andSummary.spendUsd}`);
     assert(andSummary.requests === 1, `combined summary requests ${andSummary.requests}`);
@@ -1801,6 +1831,9 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
     assert(Math.abs(andSummary.budget.globalSpend - 15) < 1e-6, "combined filters changed kill-switch spend");
     assert(andSummary.byProject.length === 1 && andSummary.byProject[0]?.project === "demo", "combined summary leaked projects");
     assert(andSummary.byModel.length === 1 && andSummary.byModel[0]?.model === "gpt-4o-mini", "combined summary leaked models");
+    assertPairs(andSummary.byProjectModel, [
+      { project: "demo", model: "gpt-4o-mini", spendUsd: 1, requests: 1, tokens: 1 },
+    ], "combined filters");
 
     const badge = await fetch(`${base}/badge.svg?since=2026-10-05&until=2026-10-06`);
     assert(badge.status === 200, `badge should ignore a time slice, got ${badge.status}`);
@@ -1889,6 +1922,10 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       assert(Math.abs(bothSummary.budget.globalSpend - 16) < 1e-6, "ny slice changed kill-switch spend");
       const nyDay = (await fetch(`${base}/api/summary?since=2026-10-04&until=2026-10-05`).then((r) => r.json())) as DailySummary;
       assertDaily(nyDay.daily, [{ day: "2026-10-04", spendUsd: 3, requests: 2 }], "ny local day");
+      assertPairs(nyDay.byProjectModel, [
+        { project: "other", model: "gpt-4o", spendUsd: 2, requests: 1, tokens: 1 },
+        { project: "demo", model: "gpt-4o-mini", spendUsd: 1, requests: 1, tokens: 1 },
+      ], "ny local day");
       const nySpan = (await fetch(`${base}/api/summary?since=2026-10-03&until=2026-10-06`).then((r) => r.json())) as DailySummary;
       assertDaily(nySpan.daily, [
         { day: "2026-10-03", spendUsd: 9, requests: 1 },
@@ -1942,6 +1979,9 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       assert(Math.abs(sumDaily(andDaily.daily) - andDaily.spendUsd) < 1e-6, "combined daily spend drifted");
       assert(andDaily.byProject.length === 1 && andDaily.byProject[0]?.project === "demo", "combined daily leaked projects");
       assert(andDaily.byModel.length === 1 && andDaily.byModel[0]?.model === "gpt-4o-mini", "combined daily leaked models");
+      assertPairs(andDaily.byProjectModel, [
+        { project: "demo", model: "gpt-4o-mini", spendUsd: 14, requests: 3, tokens: 3 },
+      ], "ny project+model+range");
       assert(Math.abs(andDaily.budget.globalSpend - 16) < 1e-6, "combined daily changed kill-switch spend");
 
       await expectRange400(`${base}/receipt.md?since=2026-03-08T02:30:00`, "since", "America/New_York");
@@ -1985,11 +2025,18 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       assert(currentSummary.budget.period === "day", currentSummary.budget.period);
       const currentDaily = (await fetch(`${base}/api/summary?window=current`).then((r) => r.json())) as DailySummary;
       assertDaily(currentDaily.daily, [{ day: today, spendUsd: 1, requests: 1 }], "window=current");
+      assertPairs(currentDaily.byProjectModel, [
+        { project: "demo", model: "gpt-4o-mini", spendUsd: 1, requests: 1, tokens: 1 },
+      ], "window=current");
       const windowScoped = (await fetch(`${base}/api/summary?project=demo&model=gpt-4o-mini&window=current`).then((r) => r.json())) as DailySummary;
       assertDaily(windowScoped.daily, [{ day: today, spendUsd: 1, requests: 1 }], "window=current project+model");
+      assertPairs(windowScoped.byProjectModel, [
+        { project: "demo", model: "gpt-4o-mini", spendUsd: 1, requests: 1, tokens: 1 },
+      ], "window=current project+model");
       const windowMiss = (await fetch(`${base}/api/summary?project=demo&model=gpt-4o&window=current`).then((r) => r.json())) as DailySummary;
       assert(windowMiss.requests === 0, `window model miss requests ${windowMiss.requests}`);
       assertDaily(windowMiss.daily, [{ day: today, spendUsd: 0, requests: 0 }], "window=current quiet day");
+      assert(windowMiss.byProjectModel.length === 0, "window model miss should have no pairs");
       assert(Math.abs(windowMiss.budget.globalSpend - 1) < 1e-6, "window daily filter changed the day budget");
       const yesterdayDaily = (await fetch(`${base}/api/summary?since=${yesterday}&until=${today}`).then((r) => r.json())) as DailySummary;
       assertDaily(yesterdayDaily.daily, [{ day: yesterday, spendUsd: 9, requests: 1 }], "yesterday local day");
@@ -2015,6 +2062,8 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
 
 type DailyRow = { day: string; spendUsd: number; requests: number };
 
+type PairRow = { project: string; model: string; spendUsd: number; requests: number; tokens: number };
+
 type DailySummary = {
   generatedAt: string;
   spendUsd: number;
@@ -2024,6 +2073,7 @@ type DailySummary = {
   daily: DailyRow[];
   byProject: { project: string }[];
   byModel: { model: string }[];
+  byProjectModel: PairRow[];
   budget: { globalSpend: number };
 } & Record<string, unknown>;
 
@@ -2040,6 +2090,7 @@ const SUMMARY_FIELDS = [
   "budget",
   "byProject",
   "byModel",
+  "byProjectModel",
   "daily",
   "recent",
   "events",
@@ -2070,7 +2121,7 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
     const limit = budget[side] as Record<string, unknown>;
     assert(limit && "softUsd" in limit && "hardUsd" in limit, `${label} ${side} missing soft/hard`);
   }
-  for (const key of ["byProject", "byModel", "daily", "recent", "events"] as const) {
+  for (const key of ["byProject", "byModel", "byProjectModel", "daily", "recent", "events"] as const) {
     assert(Array.isArray(summary[key]), `${label} ${key} is not an array`);
   }
   const projects = summary.byProject as Record<string, unknown>[];
@@ -2083,6 +2134,12 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
   if (models[0]) {
     for (const key of ["model", "spendUsd", "requests", "tokens"]) {
       assert(key in models[0], `${label} byModel missing ${key}`);
+    }
+  }
+  const pairs = summary.byProjectModel as Record<string, unknown>[];
+  if (pairs[0]) {
+    for (const key of ["project", "model", "spendUsd", "requests", "tokens"]) {
+      assert(key in pairs[0], `${label} byProjectModel missing ${key}`);
     }
   }
   const daily = summary.daily as Record<string, unknown>[];
@@ -2139,6 +2196,77 @@ function sliceDaily(daily: DailyRow[], from: string, untilDay: string): DailyRow
 
 function sumDaily(daily: DailyRow[]): number {
   return daily.reduce((sum, row) => sum + row.spendUsd, 0);
+}
+
+function assertPairs(pairs: PairRow[], expected: PairRow[], label: string): void {
+  assert(
+    pairs.length === expected.length,
+    `${label} pairs [${pairs.map((p) => `${p.project}/${p.model}`).join(",")}] expected [${expected.map((p) => `${p.project}/${p.model}`).join(",")}]`,
+  );
+  for (let i = 0; i < expected.length; i++) {
+    const got = pairs[i];
+    const want = expected[i]!;
+    assert(got?.project === want.project, `${label} pair ${i} project ${got?.project} !== ${want.project}`);
+    assert(got?.model === want.model, `${label} pair ${i} model ${got?.model} !== ${want.model}`);
+    assert(Math.abs((got?.spendUsd ?? NaN) - want.spendUsd) < 1e-6, `${label} ${want.project}/${want.model} spend ${got?.spendUsd}`);
+    assert(got?.requests === want.requests, `${label} ${want.project}/${want.model} requests ${got?.requests}`);
+    assert(got?.tokens === want.tokens, `${label} ${want.project}/${want.model} tokens ${got?.tokens}`);
+  }
+}
+
+function sumPairs(pairs: PairRow[]): number {
+  return pairs.reduce((sum, row) => sum + row.spendUsd, 0);
+}
+
+async function testProjectModelPairs(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "pairs", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
+    seedSpend(app.db, "2026-10-02T00:00:00.000Z", 5, "zeta", "gpt-4o");
+    seedSpend(app.db, "2026-10-02T01:00:00.000Z", 5, "alpha", "gpt-4o-mini");
+    seedSpend(app.db, "2026-10-02T02:00:00.000Z", 5, "alpha", "gpt-4o");
+    seedSpend(app.db, "2026-10-02T03:00:00.000Z", 1, "alpha", "gpt-4o");
+
+    const summary = (await fetch(`${base}/api/summary`).then((r) => r.json())) as DailySummary;
+    assertSummaryFields(summary, "pairs");
+    assertPairs(summary.byProjectModel, [
+      { project: "alpha", model: "gpt-4o", spendUsd: 6, requests: 2, tokens: 2 },
+      { project: "alpha", model: "gpt-4o-mini", spendUsd: 5, requests: 1, tokens: 1 },
+      { project: "zeta", model: "gpt-4o", spendUsd: 5, requests: 1, tokens: 1 },
+    ], "tie break");
+    assert(Math.abs(sumPairs(summary.byProjectModel) - summary.spendUsd) < 1e-6, "pair spend drifted from the ledger");
+
+    const scoped = (await fetch(`${base}/api/summary?project=alpha&since=2026-10-02&until=2026-10-03`).then((r) => r.json())) as DailySummary;
+    assertPairs(scoped.byProjectModel, [
+      { project: "alpha", model: "gpt-4o", spendUsd: 6, requests: 2, tokens: 2 },
+      { project: "alpha", model: "gpt-4o-mini", spendUsd: 5, requests: 1, tokens: 1 },
+    ], "project filter");
+    assert(scoped.byProject.length === 1, "project filter leaked other projects into byProject");
+    assert(Math.abs(scoped.budget.globalSpend - 16) < 1e-6, "pair filter changed kill-switch spend");
+
+    const modelScoped = (await fetch(`${base}/api/summary?model=gpt-4o`).then((r) => r.json())) as DailySummary;
+    assertPairs(modelScoped.byProjectModel, [
+      { project: "alpha", model: "gpt-4o", spendUsd: 6, requests: 2, tokens: 2 },
+      { project: "zeta", model: "gpt-4o", spendUsd: 5, requests: 1, tokens: 1 },
+    ], "model filter");
+
+    const miss = (await fetch(`${base}/api/summary?model=missing`).then((r) => r.json())) as DailySummary;
+    assert(miss.byProjectModel.length === 0, "unknown model should have no pairs");
+    assert(miss.byProject.length === 0 && miss.byModel.length === 0, "unknown model should still empty the other breakdowns");
+    assert(miss.requests === 0, "unknown model should match nothing");
+
+    const pairCsv = await fetch(`${base}/api/export.csv?project=alpha&model=gpt-4o`);
+    assert(pairCsv.status === 200, `pair csv ${pairCsv.status}`);
+    const pairLines = csvLines(await pairCsv.text());
+    assert(pairLines.length === 3, `pair csv rows ${pairLines.length}`);
+    assert(pairLines.every((line, i) => i === 0 || line.includes(",alpha,gpt-4o,")), "pair csv leaked another pair");
+    const pairMd = await fetch(`${base}/receipt.md?project=alpha&model=gpt-4o`).then((r) => r.text());
+    assert(pairMd.includes("Project **alpha**"), pairMd);
+    assert(pairMd.includes("Model **gpt-4o**"), pairMd);
+    assert(pairMd.includes("| Total spend | $6.00 |"), pairMd);
+    assert(!pairMd.includes("zeta"), "pair receipt listed another project");
+    const pairSvg = await fetch(`${base}/receipt.svg?project=alpha&model=gpt-4o`);
+    assert(pairSvg.status === 200, `pair svg ${pairSvg.status}`);
+    assert((await pairSvg.text()).includes("$6.00"), "pair svg missing the scoped total");
+  });
 }
 
 async function testDailyDst(dir: string, mockUrl: string): Promise<void> {
