@@ -230,6 +230,23 @@ async function main(): Promise<void> {
       csvLines.some((line) => line.includes(",demo,gpt-4o-mini,")),
       "csv missing logged demo project/model",
     );
+
+    const jsonRes = await fetch(`${base}/api/export.json`);
+    assert(jsonRes.status === 200, `json export status ${jsonRes.status}`);
+    const jsonType = jsonRes.headers.get("content-type") ?? "";
+    assert(jsonType.includes("application/json"), `json content-type ${jsonType}`);
+    const jsonRows = (await jsonRes.json()) as {
+      project: string;
+      model: string;
+      costUsd: number;
+      promptTokens: number;
+      streamed: boolean;
+    }[];
+    assert(Array.isArray(jsonRows) && jsonRows.length === 1, `json export rows ${jsonRows.length}`);
+    assert(jsonRows[0]?.project === "demo" && jsonRows[0]?.model === "gpt-4o-mini", "json export missing logged row");
+    assert(jsonRows[0]?.costUsd === summary.spendUsd, `json cost ${jsonRows[0]?.costUsd}`);
+    assert(jsonRows[0]?.promptTokens === 100_000, `json prompt tokens ${jsonRows[0]?.promptTokens}`);
+    assert(jsonRows[0]?.streamed === false, "non-stream completion should export streamed false");
     assert(
       summary.budget.status === "hard",
       `expected hard status after overshoot ($$${summary.spendUsd} >= $0.04), got ${summary.budget.status}`,
@@ -276,12 +293,16 @@ async function main(): Promise<void> {
     assert(dash.includes("/api/summary"), "dashboard missing summary fetch");
     assert(dash.includes('href="/api/export.csv"'), "dashboard missing csv download");
     assert(dash.includes("Download CSV"), "dashboard missing csv label");
+    assert(dash.includes('href="/api/export.json"'), "dashboard missing json download");
+    assert(dash.includes("Download JSON"), "dashboard missing json label");
     assert(dash.includes('href="/receipt.md?project='), "dashboard missing scoped markdown link");
     assert(dash.includes('href="/receipt.svg?project='), "dashboard missing scoped svg link");
     assert(dash.includes('href="/api/export.csv?project='), "dashboard missing scoped csv link");
+    assert(dash.includes('href="/api/export.json?project='), "dashboard missing scoped json link");
     assert(dash.includes('href="/receipt.md?model='), "dashboard missing model markdown link");
     assert(dash.includes('href="/receipt.svg?model='), "dashboard missing model svg link");
     assert(dash.includes('href="/api/export.csv?model='), "dashboard missing model csv link");
+    assert(dash.includes('href="/api/export.json?model='), "dashboard missing model json link");
     assert(dash.includes("const esc"), "dashboard should HTML-escape untrusted fields");
     assert(dash.includes("Today ("), "dashboard should name the day window");
     assert(dash.includes("This week ("), "dashboard should name the week window");
@@ -292,6 +313,7 @@ async function main(): Promise<void> {
     assert(dash.includes("function dayLinks"), "dashboard missing per-day receipt links");
     assert(dash.includes('href="/receipt.md?'), "dashboard day links should include the markdown receipt");
     assert(dash.includes('href="/api/export.csv?'), "dashboard day links should include csv");
+    assert(dash.includes('href="/api/export.json?'), "dashboard day links should include json");
     assert(dash.includes("since="), "dashboard day links should set since");
     assert(dash.includes("until="), "dashboard day links should set until");
     assert(dash.includes("By project and model"), "dashboard missing project-model card");
@@ -305,6 +327,7 @@ async function main(): Promise<void> {
     assert(dash.includes('href="/receipt.md?\' + q'), "dashboard pair links should include the markdown receipt");
     assert(dash.includes('href="/receipt.svg?\' + q'), "dashboard pair links should include the svg receipt");
     assert(dash.includes('href="/api/export.csv?\' + q'), "dashboard pair links should include csv");
+    assert(dash.includes('href="/api/export.json?\' + q'), "dashboard pair links should include json");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -333,10 +356,11 @@ async function main(): Promise<void> {
     await testProjectScope(dir, mockUrl);
     await testModelScope(dir, mockUrl);
     await testTimeScope(dir, mockUrl);
+    await testJsonExport(dir, mockUrl);
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -1642,6 +1666,172 @@ async function testModelScope(dir: string, mockUrl: string): Promise<void> {
 
 function csvLines(csv: string): string[] {
   return csv.split(/\r?\n/).filter((line) => line.length > 0);
+}
+
+type LedgerExportJson = {
+  timestamp: string;
+  project: string;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  streamed: boolean;
+  id: string;
+  error: string | null;
+};
+
+const LEDGER_EXPORT_KEYS = [
+  "timestamp",
+  "project",
+  "model",
+  "promptTokens",
+  "completionTokens",
+  "cachedTokens",
+  "totalTokens",
+  "costUsd",
+  "streamed",
+  "id",
+  "error",
+] as const;
+
+async function fetchLedgerJson(url: string): Promise<{ res: Response; rows: LedgerExportJson[] }> {
+  const res = await fetch(url);
+  const text = await res.text();
+  assert(res.status === 200, `${url} status ${res.status}: ${text.slice(0, 200)}`);
+  assert(
+    (res.headers.get("content-type") ?? "").includes("application/json"),
+    `${url} type ${res.headers.get("content-type")}`,
+  );
+  const body = JSON.parse(text) as unknown;
+  assert(Array.isArray(body), `${url} should be a JSON array, got ${text.slice(0, 80)}`);
+  return { res, rows: body as LedgerExportJson[] };
+}
+
+function dispositionName(header: string | null): string {
+  const match = /filename="([^"]+)"/.exec(header ?? "");
+  assert(match?.[1], `missing export filename in ${header}`);
+  return match[1];
+}
+
+function assertJsonMatchesCsv(rows: LedgerExportJson[], csv: string, label: string): void {
+  const data = csvLines(csv).slice(1);
+  assert(rows.length === data.length, `${label} json rows ${rows.length} vs csv ${data.length}`);
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    assert(Object.keys(row).join(",") === LEDGER_EXPORT_KEYS.join(","), `${label} fields ${Object.keys(row).join(",")}`);
+    for (const key of ["promptTokens", "completionTokens", "cachedTokens", "totalTokens", "costUsd"] as const) {
+      assert(typeof row[key] === "number", `${label} ${key} should be a number`);
+    }
+    assert(typeof row.streamed === "boolean", `${label} streamed should be a boolean`);
+    assert(row.error === null || typeof row.error === "string", `${label} error should be a string or null`);
+    const cells = data[i]!.split(",");
+    assert(cells.length === LEDGER_EXPORT_KEYS.length, `${label} csv cells ${cells.length}: ${data[i]}`);
+    assert(cells[0] === row.timestamp, `${label} timestamp ${row.timestamp}`);
+    assert(cells[1] === row.project && cells[2] === row.model, `${label} scope ${cells[1]}/${cells[2]}`);
+    assert(Number(cells[3]) === row.promptTokens, `${label} prompt tokens`);
+    assert(Number(cells[4]) === row.completionTokens, `${label} completion tokens`);
+    assert(Number(cells[5]) === row.cachedTokens, `${label} cached tokens`);
+    assert(Number(cells[6]) === row.totalTokens, `${label} total tokens`);
+    assert(Number(cells[7]) === row.costUsd, `${label} cost ${row.costUsd}`);
+    assert(cells[8] === (row.streamed ? "1" : "0"), `${label} streamed flag`);
+    assert(cells[9] === row.id, `${label} id`);
+    assert(cells[10] === (row.error ?? ""), `${label} error`);
+  }
+}
+
+async function testJsonExport(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "json-export", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
+    seedSpend(app.db, "2026-10-01T00:00:00.000Z", 1, "demo", "gpt-4o-mini");
+    seedSpend(app.db, "2026-10-03T12:00:00.000Z", 2, "demo", "gpt-4o");
+    seedSpend(app.db, "2026-10-04T00:00:00.000Z", 4, "other", "gpt-4o-mini");
+    insertRequest(app.db, {
+      id: "stream-err",
+      createdAt: "2026-10-04T18:00:00.000Z",
+      project: "demo",
+      model: "gpt-4o-mini",
+      usage: { promptTokens: 3, completionTokens: 5, cachedTokens: 1, totalTokens: 8 },
+      costUsd: 0.5,
+      status: 200,
+      error: "upstream timeout",
+      path: "/v1/chat/completions",
+      streamed: true,
+    });
+
+    const allCsvRes = await fetch(`${base}/api/export.csv`);
+    const allCsv = await allCsvRes.text();
+    const allJson = await fetchLedgerJson(`${base}/api/export.json`);
+    assert(allJson.rows.length === 4, `unscoped json rows ${allJson.rows.length}`);
+    assertJsonMatchesCsv(allJson.rows, allCsv, "unscoped");
+    assert(
+      dispositionName(allJson.res.headers.get("content-disposition")) === "spendlight-ledger.json",
+      allJson.res.headers.get("content-disposition") ?? "missing json disposition",
+    );
+    assert(
+      dispositionName(allCsvRes.headers.get("content-disposition")).replace(/\.csv$/, ".json") ===
+        dispositionName(allJson.res.headers.get("content-disposition")),
+      "unscoped json filename should mirror csv",
+    );
+    const streamed = allJson.rows.find((row) => row.id === "stream-err");
+    assert(streamed?.streamed === true, "streamed row should export streamed true");
+    assert(streamed?.error === "upstream timeout", `streamed error ${streamed?.error}`);
+    assert(streamed?.promptTokens === 3 && streamed?.cachedTokens === 1 && streamed?.totalTokens === 8, "streamed token counts");
+    assert(allJson.rows.filter((row) => row.id !== "stream-err").every((row) => row.error === null && row.streamed === false), "plain rows");
+
+    const filters = [
+      "project=demo",
+      "model=gpt-4o-mini",
+      "project=demo&model=gpt-4o",
+      "since=2026-10-03&until=2026-10-04",
+      "project=demo&model=gpt-4o-mini&since=2026-10-01&until=2026-10-05",
+    ];
+    for (const query of filters) {
+      const csvRes = await fetch(`${base}/api/export.csv?${query}`);
+      const json = await fetchLedgerJson(`${base}/api/export.json?${query}`);
+      assertJsonMatchesCsv(json.rows, await csvRes.text(), query);
+      assert(json.rows.length > 0, `${query} should match at least one row`);
+      assert(
+        dispositionName(json.res.headers.get("content-disposition")) ===
+          dispositionName(csvRes.headers.get("content-disposition")).replace(/\.csv$/, ".json"),
+        `${query} filename`,
+      );
+    }
+
+    const demo = await fetchLedgerJson(`${base}/api/export.json?project=demo`);
+    assert(demo.rows.every((row) => row.project === "demo"), "project filter leaked another tag");
+    assert(!demo.rows.some((row) => row.model === "gpt-4o" && row.project !== "demo"), "demo filter");
+    const ranged = await fetchLedgerJson(`${base}/api/export.json?since=2026-10-03&until=2026-10-04`);
+    assert(ranged.rows.length === 1 && ranged.rows[0]?.model === "gpt-4o", "since/until slice");
+
+    for (const query of ["project=missing-tag", "project=", "model=missing-model"]) {
+      const empty = await fetchLedgerJson(`${base}/api/export.json?${query}`);
+      assert(empty.rows.length === 0, `${query} should be an empty array, got ${empty.rows.length}`);
+      const csv = csvLines(await fetch(`${base}/api/export.csv?${query}`).then((r) => r.text()));
+      assert(csv.length === 1, `${query} csv should stay header-only`);
+    }
+
+    await expectRange400(`${base}/api/export.json?since=yesterday`, "since", "Invalid since");
+    await expectRange400(`${base}/api/export.json?since=2026-10-05&until=2026-10-03`, null, "earlier than until");
+    await expectRange400(`${base}/api/export.json?window=current`, "window", "lifetime");
+  });
+
+  await withApp(
+    dir,
+    "json-export-day",
+    mockUrl,
+    { softUsd: null, hardUsd: 100, period: "day", timezone: "UTC" },
+    async (base, app) => {
+      const window = spendWindow(app.config);
+      assert(window, "json export day window");
+      seedSpend(app.db, new Date(Date.parse(window.startIso) - 1000).toISOString(), 9, "demo");
+      seedSpend(app.db, window.startIso, 1, "demo", "gpt-4o");
+      const json = await fetchLedgerJson(`${base}/api/export.json?window=current`);
+      const csv = await fetch(`${base}/api/export.csv?window=current`).then((r) => r.text());
+      assertJsonMatchesCsv(json.rows, csv, "window=current");
+      assert(json.rows.length === 1 && json.rows[0]?.costUsd === 1, `current window json ${json.rows.length}`);
+    },
+  );
 }
 
 async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
