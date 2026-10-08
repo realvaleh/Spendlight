@@ -119,6 +119,7 @@ export function dashboardHtml(): string {
           <a class="btn" href="/receipt.svg">SVG receipt</a>
           <a class="btn" href="/badge.svg">README badge</a>
           <a class="btn" href="/api/export.csv" download="spendlight-ledger.csv">Download CSV</a>
+          <a class="btn" href="/api/export.json" download="spendlight-ledger.json">Download JSON</a>
         </div>
       </article>
     </section>
@@ -242,6 +243,7 @@ export function dashboardHtml(): string {
       return '<div class="proj-links">' +
         '<a class="btn mini" href="/receipt.md?' + q + '">Markdown</a>' +
         '<a class="btn mini" href="/api/export.csv?' + q + '">CSV</a>' +
+        '<a class="btn mini" href="/api/export.json?' + q + '">JSON</a>' +
         '</div>';
     }
     async function tick() {
@@ -334,6 +336,7 @@ export function dashboardHtml(): string {
         '<a class="btn mini" href="/receipt.md?project=' + q + '">Markdown</a>' +
         '<a class="btn mini" href="/receipt.svg?project=' + q + '">SVG</a>' +
         '<a class="btn mini" href="/api/export.csv?project=' + q + '">CSV</a>' +
+        '<a class="btn mini" href="/api/export.json?project=' + q + '">JSON</a>' +
         '</div>';
     }
     function modelLinks(name) {
@@ -342,6 +345,7 @@ export function dashboardHtml(): string {
         '<a class="btn mini" href="/receipt.md?model=' + q + '">Markdown</a>' +
         '<a class="btn mini" href="/receipt.svg?model=' + q + '">SVG</a>' +
         '<a class="btn mini" href="/api/export.csv?model=' + q + '">CSV</a>' +
+        '<a class="btn mini" href="/api/export.json?model=' + q + '">JSON</a>' +
         '</div>';
     }
     function pairLinks(project, model) {
@@ -350,6 +354,7 @@ export function dashboardHtml(): string {
         '<a class="btn mini" href="/receipt.md?' + q + '">Markdown</a>' +
         '<a class="btn mini" href="/receipt.svg?' + q + '">SVG</a>' +
         '<a class="btn mini" href="/api/export.csv?' + q + '">CSV</a>' +
+        '<a class="btn mini" href="/api/export.json?' + q + '">JSON</a>' +
         '</div>';
     }
     function budgetCopy(s) {

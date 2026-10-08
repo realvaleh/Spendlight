@@ -82,14 +82,20 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
     if (!parsed) return;
     return sendJson(res, 200, summaryFor(db, config, url, parsed.range), req);
   }
-  if (req.method === "GET" && url.pathname === "/api/export.csv") {
+  if (req.method === "GET" && (url.pathname === "/api/export.csv" || url.pathname === "/api/export.json")) {
     const parsed = exportRangeOr400(url, config, res, req);
     if (!parsed) return;
     const project = queryProject(url);
     const model = queryModel(url);
+    const rows = listRequests(db, project, model, parsed.range);
+    const json = url.pathname === "/api/export.json";
     res.setHeader("cache-control", "no-cache");
-    res.setHeader("content-disposition", `attachment; filename="${csvFilename(project, model, parsed.range?.slug)}"`);
-    return send(res, 200, "text/csv; charset=utf-8", ledgerCsv(listRequests(db, project, model, parsed.range)), req);
+    res.setHeader(
+      "content-disposition",
+      `attachment; filename="${exportFilename(json ? "json" : "csv", project, model, parsed.range?.slug)}"`,
+    );
+    if (json) return sendJson(res, 200, ledgerJson(rows), req);
+    return send(res, 200, "text/csv; charset=utf-8", ledgerCsv(rows), req);
   }
   if (req.method === "GET" && url.pathname === "/receipt.md") {
     const parsed = exportRangeOr400(url, config, res, req);
@@ -169,13 +175,18 @@ function queryModel(url: URL): string | undefined {
   return normalizeModelId(url.searchParams.get("model") ?? "");
 }
 
-function csvFilename(project: string | undefined, model: string | undefined, rangeSlug?: string | null): string {
+function exportFilename(
+  ext: "csv" | "json",
+  project: string | undefined,
+  model: string | undefined,
+  rangeSlug?: string | null,
+): string {
   const slug = [project, model, rangeSlug]
     .filter((value): value is string => Boolean(value))
     .map(fileSlug)
     .filter(Boolean)
     .join("-");
-  return slug ? `spendlight-${slug}.csv` : "spendlight-ledger.csv";
+  return slug ? `spendlight-${slug}.${ext}` : `spendlight-ledger.${ext}`;
 }
 
 function fileSlug(value: string): string {
@@ -210,12 +221,48 @@ const LEDGER_CSV_HEADER = [
   "error",
 ] as const;
 
+/** One ledger row in the CSV column set. `streamed` is boolean here; CSV writes 1 or 0. */
+export type LedgerExportRow = {
+  timestamp: string;
+  project: string;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  streamed: boolean;
+  id: string;
+  error: string | null;
+};
+
+export function ledgerExportRows(rows: LedgerRow[]): LedgerExportRow[] {
+  return rows.map((row) => ({
+    timestamp: row.createdAt,
+    project: row.project,
+    model: row.model,
+    promptTokens: row.promptTokens,
+    completionTokens: row.completionTokens,
+    cachedTokens: row.cachedTokens,
+    totalTokens: row.totalTokens,
+    costUsd: row.costUsd,
+    streamed: row.streamed !== 0,
+    id: row.id,
+    error: row.error,
+  }));
+}
+
+/** Same rows and field set as {@link ledgerCsv}, as a JSON array. Empty scope is `[]`. */
+export function ledgerJson(rows: LedgerRow[]): LedgerExportRow[] {
+  return ledgerExportRows(rows);
+}
+
 export function ledgerCsv(rows: LedgerRow[]): string {
   const lines = [LEDGER_CSV_HEADER.join(",")];
-  for (const row of rows) {
+  for (const row of ledgerExportRows(rows)) {
     lines.push(
       [
-        row.createdAt,
+        row.timestamp,
         row.project,
         row.model,
         row.promptTokens,

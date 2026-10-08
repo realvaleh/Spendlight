@@ -37,6 +37,7 @@ A single Node process that:
   │              Spendlight                  │
   │  /                 local dashboard       │
   │  /api/export.csv   spend ledger CSV      │
+  │  /api/export.json  spend ledger JSON     │
   │  /receipt.md .svg  shareable receipts    │
   │  /badge.svg        README badge          │
   │  /v1/*             reverse proxy         │
@@ -244,6 +245,7 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 | `/badge.svg` | Shields-style badge for a local README (`?project=` or `?model=`; time parameters are ignored) |
 | `/api/summary` | JSON for the same numbers (same scope parameters as the receipts) |
 | `/api/export.csv` | Spend ledger as CSV (same scope parameters as the receipts) |
+| `/api/export.json` | Same filtered ledger rows as the CSV, as a JSON array |
 | `/health` | Liveness |
 
 Sample receipt (checked in):
@@ -256,16 +258,17 @@ curl -s http://127.0.0.1:8787/receipt.svg -o receipt.svg
 curl -s http://127.0.0.1:8787/badge.svg -o badge.svg
 ```
 
-Pass `?project=<tag>` to scope the CSV, receipts, or badge to one `x-spendlight-project` tag. The tag is sanitized the same way as request tags. Omit it for the whole ledger. A tag that is unknown, or that sanitizes to nothing, returns an empty scope (no rows) rather than an error. The project badge compares that tag's window or lifetime spend to its project hard cap when configured, otherwise to the global hard cap. Scoped receipts still show global budget lines. By project on the dashboard links to the same three URLs.
+Pass `?project=<tag>` to scope the CSV, JSON export, receipts, or badge to one `x-spendlight-project` tag. The tag is sanitized the same way as request tags. Omit it for the whole ledger. A tag that is unknown, or that sanitizes to nothing, returns an empty scope (no rows) rather than an error. The project badge compares that tag's window or lifetime spend to its project hard cap when configured, otherwise to the global hard cap. Scoped receipts still show global budget lines. By project on the dashboard links to Markdown, SVG, CSV, and JSON.
 
 ```bash
 curl -s "http://127.0.0.1:8787/api/export.csv?project=demo" -o demo.csv
+curl -s "http://127.0.0.1:8787/api/export.json?project=demo"
 curl -s "http://127.0.0.1:8787/receipt.md?project=demo"
 curl -s "http://127.0.0.1:8787/receipt.svg?project=demo" -o demo-receipt.svg
 curl -s "http://127.0.0.1:8787/badge.svg?project=demo" -o demo-badge.svg
 ```
 
-Pass `?model=<id>` the same way to scope the CSV, receipts, or badge to one upstream model id. Sanitization matches project tags. Omit it for every model. An unknown id, or a value that sanitizes to nothing, returns an empty scope rather than the full ledger — it is not rewritten to `default`. When both `project` and `model` are set, a row must match both. There is no per-model budget: a model badge compares that model's window or lifetime spend to the global hard cap, or to the project hard cap when `project` is set too. CSV filenames include the model slug (and the project slug when both are set). By model on the dashboard links to Markdown, SVG, and CSV.
+Pass `?model=<id>` the same way to scope the CSV, JSON export, receipts, or badge to one upstream model id. Sanitization matches project tags. Omit it for every model. An unknown id, or a value that sanitizes to nothing, returns an empty scope rather than the full ledger — it is not rewritten to `default`. When both `project` and `model` are set, a row must match both. There is no per-model budget: a model badge compares that model's window or lifetime spend to the global hard cap, or to the project hard cap when `project` is set too. CSV and JSON filenames include the model slug (and the project slug when both are set). By model on the dashboard links to Markdown, SVG, CSV, and JSON.
 
 ```bash
 curl -s "http://127.0.0.1:8787/api/export.csv?model=gpt-4o-mini" -o gpt-4o-mini.csv
@@ -274,18 +277,21 @@ curl -s "http://127.0.0.1:8787/receipt.svg?model=gpt-4o-mini" -o gpt-4o-mini-rec
 curl -s "http://127.0.0.1:8787/badge.svg?model=gpt-4o-mini" -o gpt-4o-mini-badge.svg
 ```
 
-Pass `?since=` and `?until=` to limit the CSV, Markdown receipt, SVG receipt, or `/api/summary` to a time slice. `/api/summary` takes `project` and `model` the same way as the receipts. Either time bound can be omitted. The filters combine: a row has to match every one that is set. The range is half-open, `since` inclusive and `until` exclusive. A bare `YYYY-MM-DD` is midnight in the budget timezone (`budgets.timezone` / `SPENDLIGHT_BUDGET_TIMEZONE`, UTC when unset), the same zone calendar budget windows use. A datetime with `Z` or a numeric offset is that absolute instant. A datetime with no offset is civil time in the budget timezone. Omit both bounds for the whole ledger.
+Pass `?since=` and `?until=` to limit the CSV, JSON export, Markdown receipt, SVG receipt, or `/api/summary` to a time slice. `/api/summary` takes `project` and `model` the same way as the receipts. Either time bound can be omitted. The filters combine: a row has to match every one that is set. The range is half-open, `since` inclusive and `until` exclusive. A bare `YYYY-MM-DD` is midnight in the budget timezone (`budgets.timezone` / `SPENDLIGHT_BUDGET_TIMEZONE`, UTC when unset), the same zone calendar budget windows use. A datetime with `Z` or a numeric offset is that absolute instant. A datetime with no offset is civil time in the budget timezone. Omit both bounds for the whole ledger.
 
-`?window=current` is shorthand for the active day, week, or month budget window. It is a 400 when the budget period is `lifetime`, and it cannot be combined with `since` or `until`. An unparseable value, or a range where `since` is not earlier than `until`, is a 400 JSON error (`invalid_request_error` / `invalid_time_range`) rather than the full ledger. Receipts name the covered range. CSV filenames add a range slug next to any project or model slug. The badge ignores these parameters and still compares budget-window or lifetime spend to the configured hard cap. The kill-switch still counts the configured lifetime total or calendar window.
+`/api/export.json` is that same filtered ledger as a JSON array, oldest first, using the CSV column names. Token counts and `costUsd` are numbers, `streamed` is a boolean, and `error` is a string or `null`. An empty scope is `[]`. A bad `since`, `until`, or `window` is the same 400 as the CSV.
+
+`?window=current` is shorthand for the active day, week, or month budget window. It is a 400 when the budget period is `lifetime`, and it cannot be combined with `since` or `until`. An unparseable value, or a range where `since` is not earlier than `until`, is a 400 JSON error (`invalid_request_error` / `invalid_time_range`) rather than the full ledger. Receipts name the covered range. CSV and JSON filenames add a range slug next to any project or model slug. The badge ignores these parameters and still compares budget-window or lifetime spend to the configured hard cap. The kill-switch still counts the configured lifetime total or calendar window.
 
 `/api/summary` adds a `daily` array: one object per calendar day in the budget timezone (`budgets.timezone` / `SPENDLIGHT_BUDGET_TIMEZONE`, UTC when unset), oldest first. Each object is `{ "day": "YYYY-MM-DD", "spendUsd": <number>, "requests": <number> }`. `day` is the civil date in that timezone, so a 23-hour or 25-hour DST day is still a single entry, and a row just before local midnight stays on the previous day. The same `project`, `model`, `since`, `until`, and `window` filters apply to the totals and to `daily`. With no query, every field the summary already returned is still present. `daily` is empty when the ledger has no requests and `since` is open.
 
-Quiet days inside the covered span are included, with `spendUsd: 0` and `requests: 0`, rather than omitted. The span starts on the local day of `since` when that bound is set, otherwise on the local day of the earliest matching request. It ends on the last local day the half-open range touches when `until` is set (a bound exactly at local midnight does not include that new day), otherwise on the later of today in the budget timezone and the latest matching request. A partial first or last day still counts as that one day, and only requests inside the slice contribute to it. The dashboard **Spend by day** card shows the last 14 local days through today, filling any day the summary did not list as zero. Each day links to that day's Markdown receipt and CSV via `since=<day>&until=<next day>`, which is local midnight to the next local midnight.
+Quiet days inside the covered span are included, with `spendUsd: 0` and `requests: 0`, rather than omitted. The span starts on the local day of `since` when that bound is set, otherwise on the local day of the earliest matching request. It ends on the last local day the half-open range touches when `until` is set (a bound exactly at local midnight does not include that new day), otherwise on the later of today in the budget timezone and the latest matching request. A partial first or last day still counts as that one day, and only requests inside the slice contribute to it. The dashboard **Spend by day** card shows the last 14 local days through today, filling any day the summary did not list as zero. Each day links to that day's Markdown receipt, CSV, and JSON via `since=<day>&until=<next day>`, which is local midnight to the next local midnight.
 
-`/api/summary` also adds `byProjectModel`: one object per project and model pair inside those same filters, highest spend first. Each object is `{ "project": "<tag>", "model": "<id>", "spendUsd": <number>, "requests": <number>, "tokens": <number> }`. Equal spend is ordered by project tag, then model id. A project-scoped summary lists only that tag's models, and a model-scoped summary lists only the projects that used it. The array is empty when nothing matches. `byProject` and `byModel` are unchanged. The dashboard **By project and model** card lists the pairs and links each one to its Markdown receipt, SVG receipt, and CSV via `project=<tag>&model=<id>`.
+`/api/summary` also adds `byProjectModel`: one object per project and model pair inside those same filters, highest spend first. Each object is `{ "project": "<tag>", "model": "<id>", "spendUsd": <number>, "requests": <number>, "tokens": <number> }`. Equal spend is ordered by project tag, then model id. A project-scoped summary lists only that tag's models, and a model-scoped summary lists only the projects that used it. The array is empty when nothing matches. `byProject` and `byModel` are unchanged. The dashboard **By project and model** card lists the pairs and links each one to its Markdown receipt, SVG receipt, CSV, and JSON via `project=<tag>&model=<id>`.
 
 ```bash
 curl -s "http://127.0.0.1:8787/api/export.csv?since=2026-10-01&until=2026-10-05" -o october-week.csv
+curl -s "http://127.0.0.1:8787/api/export.json?since=2026-10-01&until=2026-10-05"
 curl -s "http://127.0.0.1:8787/receipt.md?project=demo&since=2026-10-04"
 curl -s "http://127.0.0.1:8787/receipt.svg?model=gpt-4o-mini&since=2026-10-01&until=2026-11-01" -o month-receipt.svg
 curl -s "http://127.0.0.1:8787/api/summary?window=current"
@@ -305,7 +311,7 @@ Streaming chat completions: Spendlight sets `stream_options.include_usage` so a 
 
 Spendlight is a **localhost reverse proxy that can spend your API key**. Treat the bind address like a secret.
 
-- **Bind localhost.** Default `SPENDLIGHT_HOST=127.0.0.1`. Docker Compose publishes `127.0.0.1:8787`. Do not put this on `0.0.0.0` / the public internet. The dashboard, receipts, badge, `/api/summary`, and `/api/export.csv` have **no auth**.
+- **Bind localhost.** Default `SPENDLIGHT_HOST=127.0.0.1`. Docker Compose publishes `127.0.0.1:8787`. Do not put this on `0.0.0.0` / the public internet. The dashboard, receipts, badge, `/api/summary`, `/api/export.csv`, and `/api/export.json` have **no auth**.
 - **API keys.** If `OPENAI_API_KEY` is set, any client that can reach the proxy and omits `Authorization` uses your key. If the client sends `Authorization`, that value is forwarded instead. Keys are not written to the ledger or stdout. Prefer the env var over `upstream.apiKey` in JSON (do not commit keys).
 - **Trust model.** Anyone who can talk to the port is trusted: they can complete, retag projects, and read spend. Project tags are labels, not ACLs. CORS is allowed only from `http(s)://127.0.0.1`, `localhost`, and `::1` so a random website cannot drive the proxy from the browser.
 - **Upstream URL.** `OPENAI_BASE_URL` is operator-controlled (http/https only). Clients cannot pick a different host. Do not point it at arbitrary internal URLs.
