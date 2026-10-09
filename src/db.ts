@@ -238,6 +238,9 @@ const REQUEST_COLUMNS = `id, created_at AS createdAt, project, model,
               cached_tokens AS cachedTokens, total_tokens AS totalTokens,
               cost_usd AS costUsd, status, error, upstream_id AS upstreamId, path, streamed`;
 
+/** Highest-cost rows included on a summary. */
+const TOP_REQUEST_LIMIT = 10;
+
 export function listRecent(db: Db, limit = 50, project?: string, model?: string, range?: CreatedRange | null): LedgerRow[] {
   const { clause, args } = requestWhere({ project, model }, range);
   const rows = db
@@ -304,6 +307,7 @@ export function loadSummaryParts(
   byProjectModel: { project: string; model: string; spendUsd: number; requests: number; tokens: number }[];
   daily: { day: string; spendUsd: number; requests: number }[];
   recent: LedgerRow[];
+  topRequests: LedgerRow[];
   events: { createdAt: string; type: string; project: string; message: string }[];
 } {
   const { clause, args } = requestWhere({ project, model }, range);
@@ -330,6 +334,11 @@ export function loadSummaryParts(
        FROM requests${clause} GROUP BY project, model ORDER BY spendUsd DESC, project ASC, model ASC`,
     )
     .all(...args) as { project: string; model: string; spendUsd: number; requests: number; tokens: number }[];
+  const topRequests = db
+    .prepare(
+      `SELECT ${REQUEST_COLUMNS} FROM requests${clause} ORDER BY cost_usd DESC, created_at DESC, id ASC LIMIT ?`,
+    )
+    .all(...args, TOP_REQUEST_LIMIT) as LedgerRow[];
   const stamps = db
     .prepare(`SELECT created_at AS createdAt, cost_usd AS costUsd FROM requests${clause}`)
     .all(...args) as { createdAt: string; costUsd: number }[];
@@ -352,6 +361,7 @@ export function loadSummaryParts(
     })),
     daily: dailySeries(stamps, timeZone, range, now),
     recent: listRecent(db, 40, project, model, range),
+    topRequests: topRequests.map(normalizeRow),
     events,
   };
 }

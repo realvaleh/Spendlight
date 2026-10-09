@@ -123,5 +123,13 @@ export type Summary = {
    */
   daily: { day: string; spendUsd: number; requests: number }[];
   recent: LedgerRow[];
+  /**
+   * The ten highest-cost requests inside the same project, model, and time
+   * filters as the rest of the summary. Highest `costUsd` first. Equal cost
+   * breaks ties by `createdAt` descending, then `id` ascending. Fewer than
+   * ten matches returns every match. Empty when nothing matches. Failed and
+   * streamed rows stay in the ranking. `recent` stays newest-first.
+   */
+  topRequests: LedgerRow[];
   events: { createdAt: string; type: string; project: string; message: string }[];
 };
