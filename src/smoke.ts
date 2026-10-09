@@ -328,6 +328,10 @@ async function main(): Promise<void> {
     assert(dash.includes('href="/receipt.svg?\' + q'), "dashboard pair links should include the svg receipt");
     assert(dash.includes('href="/api/export.csv?\' + q'), "dashboard pair links should include csv");
     assert(dash.includes('href="/api/export.json?\' + q'), "dashboard pair links should include json");
+    assert(dash.includes("Most expensive"), "dashboard missing most-expensive card");
+    assert(dash.includes("highest cost first"), "dashboard should order expensive requests by cost");
+    assert(dash.includes('id="top-requests"'), "dashboard missing most-expensive mount");
+    assert(dash.includes("s.topRequests"), "dashboard should render topRequests");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -359,8 +363,9 @@ async function main(): Promise<void> {
     await testJsonExport(dir, mockUrl);
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
+    await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2254,6 +2259,18 @@ type DailyRow = { day: string; spendUsd: number; requests: number };
 
 type PairRow = { project: string; model: string; spendUsd: number; requests: number; tokens: number };
 
+type TopRow = {
+  id: string;
+  createdAt: string;
+  project: string;
+  model: string;
+  costUsd: number;
+  totalTokens: number;
+  status: number;
+  error: string | null;
+  streamed: number;
+};
+
 type DailySummary = {
   generatedAt: string;
   spendUsd: number;
@@ -2283,6 +2300,7 @@ const SUMMARY_FIELDS = [
   "byProjectModel",
   "daily",
   "recent",
+  "topRequests",
   "events",
 ] as const;
 
@@ -2311,7 +2329,7 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
     const limit = budget[side] as Record<string, unknown>;
     assert(limit && "softUsd" in limit && "hardUsd" in limit, `${label} ${side} missing soft/hard`);
   }
-  for (const key of ["byProject", "byModel", "byProjectModel", "daily", "recent", "events"] as const) {
+  for (const key of ["byProject", "byModel", "byProjectModel", "daily", "recent", "topRequests", "events"] as const) {
     assert(Array.isArray(summary[key]), `${label} ${key} is not an array`);
   }
   const projects = summary.byProject as Record<string, unknown>[];
@@ -2337,25 +2355,28 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
     for (const key of ["day", "spendUsd", "requests"]) assert(key in daily[0], `${label} daily missing ${key}`);
   }
   const recent = summary.recent as Record<string, unknown>[];
+  const requestKeys = [
+    "id",
+    "createdAt",
+    "project",
+    "model",
+    "promptTokens",
+    "completionTokens",
+    "cachedTokens",
+    "totalTokens",
+    "costUsd",
+    "status",
+    "error",
+    "upstreamId",
+    "path",
+    "streamed",
+  ];
   if (recent[0]) {
-    for (const key of [
-      "id",
-      "createdAt",
-      "project",
-      "model",
-      "promptTokens",
-      "completionTokens",
-      "cachedTokens",
-      "totalTokens",
-      "costUsd",
-      "status",
-      "error",
-      "upstreamId",
-      "path",
-      "streamed",
-    ]) {
-      assert(key in recent[0], `${label} recent missing ${key}`);
-    }
+    for (const key of requestKeys) assert(key in recent[0], `${label} recent missing ${key}`);
+  }
+  const top = summary.topRequests as Record<string, unknown>[];
+  if (top[0]) {
+    for (const key of requestKeys) assert(key in top[0], `${label} topRequests missing ${key}`);
   }
 }
 
@@ -2406,6 +2427,19 @@ function assertPairs(pairs: PairRow[], expected: PairRow[], label: string): void
 
 function sumPairs(pairs: PairRow[]): number {
   return pairs.reduce((sum, row) => sum + row.spendUsd, 0);
+}
+
+function assertTop(rows: TopRow[], expected: { id: string; costUsd: number }[], label: string): void {
+  assert(
+    rows.length === expected.length,
+    `${label} top [${rows.map((r) => r.id).join(",")}] expected [${expected.map((r) => r.id).join(",")}]`,
+  );
+  for (let i = 0; i < expected.length; i++) {
+    const got = rows[i];
+    const want = expected[i]!;
+    assert(got?.id === want.id, `${label} #${i} ${got?.id} !== ${want.id}`);
+    assert(Math.abs((got?.costUsd ?? NaN) - want.costUsd) < 1e-6, `${label} ${want.id} cost ${got?.costUsd}`);
+  }
 }
 
 async function testProjectModelPairs(dir: string, mockUrl: string): Promise<void> {
@@ -2494,6 +2528,221 @@ async function testDailyDst(dir: string, mockUrl: string): Promise<void> {
     ], "fall-back midnight span");
     assert(Math.abs(fall.budget.globalSpend - 126) < 1e-6, "fall slice changed kill-switch spend");
   });
+}
+
+async function testTopRequests(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "top", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
+    const empty = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+      requests: number;
+      topRequests: TopRow[];
+    };
+    assertSummaryFields(empty as unknown as Record<string, unknown>, "empty top");
+    assert(empty.requests === 0 && empty.topRequests.length === 0, "empty ledger should have no top requests");
+
+    const seed = (
+      id: string,
+      createdAt: string,
+      costUsd: number,
+      project: string,
+      model: string,
+      tokens: number,
+      extra?: { status?: number; error?: string | null; streamed?: boolean },
+    ) => {
+      insertRequest(app.db, {
+        id,
+        createdAt,
+        project,
+        model,
+        usage: { promptTokens: tokens, completionTokens: 0, cachedTokens: 0, totalTokens: tokens },
+        costUsd,
+        status: extra?.status ?? 200,
+        error: extra?.error ?? null,
+        streamed: extra?.streamed ?? false,
+        path: "/v1/chat/completions",
+      });
+    };
+    seed("m", "2026-10-01T00:00:00.000Z", 20, "alpha", "gpt-4o", 100);
+    seed("x", "2026-10-01T12:00:00.000Z", 15, "alpha", "gpt-4o", 15, {
+      status: 500,
+      error: "upstream timeout",
+      streamed: true,
+    });
+    seed("b", "2026-10-02T01:00:00.000Z", 9, "alpha", "gpt-4o", 20);
+    seed("c", "2026-10-02T02:00:00.000Z", 9, "beta", "gpt-4o", 30);
+    seed("d", "2026-10-02T02:00:00.000Z", 9, "beta", "gpt-4o-mini", 40);
+    seed("k", "2026-10-02T03:00:00.000Z", 8, "alpha", "gpt-4o-mini", 8);
+    seed("j", "2026-10-02T04:00:00.000Z", 7, "alpha", "gpt-4o-mini", 7);
+    seed("i", "2026-10-02T05:00:00.000Z", 6, "zeta", "gpt-4o", 6);
+    seed("h", "2026-10-02T06:00:00.000Z", 5, "zeta", "gpt-4o", 5);
+    seed("g", "2026-10-03T00:00:00.000Z", 4, "alpha", "gpt-4o-mini", 4);
+    seed("f", "2026-10-03T01:00:00.000Z", 3, "alpha", "gpt-4o", 3);
+    seed("e", "2026-10-03T02:00:00.000Z", 2, "alpha", "gpt-4o-mini", 2);
+    seed("a", "2026-10-03T03:00:00.000Z", 1, "alpha", "gpt-4o-mini", 1);
+
+    const summary = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+      spendUsd: number;
+      requests: number;
+      topRequests: TopRow[];
+      recent: { id: string }[];
+      budget: { globalSpend: number };
+    };
+    assertSummaryFields(summary as unknown as Record<string, unknown>, "top");
+    assert(summary.requests === 13, `top ledger requests ${summary.requests}`);
+    assert(Math.abs(summary.spendUsd - 98) < 1e-6, `top ledger spend ${summary.spendUsd}`);
+    assert(Math.abs(summary.budget.globalSpend - 98) < 1e-6, "top ranking changed kill-switch spend");
+    assertTop(summary.topRequests, [
+      { id: "m", costUsd: 20 },
+      { id: "x", costUsd: 15 },
+      { id: "c", costUsd: 9 },
+      { id: "d", costUsd: 9 },
+      { id: "b", costUsd: 9 },
+      { id: "k", costUsd: 8 },
+      { id: "j", costUsd: 7 },
+      { id: "i", costUsd: 6 },
+      { id: "h", costUsd: 5 },
+      { id: "g", costUsd: 4 },
+    ], "cap and tie break");
+    assert(summary.recent[0]?.id === "a", `recent should stay newest-first, got ${summary.recent[0]?.id}`);
+    const failed = summary.topRequests.find((row) => row.id === "x");
+    assert(failed?.status === 500, `failed row status ${failed?.status}`);
+    assert(failed?.error === "upstream timeout", `failed row error ${failed?.error}`);
+    assert(failed?.streamed === 1, `failed row streamed ${failed?.streamed}`);
+    assert(failed?.totalTokens === 15, `failed row tokens ${failed?.totalTokens}`);
+    assert(failed?.project === "alpha" && failed?.model === "gpt-4o", "failed row identity");
+
+    const projectScoped = (await fetch(`${base}/api/summary?project=alpha`).then((r) => r.json())) as {
+      topRequests: TopRow[];
+      requests: number;
+      budget: { globalSpend: number };
+    };
+    assertTop(projectScoped.topRequests, [
+      { id: "m", costUsd: 20 },
+      { id: "x", costUsd: 15 },
+      { id: "b", costUsd: 9 },
+      { id: "k", costUsd: 8 },
+      { id: "j", costUsd: 7 },
+      { id: "g", costUsd: 4 },
+      { id: "f", costUsd: 3 },
+      { id: "e", costUsd: 2 },
+      { id: "a", costUsd: 1 },
+    ], "project filter");
+    assert(projectScoped.requests === 9, `alpha requests ${projectScoped.requests}`);
+    assert(Math.abs(projectScoped.budget.globalSpend - 98) < 1e-6, "project filter changed kill-switch spend");
+
+    const modelScoped = (await fetch(`${base}/api/summary?model=gpt-4o`).then((r) => r.json())) as {
+      topRequests: TopRow[];
+    };
+    assertTop(modelScoped.topRequests, [
+      { id: "m", costUsd: 20 },
+      { id: "x", costUsd: 15 },
+      { id: "c", costUsd: 9 },
+      { id: "b", costUsd: 9 },
+      { id: "i", costUsd: 6 },
+      { id: "h", costUsd: 5 },
+      { id: "f", costUsd: 3 },
+    ], "model filter");
+
+    const ranged = (await fetch(`${base}/api/summary?since=2026-10-03&until=2026-10-04`).then((r) => r.json())) as {
+      topRequests: TopRow[];
+      spendUsd: number;
+    };
+    assertTop(ranged.topRequests, [
+      { id: "g", costUsd: 4 },
+      { id: "f", costUsd: 3 },
+      { id: "e", costUsd: 2 },
+      { id: "a", costUsd: 1 },
+    ], "time slice");
+    assert(Math.abs(ranged.spendUsd - 10) < 1e-6, `slice spend ${ranged.spendUsd}`);
+
+    const both = (await fetch(`${base}/api/summary?project=alpha&model=gpt-4o&since=2026-10-02&until=2026-10-03`).then((r) => r.json())) as {
+      topRequests: TopRow[];
+      requests: number;
+    };
+    assertTop(both.topRequests, [{ id: "b", costUsd: 9 }], "project+model+range");
+    assert(both.requests === 1, `combined requests ${both.requests}`);
+
+    const miss = (await fetch(`${base}/api/summary?model=missing`).then((r) => r.json())) as {
+      topRequests: TopRow[];
+      requests: number;
+      spendUsd: number;
+      budget: { globalSpend: number };
+    };
+    assert(miss.topRequests.length === 0, "unknown model should have no top requests");
+    assert(miss.requests === 0 && miss.spendUsd === 0, "unknown model should be an empty scope");
+    assert(Math.abs(miss.budget.globalSpend - 98) < 1e-6, "empty scope changed kill-switch spend");
+
+    const md = await fetch(`${base}/receipt.md`).then((r) => r.text());
+    const newest = md.indexOf("2026-10-03T03:00:00.000Z");
+    const dearest = md.indexOf("2026-10-01T00:00:00.000Z");
+    assert(newest !== -1 && dearest !== -1 && newest < dearest, "receipt recent order should stay newest-first");
+    assert(!md.includes("Most expensive"), "receipt should not grow a top-requests section");
+  });
+
+  await withApp(
+    dir,
+    "top-day",
+    mockUrl,
+    { softUsd: null, hardUsd: 100, period: "day", timezone: "America/New_York" },
+    async (base, app) => {
+      const probe = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+        budget: { windowStart: string | null; windowEnd: string | null };
+      };
+      const start = probe.budget.windowStart;
+      const end = probe.budget.windowEnd;
+      assert(start != null && end != null, "day window missing bounds");
+      insertRequest(app.db, {
+        id: "old",
+        createdAt: new Date(Date.parse(start) - 1000).toISOString(),
+        project: "demo",
+        model: "gpt-4o",
+        usage: { promptTokens: 1, completionTokens: 0, cachedTokens: 0, totalTokens: 1 },
+        costUsd: 50,
+        status: 200,
+        path: "/v1/chat/completions",
+      });
+      insertRequest(app.db, {
+        id: "low",
+        createdAt: start,
+        project: "demo",
+        model: "gpt-4o-mini",
+        usage: { promptTokens: 1, completionTokens: 0, cachedTokens: 0, totalTokens: 1 },
+        costUsd: 2,
+        status: 200,
+        path: "/v1/chat/completions",
+      });
+      insertRequest(app.db, {
+        id: "high",
+        createdAt: new Date(Date.parse(start) + 60_000).toISOString(),
+        project: "demo",
+        model: "gpt-4o",
+        usage: { promptTokens: 1, completionTokens: 0, cachedTokens: 0, totalTokens: 1 },
+        costUsd: 7,
+        status: 200,
+        path: "/v1/chat/completions",
+      });
+
+      const current = (await fetch(`${base}/api/summary?window=current`).then((r) => r.json())) as {
+        spendUsd: number;
+        topRequests: TopRow[];
+        budget: { globalSpend: number };
+      };
+      assertTop(current.topRequests, [
+        { id: "high", costUsd: 7 },
+        { id: "low", costUsd: 2 },
+      ], "window=current");
+      assert(Math.abs(current.spendUsd - 9) < 1e-6, `window spend ${current.spendUsd}`);
+      assert(Math.abs(current.budget.globalSpend - 9) < 1e-6, "window ranking changed the day budget");
+
+      const lifetime = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+        spendUsd: number;
+        topRequests: TopRow[];
+        scopeSince: string | null;
+      };
+      assert(lifetime.topRequests[0]?.id === "old", `unscoped top should keep yesterday, got ${lifetime.topRequests[0]?.id}`);
+      assert(Math.abs(lifetime.spendUsd - 59) < 1e-6, `unscoped spend ${lifetime.spendUsd}`);
+      assert(lifetime.scopeSince == null, "unscoped summary picked up window=current");
+    },
+  );
 }
 
 async function expectRange400(url: string, param: string | null, snippet: string): Promise<void> {

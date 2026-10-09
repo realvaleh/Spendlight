@@ -153,6 +153,14 @@ export function dashboardHtml(): string {
 
     <article class="card" style="margin-bottom:18px">
       <div class="row-head">
+        <div class="k">Most expensive</div>
+        <div class="sub">highest cost first</div>
+      </div>
+      <div id="top-requests" class="empty">No requests yet.</div>
+    </article>
+
+    <article class="card" style="margin-bottom:18px">
+      <div class="row-head">
         <div class="k">Recent requests</div>
         <div class="sub">auto-refresh 3s</div>
       </div>
@@ -315,6 +323,20 @@ export function dashboardHtml(): string {
       );
       $("by-pair").className = "";
       $("by-pair").innerHTML = pairs || '<div class="empty">No project and model pairs yet.</div>';
+      const ranked = s.topRequests || [];
+      const maxT = Math.max(...ranked.map(r => r.costUsd), 1e-9);
+      const top = table(
+        [{label:"When"},{label:"Project"},{label:"Model"},{label:"Tokens",num:true},{label:"Cost",num:true}],
+        ranked.map(r => [
+          new Date(r.createdAt).toLocaleString(),
+          esc(r.project),
+          "<code>" + esc(r.model) + "</code>",
+          fmtInt(r.totalTokens),
+          fmtMoney(r.costUsd) + '<div class="bar"><i style="width:' + (r.costUsd / maxT * 100) + '%"></i></div>'
+        ])
+      );
+      $("top-requests").className = "";
+      $("top-requests").innerHTML = top || '<div class="empty">No requests yet.</div>';
       const recent = table(
         [{label:"When"},{label:"Project"},{label:"Model"},{label:"Tokens",num:true},{label:"Cost",num:true}],
         s.recent.map(r => [
