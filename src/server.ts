@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Config, LedgerRow, Summary } from "./types.js";
 import { closeDb, listRequests, loadSummaryParts, openDb, spendMatching, type CreatedRange, type Db } from "./db.js";
-import { evaluateBudget, spendWindow } from "./budget.js";
+import { budgetAlertFor, evaluateBudget, spendWindow } from "./budget.js";
 import { dashboardHtml, FAVICON_SVG } from "./ui.js";
 import { badgeSvg, receiptMarkdown, receiptSvg } from "./receipts.js";
 import { proxyRequest, corsHeaders, normalizeModelId, normalizeProjectTag } from "./proxy.js";
@@ -130,17 +130,20 @@ export function buildSummary(
   const now = new Date();
   const parts = loadSummaryParts(db, project, model, range, config.budgets.timezone, now);
   const budget = evaluateBudget(db, config, project ?? "default");
+  const scopeProject = project === undefined ? null : project;
+  const budgetAlert = budgetAlertFor(budget, config.budgets.warnPercent, scopeProject);
   const window = model !== undefined ? spendWindow(config) : null;
   const scopeWindowSpend = window ? spendMatching(db, project, model, window) : null;
   return {
     generatedAt: now.toISOString(),
     ...parts,
-    scopeProject: project === undefined ? null : project,
+    scopeProject,
     scopeModel: model === undefined ? null : model,
     scopeSince: range?.sinceIso ?? null,
     scopeUntil: range?.untilIso ?? null,
     scopeWindowSpend,
     budget,
+    budgetAlert,
   };
 }
 

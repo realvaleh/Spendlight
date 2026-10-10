@@ -37,8 +37,9 @@ export function dashboardHtml(): string {
     .lede { color: var(--muted); margin: 6px 0 0; font-size: 14px; }
     .pill { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; padding: 7px 11px; border: 1px solid var(--line); border-radius: 999px; background: #fff8ea; }
     .pill.ok { color: var(--green); }
-    .pill.soft { color: var(--gold); }
-    .pill.hard { color: var(--red); background: #f8e8e4; }
+    .pill.soft, .pill.warn { color: var(--gold); }
+    .pill.hard, .pill.over { color: var(--red); background: #f8e8e4; }
+    .pills { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     .hero {
       display: grid; grid-template-columns: 1.4fr .8fr; gap: 18px; margin-bottom: 18px;
     }
@@ -92,7 +93,10 @@ export function dashboardHtml(): string {
         <h1 class="brand">Spend<span>light</span></h1>
         <p class="lede">Local OpenAI proxy · spend ledger · budgets · receipts</p>
       </div>
-      <div id="status-pill" class="pill">loading</div>
+      <div class="pills">
+        <div id="status-pill" class="pill">loading</div>
+        <div id="alert-pill" class="pill">loading</div>
+      </div>
     </header>
 
     <section class="hero">
@@ -193,6 +197,23 @@ export function dashboardHtml(): string {
       el.className = "pill " + status;
       el.textContent = status === "hard" ? "kill-switch" : status === "soft" ? "soft warning" : "all clear";
     }
+    function fmtPct(n) {
+      const rounded = Math.round(Number(n) * 1000) / 1000;
+      return String(rounded);
+    }
+    function alertPill(alert) {
+      const el = $("alert-pill");
+      if (!alert || alert.hardUsd == null) {
+        el.className = "pill";
+        el.textContent = "no cap";
+        return;
+      }
+      const pct = fmtPct(alert.warnPercent);
+      el.className = "pill " + (alert.status === "over" ? "over" : alert.status === "warn" ? "warn" : "ok");
+      if (alert.status === "over") el.textContent = "over cap";
+      else if (alert.status === "warn") el.textContent = "warn " + pct + "%";
+      else el.textContent = "under " + pct + "%";
+    }
     function spark(daily) {
       const svg = $("spark");
       if (!daily || daily.length < 2) { svg.innerHTML = ""; svg.style.display = "none"; return; }
@@ -265,6 +286,7 @@ export function dashboardHtml(): string {
         ? s.tokens.toLocaleString("en-US") + " tokens across " + s.requests + " request" + (s.requests === 1 ? "" : "s")
         : "Waiting for the first completion…";
       pill(s.budget.status);
+      alertPill(s.budgetAlert);
       const hard = s.budget.globalLimit.hardUsd;
       const spend = s.budget.globalSpend;
       const pct = hard ? Math.min(100, (spend / hard) * 100) : 0;
@@ -385,14 +407,15 @@ export function dashboardHtml(): string {
       const soft = b.globalLimit.softUsd;
       const spend = b.globalSpend;
       const softBit = soft != null ? " · soft " + fmtMoney(soft) : "";
+      const warnBit = hard != null && s.budgetAlert ? " · warn at " + fmtPct(s.budgetAlert.warnPercent) + "%" : "";
       const head = b.period === "day" ? "Today (" + b.timezone + ") " : b.period === "week" ? "This week (" + b.timezone + ") " : b.period === "month" ? "This month (" + b.timezone + ") " : "";
       if (!head) {
         return hard == null
           ? "No global hard budget configured."
-          : "Hard budget " + fmtMoney(spend) + " / " + fmtMoney(hard) + softBit;
+          : "Hard budget " + fmtMoney(spend) + " / " + fmtMoney(hard) + softBit + warnBit;
       }
       if (hard == null) return head + "no global hard budget" + softBit + ".";
-      return head + "hard budget " + fmtMoney(spend) + " / " + fmtMoney(hard) + softBit;
+      return head + "hard budget " + fmtMoney(spend) + " / " + fmtMoney(hard) + softBit + warnBit;
     }
     tick();
     setInterval(tick, 3000);

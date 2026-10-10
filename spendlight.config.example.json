@@ -8,6 +8,7 @@
   "budgets": {
     "period": "day",
     "timezone": "America/New_York",
+    "warnPercent": 80,
     "global": {
       "softUsd": 5,
       "hardUsd": 10

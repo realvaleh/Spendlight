@@ -155,6 +155,7 @@ async function main(): Promise<void> {
   delete process.env.SPENDLIGHT_HARD_BUDGET_USD;
   delete process.env.SPENDLIGHT_BUDGET_PERIOD;
   delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
+  delete process.env.SPENDLIGHT_BUDGET_WARN_PERCENT;
   delete process.env.SPENDLIGHT_PORT;
   delete process.env.SPENDLIGHT_HOST;
   delete process.env.SPENDLIGHT_DB;
@@ -209,6 +210,7 @@ async function main(): Promise<void> {
       requests: number;
       recent: { project: string; model: string; costUsd: number }[];
       budget: { status: string };
+      budgetAlert: { status: string; warnPercent: number; basis: string | null; hardUsd: number | null };
     };
     assert(summary.requests === 1, `expected 1 logged request, got ${summary.requests}`);
     assert(Math.abs(summary.spendUsd - 0.045) < 1e-6, `logged spend ${summary.spendUsd}`);
@@ -251,6 +253,10 @@ async function main(): Promise<void> {
       summary.budget.status === "hard",
       `expected hard status after overshoot ($$${summary.spendUsd} >= $0.04), got ${summary.budget.status}`,
     );
+    assert(summary.budgetAlert.status === "over", `expected over alert after the hard cap, got ${summary.budgetAlert.status}`);
+    assert(summary.budgetAlert.warnPercent === 80, `default warn percent ${summary.budgetAlert.warnPercent}`);
+    assert(summary.budgetAlert.basis === "global", `alert basis ${summary.budgetAlert.basis}`);
+    assert(summary.budgetAlert.hardUsd === 0.04, `alert hard cap ${summary.budgetAlert.hardUsd}`);
 
     const second = await fetch(`${base}/v1/chat/completions`, {
       method: "POST",
@@ -332,6 +338,13 @@ async function main(): Promise<void> {
     assert(dash.includes("highest cost first"), "dashboard should order expensive requests by cost");
     assert(dash.includes('id="top-requests"'), "dashboard missing most-expensive mount");
     assert(dash.includes("s.topRequests"), "dashboard should render topRequests");
+    assert(dash.includes('id="alert-pill"'), "dashboard missing hard-cap badge");
+    assert(dash.includes("alertPill(s.budgetAlert)"), "dashboard should render budgetAlert");
+    assert(dash.includes("over cap"), "dashboard badge should name an over-cap state");
+    assert(dash.includes("no cap"), "dashboard badge should name a missing hard cap");
+    assert(dash.includes('"warn " + pct + "%"'), "dashboard badge should name the warn percent");
+    assert(dash.includes('"under " + pct + "%"'), "dashboard badge should name the under-threshold state");
+    assert(dash.includes("warn at "), "dashboard budget line should mention the warn percent");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -364,8 +377,9 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testBudgetAlert(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, budget warn percent");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -472,6 +486,7 @@ type SmokeBudgets = {
   hardUsd: number | null;
   period?: "lifetime" | "day" | "week" | "month";
   timezone?: string;
+  warnPercent?: number;
   projects?: Record<string, { softUsd: number | null; hardUsd: number | null }>;
 };
 
@@ -494,6 +509,7 @@ async function withApp(
       budgets: {
         period: budgets.period,
         timezone: budgets.timezone,
+        ...(budgets.warnPercent != null ? { warnPercent: budgets.warnPercent } : {}),
         global: { softUsd: budgets.softUsd, hardUsd: budgets.hardUsd },
         projects: budgets.projects,
       },
@@ -663,10 +679,12 @@ function testBudgetConfig(dir: string): void {
   );
   const savedPeriod = process.env.SPENDLIGHT_BUDGET_PERIOD;
   const savedZone = process.env.SPENDLIGHT_BUDGET_TIMEZONE;
+  const savedWarn = process.env.SPENDLIGHT_BUDGET_WARN_PERCENT;
   const origWarn = console.warn;
   try {
     delete process.env.SPENDLIGHT_BUDGET_PERIOD;
     delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
+    delete process.env.SPENDLIGHT_BUDGET_WARN_PERCENT;
     const base = loadConfig(path);
     assert(base.budgets.period === "lifetime", "file period lifetime");
     assert(base.budgets.timezone === "Europe/Berlin", "file timezone");
@@ -676,6 +694,46 @@ function testBudgetConfig(dir: string): void {
     const bare = loadConfig(barePath);
     assert(bare.budgets.period === "lifetime", "omitted period must stay lifetime");
     assert(bare.budgets.timezone === "UTC", "omitted timezone defaults to UTC");
+    assert(bare.budgets.warnPercent === 80, `omitted warn percent should default to 80, got ${bare.budgets.warnPercent}`);
+
+    const warnPath = join(dir, "warn.json");
+    writeFileSync(warnPath, JSON.stringify({ budgets: { warnPercent: 70, global: { hardUsd: 1 } } }));
+    const warnFile = loadConfig(warnPath);
+    assert(warnFile.budgets.warnPercent === 70, `file warn percent ${warnFile.budgets.warnPercent}`);
+
+    process.env.SPENDLIGHT_BUDGET_WARN_PERCENT = "90";
+    const warnEnv = loadConfig(warnPath);
+    assert(warnEnv.budgets.warnPercent === 90, `env warn percent should override the file, got ${warnEnv.budgets.warnPercent}`);
+
+    process.env.SPENDLIGHT_BUDGET_WARN_PERCENT = "100";
+    const warnFull = loadConfig(barePath);
+    assert(warnFull.budgets.warnPercent === 100, "100 is a valid warn percent");
+
+    for (const bad of ["0", "101", "-5", "eighty", "80%"]) {
+      process.env.SPENDLIGHT_BUDGET_WARN_PERCENT = bad;
+      let rejected = false;
+      try {
+        loadConfig(barePath);
+      } catch (err) {
+        rejected = true;
+        const message = err instanceof Error ? err.message : String(err);
+        assert(message.includes(bad), message);
+        assert(message.toLowerCase().includes("warn percent"), message);
+      }
+      assert(rejected, `invalid warn percent ${bad} must fail startup`);
+    }
+    delete process.env.SPENDLIGHT_BUDGET_WARN_PERCENT;
+
+    writeFileSync(join(dir, "bad-warn.json"), JSON.stringify({ budgets: { warnPercent: 0 } }));
+    let rejectedFile = false;
+    try {
+      loadConfig(join(dir, "bad-warn.json"));
+    } catch (err) {
+      rejectedFile = true;
+      const message = err instanceof Error ? err.message : String(err);
+      assert(message.includes("0"), message);
+    }
+    assert(rejectedFile, "invalid warn percent in the config file must fail startup");
 
     const dayPath = join(dir, "day-no-zone.json");
     writeFileSync(dayPath, JSON.stringify({ budgets: { period: "day", global: { hardUsd: 1 } } }));
@@ -795,6 +853,8 @@ function testBudgetConfig(dir: string): void {
     else process.env.SPENDLIGHT_BUDGET_PERIOD = savedPeriod;
     if (savedZone == null) delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
     else process.env.SPENDLIGHT_BUDGET_TIMEZONE = savedZone;
+    if (savedWarn == null) delete process.env.SPENDLIGHT_BUDGET_WARN_PERCENT;
+    else process.env.SPENDLIGHT_BUDGET_WARN_PERCENT = savedWarn;
   }
 }
 
@@ -2295,6 +2355,7 @@ const SUMMARY_FIELDS = [
   "requests",
   "tokens",
   "budget",
+  "budgetAlert",
   "byProject",
   "byModel",
   "byProjectModel",
@@ -2325,6 +2386,15 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
   const budget = summary.budget as Record<string, unknown>;
   assert(budget && typeof budget === "object", `${label} summary missing budget`);
   for (const key of BUDGET_FIELDS) assert(key in budget, `${label} budget missing ${key}`);
+  const alert = summary.budgetAlert as Record<string, unknown>;
+  assert(alert && typeof alert === "object", `${label} summary missing budgetAlert`);
+  for (const key of ["status", "warnPercent", "percentUsed", "spendUsd", "hardUsd", "basis"] as const) {
+    assert(key in alert, `${label} budgetAlert missing ${key}`);
+  }
+  assert(
+    alert.status === "ok" || alert.status === "warn" || alert.status === "over",
+    `${label} budgetAlert status ${String(alert.status)}`,
+  );
   for (const side of ["projectLimit", "globalLimit"] as const) {
     const limit = budget[side] as Record<string, unknown>;
     assert(limit && "softUsd" in limit && "hardUsd" in limit, `${label} ${side} missing soft/hard`);
@@ -2790,6 +2860,184 @@ async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise
     await res.text();
     const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
     assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
+  });
+}
+
+type AlertSummary = {
+  spendUsd: number;
+  scopeModel: string | null;
+  budget: { status: string; allowed?: boolean; globalSpend: number; period: string; timezone: string };
+  budgetAlert: {
+    status: string;
+    warnPercent: number;
+    percentUsed: number | null;
+    spendUsd: number;
+    hardUsd: number | null;
+    basis: string | null;
+  };
+};
+
+async function alertSummary(base: string, query = ""): Promise<AlertSummary> {
+  const url = query ? `${base}/api/summary?${query}` : `${base}/api/summary`;
+  return (await fetch(url).then((r) => r.json())) as AlertSummary;
+}
+
+async function testBudgetAlert(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "alert-life", mockUrl, { softUsd: 100, hardUsd: 10, warnPercent: 80 }, async (base, app) => {
+    let summary = await alertSummary(base);
+    assert(summary.budgetAlert.status === "ok", `empty ledger alert ${summary.budgetAlert.status}`);
+    assert(summary.budgetAlert.percentUsed === 0, `empty percent ${summary.budgetAlert.percentUsed}`);
+    assert(summary.budgetAlert.spendUsd === 0, "empty alert spend");
+    assert(summary.budgetAlert.hardUsd === 10, "alert hard cap");
+    assert(summary.budgetAlert.basis === "global", "unscoped alert should use the global cap");
+    assert(summary.budgetAlert.warnPercent === 80, "configured warn percent");
+    assert(summary.budget.status === "ok", "empty ledger should stay ok");
+
+    const now = new Date().toISOString();
+    seedSpend(app.db, now, 7, "demo");
+    summary = await alertSummary(base);
+    assert(summary.budgetAlert.status === "ok", `70% should stay ok, got ${summary.budgetAlert.status}`);
+    assert(Math.abs((summary.budgetAlert.percentUsed ?? NaN) - 70) < 1e-6, `70% used ${summary.budgetAlert.percentUsed}`);
+
+    seedSpend(app.db, now, 1, "demo");
+    summary = await alertSummary(base);
+    assert(summary.budgetAlert.status === "warn", `80% should warn, got ${summary.budgetAlert.status}`);
+    assert(Math.abs((summary.budgetAlert.percentUsed ?? NaN) - 80) < 1e-6, `80% used ${summary.budgetAlert.percentUsed}`);
+    assert(summary.budget.status === "ok", "warn percent must not flip the soft/hard status");
+
+    seedSpend(app.db, now, 1, "demo");
+    summary = await alertSummary(base);
+    assert(summary.budgetAlert.status === "warn", `90% should still warn, got ${summary.budgetAlert.status}`);
+    assert(Math.abs((summary.budgetAlert.percentUsed ?? NaN) - 90) < 1e-6, `90% used ${summary.budgetAlert.percentUsed}`);
+    assert(summary.budget.status === "ok", "under the hard cap should stay ok");
+
+    seedSpend(app.db, now, 1, "other", "gpt-4.1");
+    summary = await alertSummary(base);
+    assert(summary.budgetAlert.status === "over", `hard cap should be over, got ${summary.budgetAlert.status}`);
+    assert(summary.budgetAlert.spendUsd === 10, `alert spend ${summary.budgetAlert.spendUsd}`);
+    assert(summary.budget.status === "hard", "reaching the hard cap should still kill-switch");
+    assert(summary.spendUsd === 10, `lifetime total ${summary.spendUsd}`);
+
+    const slice = await alertSummary(base, "since=1999-01-01&until=1999-01-02");
+    assert(slice.spendUsd === 0, `time slice should exclude the ledger, got ${slice.spendUsd}`);
+    assert(slice.budgetAlert.status === "over", "time slice must not clear the hard-cap alert");
+    assert(slice.budgetAlert.spendUsd === 10, `sliced alert spend ${slice.budgetAlert.spendUsd}`);
+
+    const model = await alertSummary(base, "model=gpt-4.1");
+    assert(model.spendUsd === 1, `model filter spend ${model.spendUsd}`);
+    assert(model.scopeModel === "gpt-4.1", "model scope dropped");
+    assert(model.budgetAlert.status === "over", "model filter must not change the hard-cap alert");
+    assert(model.budgetAlert.spendUsd === 10, `model alert spend ${model.budgetAlert.spendUsd}`);
+
+    const demo = await alertSummary(base, "project=demo");
+    assert(demo.spendUsd === 9, `project filter spend ${demo.spendUsd}`);
+    assert(demo.budgetAlert.status === "warn", `project without its own cap should warn at 90% of global, got ${demo.budgetAlert.status}`);
+    assert(demo.budgetAlert.basis === "global", "project without a hard cap uses the global cap");
+    assert(demo.budgetAlert.spendUsd === 9, `project alert spend ${demo.budgetAlert.spendUsd}`);
+    assert(demo.budgetAlert.hardUsd === 10, `project alert cap ${demo.budgetAlert.hardUsd}`);
+  });
+
+  await withApp(
+    dir,
+    "alert-day",
+    mockUrl,
+    { softUsd: null, hardUsd: 10, warnPercent: 80, period: "day", timezone: "America/New_York" },
+    async (base, app) => {
+      const window = spendWindow(app.config);
+      assert(window, "day alert needs a window");
+      const yesterday = new Date(Date.parse(window.startIso) - 1000).toISOString();
+      const today = new Date(Date.parse(window.startIso) + 60_000).toISOString();
+      seedSpend(app.db, yesterday, 100, "old");
+      seedSpend(app.db, today, 8, "today");
+
+      const summary = await alertSummary(base);
+      assert(summary.spendUsd === 108, `hero should stay lifetime, got ${summary.spendUsd}`);
+      assert(summary.budget.globalSpend === 8, `window spend ${summary.budget.globalSpend}`);
+      assert(summary.budget.period === "day", summary.budget.period);
+      assert(summary.budget.timezone === "America/New_York", summary.budget.timezone);
+      assert(summary.budget.status === "ok", "yesterday must not trip today's hard cap");
+      assert(summary.budgetAlert.status === "warn", `today at 80% should warn, got ${summary.budgetAlert.status}`);
+      assert(summary.budgetAlert.spendUsd === 8, `alert should count today only, got ${summary.budgetAlert.spendUsd}`);
+      assert(Math.abs((summary.budgetAlert.percentUsed ?? NaN) - 80) < 1e-6, `today percent ${summary.budgetAlert.percentUsed}`);
+
+      const slice = await alertSummary(
+        base,
+        `since=${encodeURIComponent(yesterday)}&until=${encodeURIComponent(window.startIso)}`,
+      );
+      assert(slice.spendUsd === 100, `yesterday slice ${slice.spendUsd}`);
+      assert(slice.budgetAlert.status === "warn", "a past slice must not turn today's alert into over");
+      assert(slice.budgetAlert.spendUsd === 8, `sliced day alert spend ${slice.budgetAlert.spendUsd}`);
+
+      const current = await alertSummary(base, "window=current");
+      assert(current.spendUsd === 8, `current window spend ${current.spendUsd}`);
+      assert(current.budgetAlert.status === "warn", "window=current should keep today's warn");
+      assert(current.budgetAlert.spendUsd === 8, `current alert spend ${current.budgetAlert.spendUsd}`);
+    },
+  );
+
+  await withApp(
+    dir,
+    "alert-project",
+    mockUrl,
+    {
+      softUsd: null,
+      hardUsd: 100,
+      warnPercent: 80,
+      projects: { demo: { softUsd: null, hardUsd: 10 } },
+    },
+    async (base, app) => {
+      const now = new Date().toISOString();
+      seedSpend(app.db, now, 8, "demo");
+      seedSpend(app.db, now, 50, "other");
+
+      const all = await alertSummary(base);
+      assert(all.budgetAlert.status === "ok", `58% of global should be ok, got ${all.budgetAlert.status}`);
+      assert(all.budgetAlert.basis === "global", all.budgetAlert.basis ?? "null");
+      assert(all.budgetAlert.spendUsd === 58, `global alert spend ${all.budgetAlert.spendUsd}`);
+      assert(Math.abs((all.budgetAlert.percentUsed ?? NaN) - 58) < 1e-6, `global percent ${all.budgetAlert.percentUsed}`);
+      assert(all.budget.status === "ok", all.budget.status);
+
+      const demo = await alertSummary(base, "project=demo");
+      assert(demo.spendUsd === 8, `demo ledger ${demo.spendUsd}`);
+      assert(demo.budgetAlert.status === "warn", `demo at its own cap should warn, got ${demo.budgetAlert.status}`);
+      assert(demo.budgetAlert.basis === "project", demo.budgetAlert.basis ?? "null");
+      assert(demo.budgetAlert.hardUsd === 10, `demo cap ${demo.budgetAlert.hardUsd}`);
+      assert(demo.budgetAlert.spendUsd === 8, `demo alert spend ${demo.budgetAlert.spendUsd}`);
+      assert(Math.abs((demo.budgetAlert.percentUsed ?? NaN) - 80) < 1e-6, `demo percent ${demo.budgetAlert.percentUsed}`);
+      assert(demo.budget.status === "ok", "project warn must not kill the request path status");
+
+      const other = await alertSummary(base, "project=other");
+      assert(other.budgetAlert.status === "ok", `other tag ${other.budgetAlert.status}`);
+      assert(other.budgetAlert.basis === "global", "a tag without a hard cap uses the global cap");
+      assert(other.budgetAlert.hardUsd === 100, `other cap ${other.budgetAlert.hardUsd}`);
+      assert(other.budgetAlert.spendUsd === 50, `other alert spend ${other.budgetAlert.spendUsd}`);
+      assert(Math.abs((other.budgetAlert.percentUsed ?? NaN) - 50) < 1e-6, `other percent ${other.budgetAlert.percentUsed}`);
+    },
+  );
+
+  await withApp(dir, "alert-custom", mockUrl, { softUsd: null, hardUsd: 10, warnPercent: 50 }, async (base, app) => {
+    const now = new Date().toISOString();
+    seedSpend(app.db, now, 4, "demo");
+    let summary = await alertSummary(base);
+    assert(summary.budgetAlert.warnPercent === 50, `custom warn percent ${summary.budgetAlert.warnPercent}`);
+    assert(summary.budgetAlert.status === "ok", `40% of a 50% warn should be ok, got ${summary.budgetAlert.status}`);
+    seedSpend(app.db, now, 1, "demo");
+    summary = await alertSummary(base);
+    assert(summary.budgetAlert.status === "warn", `50% threshold should warn, got ${summary.budgetAlert.status}`);
+    assert(Math.abs((summary.budgetAlert.percentUsed ?? NaN) - 50) < 1e-6, `custom percent ${summary.budgetAlert.percentUsed}`);
+    assert(summary.budget.status === "ok", summary.budget.status);
+  });
+
+  await withApp(dir, "alert-none", mockUrl, { softUsd: 1, hardUsd: null }, async (base, app) => {
+    seedSpend(app.db, new Date().toISOString(), 5, "demo");
+    const summary = await alertSummary(base);
+    assert(summary.budget.status === "soft", `soft dollar cap should still warn, got ${summary.budget.status}`);
+    assert(summary.budgetAlert.status === "ok", `no hard cap should stay ok, got ${summary.budgetAlert.status}`);
+    assert(summary.budgetAlert.hardUsd === null, "missing hard cap");
+    assert(summary.budgetAlert.percentUsed === null, "percent used needs a hard cap");
+    assert(summary.budgetAlert.basis === null, "basis needs a hard cap");
+    assert(summary.budgetAlert.warnPercent === 80, `default warn percent ${summary.budgetAlert.warnPercent}`);
+    assert(summary.budgetAlert.spendUsd === 5, `uncapped alert spend ${summary.budgetAlert.spendUsd}`);
   });
 }
 

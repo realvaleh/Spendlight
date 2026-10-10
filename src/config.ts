@@ -39,6 +39,7 @@ type FileConfig = {
     projects?: Record<string, Partial<BudgetLimit>>;
     period?: unknown;
     timezone?: unknown;
+    warnPercent?: unknown;
   };
   pricing?: Record<string, Partial<ModelPrice>>;
   fallbackPrice?: Partial<ModelPrice>;
@@ -84,6 +85,20 @@ function parseTimeZone(raw: string | undefined, period: BudgetPeriod): string {
   const timeZone = raw.trim();
   assertIanaTimeZone(timeZone);
   return timeZone;
+}
+
+/** Default share of the hard cap that marks `budgetAlert.status` as `warn`. */
+export const DEFAULT_WARN_PERCENT = 80;
+
+function parseWarnPercent(raw: string | undefined): number {
+  if (raw == null || raw.trim() === "") return DEFAULT_WARN_PERCENT;
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n) || n <= 0 || n > 100) {
+    throw new Error(
+      `Invalid budget warn percent "${raw}". Expected a number greater than 0 and at most 100 (budgets.warnPercent or SPENDLIGHT_BUDGET_WARN_PERCENT).`,
+    );
+  }
+  return n;
 }
 
 function parseBudget(raw: Partial<BudgetLimit> | undefined): BudgetLimit {
@@ -140,6 +155,9 @@ export function loadConfig(explicitPath?: string): Config {
 
   const period = parsePeriod(strEnv("SPENDLIGHT_BUDGET_PERIOD") ?? asString(file.budgets?.period));
   const timezone = parseTimeZone(strEnv("SPENDLIGHT_BUDGET_TIMEZONE") ?? asString(file.budgets?.timezone), period);
+  const warnPercent = parseWarnPercent(
+    strEnv("SPENDLIGHT_BUDGET_WARN_PERCENT") ?? asString(file.budgets?.warnPercent),
+  );
 
   if (file.upstream?.apiKey && !process.env.OPENAI_API_KEY) {
     console.warn(
@@ -159,7 +177,7 @@ export function loadConfig(explicitPath?: string): Config {
         "https://api.openai.com/v1",
     ),
     upstreamApiKey: process.env.OPENAI_API_KEY ?? file.upstream?.apiKey ?? null,
-    budgets: { global, projects, period, timezone },
+    budgets: { global, projects, period, timezone, warnPercent },
     pricing,
     fallbackPrice: {
       inputPerMillion: file.fallbackPrice?.inputPerMillion ?? DEFAULT_FALLBACK.inputPerMillion,
@@ -187,6 +205,7 @@ Env:
   SPENDLIGHT_HARD_BUDGET_USD     Global hard budget (kill-switch)
   SPENDLIGHT_BUDGET_PERIOD       lifetime (default), day, week, or month
   SPENDLIGHT_BUDGET_TIMEZONE     IANA zone when period is day, week, or month (e.g. America/New_York)
+  SPENDLIGHT_BUDGET_WARN_PERCENT Warn when spend reaches this percent of the hard cap (default 80)
 
 Bind to 127.0.0.1 (the default). The dashboard, receipts, and /api/summary have no auth.
 `;

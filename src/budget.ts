@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { BudgetDecision, BudgetLimit, BudgetPeriod, Config } from "./types.js";
+import type { BudgetAlert, BudgetDecision, BudgetLimit, BudgetPeriod, Config } from "./types.js";
 import type { Preflight } from "./pricing.js";
 import { calendarDayBounds, calendarMonthBounds, calendarWeekBounds } from "./day.js";
 import {
@@ -35,6 +35,48 @@ export function spendWindow(config: Config, now = new Date()): SpendWindow | nul
           : null;
   if (!bounds) return null;
   return { startIso: bounds.start.toISOString(), endIso: bounds.end.toISOString() };
+}
+
+/**
+ * Percent-of-hard-cap alert for a summary. Uses the budget window already on
+ * `decision` (lifetime, or the current day / week / month). A non-empty
+ * `scopeProject` measures that tag: its own hard cap when set, otherwise its
+ * window spend against the global hard cap. Export filters are not applied here.
+ * Soft and hard admission are unchanged.
+ */
+export function budgetAlertFor(
+  decision: BudgetDecision,
+  warnPercent: number,
+  scopeProject: string | null,
+): BudgetAlert {
+  const projectScoped = scopeProject != null && scopeProject !== "";
+  const projectHard = projectScoped ? decision.projectLimit.hardUsd : null;
+  const useProjectCap = projectHard != null;
+  const hardUsd = useProjectCap ? projectHard : decision.globalLimit.hardUsd;
+  const spendUsd = projectScoped ? decision.projectSpend : decision.globalSpend;
+  if (hardUsd == null) {
+    return { status: "ok", warnPercent, percentUsed: null, spendUsd, hardUsd: null, basis: null };
+  }
+  const basis = useProjectCap ? "project" : "global";
+  if (!(hardUsd > 0)) {
+    return {
+      status: spendUsd >= hardUsd ? "over" : "ok",
+      warnPercent,
+      percentUsed: null,
+      spendUsd,
+      hardUsd,
+      basis,
+    };
+  }
+  const percentUsed = roundPercent((spendUsd / hardUsd) * 100);
+  let status: BudgetAlert["status"] = "ok";
+  if (spendUsd >= hardUsd) status = "over";
+  else if (spendUsd >= hardUsd * (warnPercent / 100)) status = "warn";
+  return { status, warnPercent, percentUsed, spendUsd, hardUsd, basis };
+}
+
+function roundPercent(n: number): number {
+  return Math.round(n * 1e6) / 1e6;
 }
 
 export function evaluateBudget(db: Db, config: Config, project: string, now = new Date()): BudgetDecision {

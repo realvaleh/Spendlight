@@ -25,6 +25,11 @@ export type Config = {
     period: BudgetPeriod;
     /** IANA zone used when period is `day`, `week`, or `month`. `UTC` when unset. */
     timezone: string;
+    /**
+     * Percent of the hard cap at which `budgetAlert` becomes `warn`.
+     * Default 80. Does not change soft or hard admission.
+     */
+    warnPercent: number;
   };
   pricing: Record<string, ModelPrice>;
   fallbackPrice: ModelPrice;
@@ -72,6 +77,29 @@ export type BudgetDecision = {
   windowEnd: string | null;
 };
 
+/** Percent-of-hard-cap alert. Independent of `BudgetDecision.status` (soft / hard dollars). */
+export type BudgetAlert = {
+  /** `ok` below the warn percent, `warn` at or above it and under the hard cap, `over` at or above the hard cap. */
+  status: "ok" | "warn" | "over";
+  /** Configured warn percent of the hard cap. Default 80. */
+  warnPercent: number;
+  /** Window spend as a percent of `hardUsd`. Null when no positive hard cap applies. */
+  percentUsed: number | null;
+  /**
+   * Spend compared to the cap. This is the budget window (lifetime, or the current
+   * day, week, or month in the budget timezone), not an export time slice.
+   */
+  spendUsd: number;
+  /** Hard cap the alert is measured against. Null when none applies. */
+  hardUsd: number | null;
+  /**
+   * `project` when a project-scoped summary has its own hard cap.
+   * `global` when the alert uses the global hard cap.
+   * Null when no hard cap applies.
+   */
+  basis: "project" | "global" | null;
+};
+
 export type Summary = {
   generatedAt: string;
   /**
@@ -104,6 +132,13 @@ export type Summary = {
   requests: number;
   tokens: number;
   budget: BudgetDecision;
+  /**
+   * Warn / over alert against the hard cap. `model`, `since`, `until`, and `window`
+   * filters do not change it. A `project` query uses that tag's hard cap when one
+   * is set, otherwise that tag's window spend against the global hard cap.
+   * Existing `budget` fields are unchanged.
+   */
+  budgetAlert: BudgetAlert;
   byProject: { project: string; spendUsd: number; requests: number; tokens: number }[];
   byModel: { model: string; spendUsd: number; requests: number; tokens: number }[];
   /**
