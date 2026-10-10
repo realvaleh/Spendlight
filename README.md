@@ -145,6 +145,29 @@ export SPENDLIGHT_SOFT_BUDGET_USD=10
 export SPENDLIGHT_HARD_BUDGET_USD=25
 ```
 
+A **warn percent** is separate from the soft dollar cap. It shows up as a dashboard badge and as `budgetAlert` on `/api/summary`. It does not block traffic and it does not change `budget.status`. The default is **80**: budget-window spend at or above 80% of the hard cap is `warn`, and spend at or above the hard cap is `over`. Below that, or when no hard cap is set, the status is `ok`.
+
+```bash
+export SPENDLIGHT_BUDGET_WARN_PERCENT=80
+```
+
+`budgets.warnPercent` in the config file is the same knob (see `spendlight.config.example.json`). The env var overrides the file. A value that is not a number greater than 0 and at most 100 fails startup. `100` leaves no warn band: the alert stays `ok` until the hard cap, then `over`.
+
+`budgetAlert` is:
+
+```json
+{
+  "status": "warn",
+  "warnPercent": 80,
+  "percentUsed": 85,
+  "spendUsd": 8.5,
+  "hardUsd": 10,
+  "basis": "global"
+}
+```
+
+`percentUsed` is null when there is no positive hard cap. `basis` is `"project"` when the summary is scoped to a tag that has its own hard cap, `"global"` when the alert uses the global hard cap, and null when there is no hard cap. The spend it measures is the budget window — lifetime, or the current day, week, or month in the budget timezone — the same dollars as `budget.projectSpend` or `budget.globalSpend`. A project-scoped summary with no project hard cap compares that tag's window spend to the global hard cap. `model`, `since`, `until`, and `window` filters do not change `budgetAlert`. The dashboard badge reads **under 80%**, **warn 80%**, or **over cap** (**no cap** when no hard budget is set), next to the existing soft / hard pill.
+
 Per-project limits live in `spendlight.config.json`. A request is blocked if **either** the project hard cap **or** the global hard cap is hit.
 
 Caps count the **whole ledger** unless you set a calendar window. `period` defaults to `lifetime` (omit it and nothing changes). `day` counts only rows whose timestamp falls on the current calendar day in an IANA timezone, and the window resets at local midnight. `week` counts only rows in the current ISO week (Monday through Sunday) in that same timezone, and the window resets at local midnight on Monday. `month` counts only rows in the current calendar month in that same timezone, and the window resets at local midnight on the 1st. That is a daily, weekly, or monthly kill-switch: soft $5 / hard $10 today, soft $20 / hard $40 this week, or soft $50 / hard $100 this month, without wiping the database. The dashboard hero total stays lifetime. The budget meter, kill-switch, reservation room, and soft-warn dedupe use the day, week, or month window, so the next day, week, or month can warn again.
@@ -154,6 +177,7 @@ Caps count the **whole ledger** unless you set a calendar window. `period` defau
   "budgets": {
     "period": "day",
     "timezone": "America/New_York",
+    "warnPercent": 80,
     "global": { "softUsd": 5, "hardUsd": 10 },
     "projects": {
       "demo": { "softUsd": 1, "hardUsd": 2 }
@@ -333,6 +357,7 @@ Spendlight is a **localhost reverse proxy that can spend your API key**. Treat t
 | `SPENDLIGHT_HARD_BUDGET_USD` | — | Global hard budget (kill-switch) |
 | `SPENDLIGHT_BUDGET_PERIOD` | `lifetime` | `lifetime` (whole ledger), `day` (calendar day), `week` (ISO week, Monday–Sunday), or `month` (calendar month) |
 | `SPENDLIGHT_BUDGET_TIMEZONE` | `UTC` | IANA zone for a day, week, or month window, e.g. `America/New_York` |
+| `SPENDLIGHT_BUDGET_WARN_PERCENT` | `80` | Warn badge when window spend reaches this percent of the hard cap |
 
 ## Smoke test
 

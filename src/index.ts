@@ -28,6 +28,7 @@ if (config.budgets.period === "day" || config.budgets.period === "week" || confi
 } else {
   console.log(`  budget     lifetime`);
 }
+console.log(`  alert      warn at ${config.budgets.warnPercent}% of the hard cap`);
 if (!config.upstreamApiKey) {
   console.log("  note       OPENAI_API_KEY unset; clients must send Authorization");
 }
