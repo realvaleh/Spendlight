@@ -145,6 +145,14 @@ export function dashboardHtml(): string {
 
     <article class="card" style="margin-bottom:18px">
       <div class="row-head">
+        <div class="k">By status</div>
+        <div class="sub">highest spend first</div>
+      </div>
+      <div id="by-status" class="empty">No requests yet.</div>
+    </article>
+
+    <article class="card" style="margin-bottom:18px">
+      <div class="row-head">
         <div class="k">Spend by day</div>
         <div class="sub" id="daily-sub">last 14 days</div>
       </div>
@@ -323,6 +331,18 @@ export function dashboardHtml(): string {
       );
       $("by-pair").className = "";
       $("by-pair").innerHTML = pairs || '<div class="empty">No project and model pairs yet.</div>';
+      const statuses = s.byStatus || [];
+      const maxS = Math.max(...statuses.map(row => row.spendUsd), 1e-9);
+      const byStatus = table(
+        [{label:"Status"},{label:"Spend",num:true},{label:"Reqs",num:true}],
+        statuses.map(row => [
+          "<code>" + esc(row.status) + "</code> " + (Number(row.status) >= 200 && Number(row.status) < 300 ? "ok" : "failed"),
+          fmtMoney(row.spendUsd) + '<div class="bar"><i style="width:' + (row.spendUsd / maxS * 100) + '%"></i></div>',
+          fmtInt(row.requests)
+        ])
+      );
+      $("by-status").className = "";
+      $("by-status").innerHTML = byStatus || '<div class="empty">No requests yet.</div>';
       const ranked = s.topRequests || [];
       const maxT = Math.max(...ranked.map(r => r.costUsd), 1e-9);
       const top = table(

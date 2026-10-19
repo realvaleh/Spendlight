@@ -113,6 +113,13 @@ export type Summary = {
    */
   byProjectModel: { project: string; model: string; spendUsd: number; requests: number; tokens: number }[];
   /**
+   * Spend grouped by the HTTP status stored on each ledger row, highest
+   * `spendUsd` first. Equal spend breaks ties by status code ascending.
+   * The same project, model, and time filters as the rest of the summary
+   * apply. Empty when nothing matches.
+   */
+  byStatus: { status: number; spendUsd: number; requests: number; tokens: number }[];
+  /**
    * Spend by calendar day in the budget timezone (`UTC` when unset).
    * `day` is `YYYY-MM-DD`. Every local day in the covered span is present,
    * including days with no matching requests (`spendUsd: 0`, `requests: 0`).

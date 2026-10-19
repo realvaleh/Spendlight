@@ -291,6 +291,8 @@ Quiet days inside the covered span are included, with `spendUsd: 0` and `request
 
 `/api/summary` also adds `topRequests`: up to ten ledger rows inside those same filters, highest `costUsd` first. Each object is a request row, the same shape as `recent` (`id`, `createdAt`, `project`, `model`, token counts, `costUsd`, `status`, `error`, `upstreamId`, `path`, `streamed`). Equal cost is ordered by `createdAt` descending, then `id` ascending. Fewer than ten matches returns every match, and a miss is `[]`. Failed and streamed rows stay in the ranking. `recent` is still the latest requests, newest first. The dashboard **Most expensive** card lists this ranking, with a bar under each cost.
 
+`/api/summary` also adds `byStatus`: one object per distinct request status inside those same filters, highest spend first. Each object is `{ "status": <number>, "spendUsd": <number>, "requests": <number>, "tokens": <number> }`. `status` is the HTTP status stored on the ledger row (`200` for a successful upstream response; `429`, `500`, and other codes stay separate). Equal spend is ordered by status code ascending. The array is empty when nothing matches. The dashboard **By status** card lists each code with its spend and request count.
+
 ```bash
 curl -s "http://127.0.0.1:8787/api/export.csv?since=2026-10-01&until=2026-10-05" -o october-week.csv
 curl -s "http://127.0.0.1:8787/api/export.json?since=2026-10-01&until=2026-10-05"
