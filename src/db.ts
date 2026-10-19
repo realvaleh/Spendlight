@@ -305,6 +305,7 @@ export function loadSummaryParts(
   byProject: { project: string; spendUsd: number; requests: number; tokens: number }[];
   byModel: { model: string; spendUsd: number; requests: number; tokens: number }[];
   byProjectModel: { project: string; model: string; spendUsd: number; requests: number; tokens: number }[];
+  byStatus: { status: number; spendUsd: number; requests: number; tokens: number }[];
   daily: { day: string; spendUsd: number; requests: number }[];
   recent: LedgerRow[];
   topRequests: LedgerRow[];
@@ -334,6 +335,12 @@ export function loadSummaryParts(
        FROM requests${clause} GROUP BY project, model ORDER BY spendUsd DESC, project ASC, model ASC`,
     )
     .all(...args) as { project: string; model: string; spendUsd: number; requests: number; tokens: number }[];
+  const byStatus = db
+    .prepare(
+      `SELECT status, COALESCE(SUM(cost_usd),0) AS spendUsd, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens
+       FROM requests${clause} GROUP BY status ORDER BY spendUsd DESC, status ASC`,
+    )
+    .all(...args) as { status: number; spendUsd: number; requests: number; tokens: number }[];
   const topRequests = db
     .prepare(
       `SELECT ${REQUEST_COLUMNS} FROM requests${clause} ORDER BY cost_usd DESC, created_at DESC, id ASC LIMIT ?`,
@@ -355,6 +362,12 @@ export function loadSummaryParts(
     byModel: byModel.map((r) => ({ ...r, spendUsd: Number(r.spendUsd), requests: Number(r.requests), tokens: Number(r.tokens) })),
     byProjectModel: byProjectModel.map((r) => ({
       ...r,
+      spendUsd: Number(r.spendUsd),
+      requests: Number(r.requests),
+      tokens: Number(r.tokens),
+    })),
+    byStatus: byStatus.map((r) => ({
+      status: Number(r.status),
       spendUsd: Number(r.spendUsd),
       requests: Number(r.requests),
       tokens: Number(r.tokens),

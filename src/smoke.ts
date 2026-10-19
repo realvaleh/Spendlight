@@ -328,6 +328,9 @@ async function main(): Promise<void> {
     assert(dash.includes('href="/receipt.svg?\' + q'), "dashboard pair links should include the svg receipt");
     assert(dash.includes('href="/api/export.csv?\' + q'), "dashboard pair links should include csv");
     assert(dash.includes('href="/api/export.json?\' + q'), "dashboard pair links should include json");
+    assert(dash.includes("By status"), "dashboard missing status card");
+    assert(dash.includes('id="by-status"'), "dashboard missing status mount");
+    assert(dash.includes("s.byStatus"), "dashboard should render byStatus");
     assert(dash.includes("Most expensive"), "dashboard missing most-expensive card");
     assert(dash.includes("highest cost first"), "dashboard should order expensive requests by cost");
     assert(dash.includes('id="top-requests"'), "dashboard missing most-expensive mount");
@@ -364,8 +367,9 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testByStatus(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, status spend");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2259,6 +2263,8 @@ type DailyRow = { day: string; spendUsd: number; requests: number };
 
 type PairRow = { project: string; model: string; spendUsd: number; requests: number; tokens: number };
 
+type StatusRow = { status: number; spendUsd: number; requests: number; tokens: number };
+
 type TopRow = {
   id: string;
   createdAt: string;
@@ -2298,6 +2304,7 @@ const SUMMARY_FIELDS = [
   "byProject",
   "byModel",
   "byProjectModel",
+  "byStatus",
   "daily",
   "recent",
   "topRequests",
@@ -2329,7 +2336,7 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
     const limit = budget[side] as Record<string, unknown>;
     assert(limit && "softUsd" in limit && "hardUsd" in limit, `${label} ${side} missing soft/hard`);
   }
-  for (const key of ["byProject", "byModel", "byProjectModel", "daily", "recent", "topRequests", "events"] as const) {
+  for (const key of ["byProject", "byModel", "byProjectModel", "byStatus", "daily", "recent", "topRequests", "events"] as const) {
     assert(Array.isArray(summary[key]), `${label} ${key} is not an array`);
   }
   const projects = summary.byProject as Record<string, unknown>[];
@@ -2348,6 +2355,12 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
   if (pairs[0]) {
     for (const key of ["project", "model", "spendUsd", "requests", "tokens"]) {
       assert(key in pairs[0], `${label} byProjectModel missing ${key}`);
+    }
+  }
+  const statuses = summary.byStatus as Record<string, unknown>[];
+  if (statuses[0]) {
+    for (const key of ["status", "spendUsd", "requests", "tokens"]) {
+      assert(key in statuses[0], `${label} byStatus missing ${key}`);
     }
   }
   const daily = summary.daily as Record<string, unknown>[];
@@ -2427,6 +2440,21 @@ function assertPairs(pairs: PairRow[], expected: PairRow[], label: string): void
 
 function sumPairs(pairs: PairRow[]): number {
   return pairs.reduce((sum, row) => sum + row.spendUsd, 0);
+}
+
+function assertStatuses(rows: StatusRow[], expected: StatusRow[], label: string): void {
+  assert(
+    rows.length === expected.length,
+    `${label} statuses [${rows.map((r) => r.status).join(",")}] expected [${expected.map((r) => r.status).join(",")}]`,
+  );
+  for (let i = 0; i < expected.length; i++) {
+    const got = rows[i];
+    const want = expected[i]!;
+    assert(got?.status === want.status, `${label} status ${i} ${got?.status} !== ${want.status}`);
+    assert(Math.abs((got?.spendUsd ?? NaN) - want.spendUsd) < 1e-6, `${label} ${want.status} spend ${got?.spendUsd}`);
+    assert(got?.requests === want.requests, `${label} ${want.status} requests ${got?.requests}`);
+    assert(got?.tokens === want.tokens, `${label} ${want.status} tokens ${got?.tokens}`);
+  }
 }
 
 function assertTop(rows: TopRow[], expected: { id: string; costUsd: number }[], label: string): void {
@@ -2740,6 +2768,190 @@ async function testTopRequests(dir: string, mockUrl: string): Promise<void> {
       };
       assert(lifetime.topRequests[0]?.id === "old", `unscoped top should keep yesterday, got ${lifetime.topRequests[0]?.id}`);
       assert(Math.abs(lifetime.spendUsd - 59) < 1e-6, `unscoped spend ${lifetime.spendUsd}`);
+      assert(lifetime.scopeSince == null, "unscoped summary picked up window=current");
+    },
+  );
+}
+
+async function testByStatus(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "status", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
+    const empty = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+      requests: number;
+      byStatus: StatusRow[];
+    };
+    assertSummaryFields(empty as unknown as Record<string, unknown>, "empty status");
+    assert(empty.requests === 0 && empty.byStatus.length === 0, "empty ledger should have no status rows");
+
+    const seed = (
+      createdAt: string,
+      costUsd: number,
+      project: string,
+      model: string,
+      tokens: number,
+      status: number,
+      error?: string,
+    ) => {
+      insertRequest(app.db, {
+        createdAt,
+        project,
+        model,
+        usage: { promptTokens: tokens, completionTokens: 0, cachedTokens: 0, totalTokens: tokens },
+        costUsd,
+        status,
+        error: error ?? null,
+        path: "/v1/chat/completions",
+      });
+    };
+    seed("2026-10-01T00:00:00.000Z", 10, "alpha", "gpt-4o", 100, 200);
+    seed("2026-10-02T00:00:00.000Z", 4, "alpha", "gpt-4o-mini", 40, 200);
+    seed("2026-10-02T01:00:00.000Z", 6, "alpha", "gpt-4o", 6, 500, "upstream timeout");
+    seed("2026-10-03T00:00:00.000Z", 3, "beta", "gpt-4o", 3, 500, "upstream timeout");
+    seed("2026-10-03T01:00:00.000Z", 5, "beta", "gpt-4o-mini", 2, 429);
+    seed("2026-10-04T00:00:00.000Z", 9, "zeta", "gpt-4o", 8, 429);
+
+    const summary = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+      spendUsd: number;
+      requests: number;
+      tokens: number;
+      byStatus: StatusRow[];
+      budget: { globalSpend: number; status: string };
+    };
+    assertSummaryFields(summary as unknown as Record<string, unknown>, "status");
+    assertStatuses(summary.byStatus, [
+      { status: 200, spendUsd: 14, requests: 2, tokens: 140 },
+      { status: 429, spendUsd: 14, requests: 2, tokens: 10 },
+      { status: 500, spendUsd: 9, requests: 2, tokens: 9 },
+    ], "mixed ok and failed");
+    assert(summary.requests === 6, `status ledger requests ${summary.requests}`);
+    assert(Math.abs(summary.spendUsd - 37) < 1e-6, `status ledger spend ${summary.spendUsd}`);
+    assert(summary.tokens === 159, `status ledger tokens ${summary.tokens}`);
+    assert(Math.abs(summary.byStatus.reduce((sum, row) => sum + row.spendUsd, 0) - summary.spendUsd) < 1e-6, "status spend drifted from the ledger");
+    assert(summary.byStatus.reduce((sum, row) => sum + row.requests, 0) === summary.requests, "status request count drifted");
+    assert(Math.abs(summary.budget.globalSpend - 37) < 1e-6, "status grouping changed kill-switch spend");
+    assert(summary.budget.status === "ok", `status grouping changed budget status ${summary.budget.status}`);
+
+    const projectScoped = (await fetch(`${base}/api/summary?project=alpha`).then((r) => r.json())) as {
+      byStatus: StatusRow[];
+      requests: number;
+      spendUsd: number;
+      budget: { globalSpend: number };
+    };
+    assertStatuses(projectScoped.byStatus, [
+      { status: 200, spendUsd: 14, requests: 2, tokens: 140 },
+      { status: 500, spendUsd: 6, requests: 1, tokens: 6 },
+    ], "project filter");
+    assert(projectScoped.requests === 3, `alpha requests ${projectScoped.requests}`);
+    assert(Math.abs(projectScoped.spendUsd - 20) < 1e-6, `alpha spend ${projectScoped.spendUsd}`);
+    assert(Math.abs(projectScoped.budget.globalSpend - 37) < 1e-6, "project filter changed kill-switch spend");
+
+    const modelScoped = (await fetch(`${base}/api/summary?model=gpt-4o`).then((r) => r.json())) as {
+      byStatus: StatusRow[];
+    };
+    assertStatuses(modelScoped.byStatus, [
+      { status: 200, spendUsd: 10, requests: 1, tokens: 100 },
+      { status: 429, spendUsd: 9, requests: 1, tokens: 8 },
+      { status: 500, spendUsd: 9, requests: 2, tokens: 9 },
+    ], "model filter");
+
+    const ranged = (await fetch(`${base}/api/summary?since=2026-10-03&until=2026-10-04`).then((r) => r.json())) as {
+      byStatus: StatusRow[];
+      spendUsd: number;
+      requests: number;
+    };
+    assertStatuses(ranged.byStatus, [
+      { status: 429, spendUsd: 5, requests: 1, tokens: 2 },
+      { status: 500, spendUsd: 3, requests: 1, tokens: 3 },
+    ], "time slice");
+    assert(ranged.requests === 2, `slice requests ${ranged.requests}`);
+    assert(Math.abs(ranged.spendUsd - 8) < 1e-6, `slice spend ${ranged.spendUsd}`);
+
+    const both = (await fetch(`${base}/api/summary?project=alpha&model=gpt-4o&since=2026-10-02&until=2026-10-03`).then((r) => r.json())) as {
+      byStatus: StatusRow[];
+      requests: number;
+    };
+    assertStatuses(both.byStatus, [{ status: 500, spendUsd: 6, requests: 1, tokens: 6 }], "project+model+range");
+    assert(both.requests === 1, `combined requests ${both.requests}`);
+
+    const miss = (await fetch(`${base}/api/summary?model=missing`).then((r) => r.json())) as {
+      byStatus: StatusRow[];
+      requests: number;
+      spendUsd: number;
+      budget: { globalSpend: number };
+    };
+    assert(miss.byStatus.length === 0, "unknown model should have no status rows");
+    assert(miss.requests === 0 && miss.spendUsd === 0, "unknown model should be an empty scope");
+    assert(Math.abs(miss.budget.globalSpend - 37) < 1e-6, "empty scope changed kill-switch spend");
+
+    const md = await fetch(`${base}/receipt.md`).then((r) => r.text());
+    assert(!md.includes("## By status"), "receipt should not grow a status section");
+  });
+
+  await withApp(
+    dir,
+    "status-day",
+    mockUrl,
+    { softUsd: null, hardUsd: 100, period: "day", timezone: "America/New_York" },
+    async (base, app) => {
+      const probe = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+        budget: { windowStart: string | null; windowEnd: string | null; globalSpend: number };
+      };
+      const start = probe.budget.windowStart;
+      assert(start != null, "day window missing bounds");
+      insertRequest(app.db, {
+        createdAt: new Date(Date.parse(start) - 1000).toISOString(),
+        project: "demo",
+        model: "gpt-4o",
+        usage: { promptTokens: 4, completionTokens: 0, cachedTokens: 0, totalTokens: 4 },
+        costUsd: 20,
+        status: 500,
+        error: "yesterday",
+        path: "/v1/chat/completions",
+      });
+      insertRequest(app.db, {
+        createdAt: start,
+        project: "demo",
+        model: "gpt-4o-mini",
+        usage: { promptTokens: 2, completionTokens: 0, cachedTokens: 0, totalTokens: 2 },
+        costUsd: 4,
+        status: 200,
+        path: "/v1/chat/completions",
+      });
+      insertRequest(app.db, {
+        createdAt: new Date(Date.parse(start) + 60_000).toISOString(),
+        project: "demo",
+        model: "gpt-4o",
+        usage: { promptTokens: 1, completionTokens: 0, cachedTokens: 0, totalTokens: 1 },
+        costUsd: 1,
+        status: 500,
+        error: "today",
+        path: "/v1/chat/completions",
+      });
+
+      const current = (await fetch(`${base}/api/summary?window=current`).then((r) => r.json())) as {
+        spendUsd: number;
+        byStatus: StatusRow[];
+        budget: { globalSpend: number; status: string };
+      };
+      assertStatuses(current.byStatus, [
+        { status: 200, spendUsd: 4, requests: 1, tokens: 2 },
+        { status: 500, spendUsd: 1, requests: 1, tokens: 1 },
+      ], "window=current");
+      assert(Math.abs(current.spendUsd - 5) < 1e-6, `window spend ${current.spendUsd}`);
+      assert(Math.abs(current.budget.globalSpend - 5) < 1e-6, "window grouping changed the day budget");
+      assert(current.budget.status === "ok", current.budget.status);
+
+      const lifetime = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+        spendUsd: number;
+        byStatus: StatusRow[];
+        scopeSince: string | null;
+        budget: { globalSpend: number };
+      };
+      assertStatuses(lifetime.byStatus, [
+        { status: 500, spendUsd: 21, requests: 2, tokens: 5 },
+        { status: 200, spendUsd: 4, requests: 1, tokens: 2 },
+      ], "unscoped keeps yesterday");
+      assert(Math.abs(lifetime.spendUsd - 25) < 1e-6, `unscoped spend ${lifetime.spendUsd}`);
+      assert(Math.abs(lifetime.budget.globalSpend - 5) < 1e-6, "unscoped summary changed the day budget");
       assert(lifetime.scopeSince == null, "unscoped summary picked up window=current");
     },
   );
