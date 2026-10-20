@@ -1,9 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { Config, LedgerRow, Summary } from "./types.js";
-import { closeDb, listRequests, loadSummaryParts, openDb, spendMatching, type CreatedRange, type Db } from "./db.js";
+import type { Config, LedgerRow, PricingReport, Summary } from "./types.js";
+import { closeDb, listModelSpend, listRequests, loadSummaryParts, openDb, spendMatching, type CreatedRange, type Db } from "./db.js";
 import { evaluateBudget, spendWindow } from "./budget.js";
 import { dashboardHtml, FAVICON_SVG } from "./ui.js";
 import { badgeSvg, receiptMarkdown, receiptSvg } from "./receipts.js";
+import { pricingReport } from "./pricing.js";
 import { proxyRequest, corsHeaders, normalizeModelId, normalizeProjectTag } from "./proxy.js";
 import { parseExportRange, type ParsedExportRange } from "./range.js";
 
@@ -82,6 +83,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
     if (!parsed) return;
     return sendJson(res, 200, summaryFor(db, config, url, parsed.range), req);
   }
+  if (req.method === "GET" && url.pathname === "/api/pricing") {
+    return sendJson(res, 200, buildPricing(db, config), req);
+  }
   if (req.method === "GET" && (url.pathname === "/api/export.csv" || url.pathname === "/api/export.json")) {
     const parsed = exportRangeOr400(url, config, res, req);
     if (!parsed) return;
@@ -146,6 +150,10 @@ export function buildSummary(
 
 function summaryFor(db: Db, config: Config, url: URL, range?: CreatedRange | null): Summary {
   return buildSummary(db, config, queryProject(url), queryModel(url), range);
+}
+
+export function buildPricing(db: Db, config: Config, now = new Date()): PricingReport {
+  return pricingReport(config.pricing, config.pricingOverrides, config.fallbackPrice, listModelSpend(db), now);
 }
 
 /** Writes a 400 and returns undefined when `since`, `until`, or `window` is invalid. */

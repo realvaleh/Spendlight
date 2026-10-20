@@ -1,4 +1,42 @@
-import type { ModelPrice, Usage } from "./types.js";
+import type { ModelPrice, PriceRates, PricingReport, Usage } from "./types.js";
+
+function ratesOf(price: ModelPrice): PriceRates {
+  return {
+    inputPerMillion: price.inputPerMillion,
+    outputPerMillion: price.outputPerMillion,
+    cachedInputPerMillion: price.cachedInputPerMillion ?? null,
+  };
+}
+
+/**
+ * Effective table plus ledger models that miss every entry (exact and prefix).
+ * `overrides` are model ids that came from the config file.
+ */
+export function pricingReport(
+  pricing: Record<string, ModelPrice>,
+  overrides: readonly string[],
+  fallback: ModelPrice,
+  ledger: { model: string; spendUsd: number; requests: number }[],
+  now = new Date(),
+): PricingReport {
+  const overridden = new Set(overrides);
+  const models = Object.entries(pricing)
+    .map(([model, price]) => ({
+      model,
+      ...ratesOf(price),
+      overridden: overridden.has(model),
+    }))
+    .sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
+  const fallbackModels = ledger
+    .filter((row) => lookupPrice(row.model, pricing, fallback).matched == null)
+    .map((row) => ({ model: row.model, spendUsd: row.spendUsd, requests: row.requests }));
+  return {
+    generatedAt: now.toISOString(),
+    models,
+    fallback: ratesOf(fallback),
+    fallbackModels,
+  };
+}
 
 export function lookupPrice(
   model: string,
