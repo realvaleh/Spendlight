@@ -259,6 +259,21 @@ export function listRequests(db: Db, project?: string, model?: string, range?: C
 }
 
 /** Sum cost for an export scope. Undefined project or model leaves that dimension unscoped. */
+/** Ledger totals per model id, highest spend first. Equal spend breaks ties by model id. */
+export function listModelSpend(db: Db): { model: string; spendUsd: number; requests: number }[] {
+  const rows = db
+    .prepare(
+      `SELECT model, COALESCE(SUM(cost_usd), 0) AS spendUsd, COUNT(*) AS requests
+       FROM requests GROUP BY model ORDER BY spendUsd DESC, model ASC`,
+    )
+    .all() as { model: string; spendUsd: number; requests: number }[];
+  return rows.map((row) => ({
+    model: row.model,
+    spendUsd: roundUsd(Number(row.spendUsd) || 0),
+    requests: Number(row.requests) || 0,
+  }));
+}
+
 export function spendMatching(db: Db, project?: string, model?: string, window?: SpendWindow | null): number {
   const range = window ? { sinceIso: window.startIso, untilIso: window.endIso } : null;
   const { clause, args } = requestWhere({ project, model }, range);

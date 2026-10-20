@@ -119,7 +119,9 @@ export function loadConfig(explicitPath?: string): Config {
   }
 
   const pricing = { ...DEFAULT_PRICING };
+  const pricingOverrides: string[] = [];
   for (const [model, price] of Object.entries(file.pricing ?? {})) {
+    pricingOverrides.push(model);
     pricing[model] = {
       inputPerMillion: Number(price.inputPerMillion ?? DEFAULT_FALLBACK.inputPerMillion),
       outputPerMillion: Number(price.outputPerMillion ?? DEFAULT_FALLBACK.outputPerMillion),
@@ -161,6 +163,7 @@ export function loadConfig(explicitPath?: string): Config {
     upstreamApiKey: process.env.OPENAI_API_KEY ?? file.upstream?.apiKey ?? null,
     budgets: { global, projects, period, timezone },
     pricing,
+    pricingOverrides,
     fallbackPrice: {
       inputPerMillion: file.fallbackPrice?.inputPerMillion ?? DEFAULT_FALLBACK.inputPerMillion,
       outputPerMillion: file.fallbackPrice?.outputPerMillion ?? DEFAULT_FALLBACK.outputPerMillion,
@@ -188,7 +191,7 @@ Env:
   SPENDLIGHT_BUDGET_PERIOD       lifetime (default), day, week, or month
   SPENDLIGHT_BUDGET_TIMEZONE     IANA zone when period is day, week, or month (e.g. America/New_York)
 
-Bind to 127.0.0.1 (the default). The dashboard, receipts, and /api/summary have no auth.
+Bind to 127.0.0.1 (the default). The dashboard, receipts, and /api routes have no auth.
 `;
 
 /** http(s) only; strips userinfo so keys in the URL cannot leak via logs or fetch. */

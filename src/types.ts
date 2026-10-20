@@ -27,7 +27,33 @@ export type Config = {
     timezone: string;
   };
   pricing: Record<string, ModelPrice>;
+  /** Model ids set under `pricing` in the config file. Built-in defaults are absent. */
+  pricingOverrides: readonly string[];
   fallbackPrice: ModelPrice;
+};
+
+/** Rates shown by `GET /api/pricing`. `cachedInputPerMillion` is null when unset. */
+export type PriceRates = {
+  inputPerMillion: number;
+  outputPerMillion: number;
+  cachedInputPerMillion: number | null;
+};
+
+export type PricingReport = {
+  generatedAt: string;
+  /**
+   * Effective per-model prices: built-in defaults merged with config overrides.
+   * Sorted by model id. `overridden` is true when the id came from the config file.
+   */
+  models: (PriceRates & { model: string; overridden: boolean })[];
+  /** Price used when a model id matches no table entry, including no prefix match. */
+  fallback: PriceRates;
+  /**
+   * Ledger model ids with no table entry, so they were estimated at `fallback`.
+   * Highest `spendUsd` first. Equal spend breaks ties by model id.
+   * Empty when every logged model matched the table.
+   */
+  fallbackModels: { model: string; spendUsd: number; requests: number }[];
 };
 
 export type LedgerRow = {

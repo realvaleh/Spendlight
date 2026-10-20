@@ -77,6 +77,7 @@ export function dashboardHtml(): string {
     footer { margin-top: 22px; color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
     .empty { padding: 28px 8px; color: var(--muted); font-family: var(--serif); font-style: italic; }
     code { font-family: var(--mono); font-size: 12px; background: var(--paper-2); padding: 1px 5px; border-radius: 4px; }
+    #fallback-notice { margin: 0 0 16px; color: var(--muted); font-size: 13px; line-height: 1.45; }
     .events { list-style: none; padding: 0; margin: 0; }
     .events li { font-size: 13px; padding: 8px 0; border-bottom: 1px solid var(--line); }
     @media (max-width: 820px) {
@@ -94,6 +95,8 @@ export function dashboardHtml(): string {
       </div>
       <div id="status-pill" class="pill">loading</div>
     </header>
+
+    <p id="fallback-notice" hidden></p>
 
     <section class="hero">
       <article class="card">
@@ -351,6 +354,24 @@ export function dashboardHtml(): string {
       $("events").innerHTML = s.events.length
         ? s.events.map(e => "<li><strong>" + esc(e.type) + "</strong> · " + esc(e.project) + " · " + esc(e.message) + "</li>").join("")
         : '<li class="empty" style="border:0;padding-left:0">None yet.</li>';
+      try {
+        const pricing = await fetch("/api/pricing").then(r => r.json());
+        showFallbackNotice(pricing);
+      } catch {
+        // Leave the previous notice. A pricing miss should not blank the dashboard.
+      }
+    }
+    function showFallbackNotice(pricing) {
+      const el = $("fallback-notice");
+      const rows = (pricing && pricing.fallbackModels) || [];
+      if (!rows.length) {
+        el.hidden = true;
+        el.innerHTML = "";
+        return;
+      }
+      el.hidden = false;
+      el.innerHTML = "Estimated with the fallback price: " +
+        rows.map(m => "<code>" + esc(m.model) + "</code>").join(", ") + ".";
     }
     function projectLinks(name) {
       const q = encodeURIComponent(name);

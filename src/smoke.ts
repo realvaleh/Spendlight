@@ -332,6 +332,13 @@ async function main(): Promise<void> {
     assert(dash.includes("highest cost first"), "dashboard should order expensive requests by cost");
     assert(dash.includes('id="top-requests"'), "dashboard missing most-expensive mount");
     assert(dash.includes("s.topRequests"), "dashboard should render topRequests");
+    assert(dash.includes('id="fallback-notice" hidden'), "dashboard fallback notice should start hidden");
+    assert(dash.includes("/api/pricing"), "dashboard missing pricing fetch");
+    assert(dash.includes("function showFallbackNotice"), "dashboard missing fallback notice");
+    assert(dash.includes("pricing.fallbackModels"), "dashboard should read fallbackModels");
+    assert(dash.includes("Estimated with the fallback price:"), "dashboard missing fallback notice copy");
+    assert(dash.includes("el.hidden = true"), "dashboard should hide the notice when there are no fallback models");
+    assert(dash.includes('el.innerHTML = ""'), "dashboard should clear the notice when there are no fallback models");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -364,8 +371,9 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testPricing(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, pricing");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2791,6 +2799,218 @@ async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise
     const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
     assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
   });
+}
+
+type PricingBody = {
+  generatedAt: string;
+  models: {
+    model: string;
+    inputPerMillion: number;
+    outputPerMillion: number;
+    cachedInputPerMillion: number | null;
+    overridden: boolean;
+  }[];
+  fallback: {
+    inputPerMillion: number;
+    outputPerMillion: number;
+    cachedInputPerMillion: number | null;
+  };
+  fallbackModels: { model: string; spendUsd: number; requests: number }[];
+};
+
+async function withFileApp(
+  dir: string,
+  name: string,
+  mockUrl: string,
+  file: Record<string, unknown>,
+  fn: (base: string, app: App) => Promise<void>,
+): Promise<void> {
+  const dbPath = join(dir, `${name}.db`);
+  const configPath = join(dir, `${name}.json`);
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      host: "127.0.0.1",
+      port: 0,
+      dbPath,
+      upstream: { baseUrl: mockUrl },
+      ...file,
+    }),
+  );
+  const config = loadConfig(configPath);
+  config.port = 0;
+  const app = createApp(config);
+  const base = await listen(app);
+  try {
+    await fn(base, app);
+  } finally {
+    await app.close();
+  }
+}
+
+async function pricingOf(base: string, query = ""): Promise<PricingBody> {
+  const res = await fetch(`${base}/api/pricing${query}`);
+  assert(res.status === 200, `pricing status ${res.status}`);
+  const type = res.headers.get("content-type") ?? "";
+  assert(type.includes("application/json"), `pricing content-type ${type}`);
+  const body = (await res.json()) as PricingBody;
+  const keys = Object.keys(body).sort().join(",");
+  assert(keys === "fallback,fallbackModels,generatedAt,models", `pricing keys ${keys}`);
+  assert(Array.isArray(body.models) && body.models.length > 0, "pricing models missing");
+  const modelKeys = Object.keys(body.models[0] ?? {}).sort().join(",");
+  assert(
+    modelKeys === "cachedInputPerMillion,inputPerMillion,model,outputPerMillion,overridden",
+    `pricing model keys ${modelKeys}`,
+  );
+  const fallbackKeys = Object.keys(body.fallback).sort().join(",");
+  assert(
+    fallbackKeys === "cachedInputPerMillion,inputPerMillion,outputPerMillion",
+    `fallback keys ${fallbackKeys}`,
+  );
+  assert(Number.isFinite(Date.parse(body.generatedAt)), `pricing generatedAt ${body.generatedAt}`);
+  const ids = body.models.map((row) => row.model);
+  const sorted = [...ids].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  assert(ids.join("\n") === sorted.join("\n"), "pricing models should be sorted by id");
+  return body;
+}
+
+async function testPricing(dir: string, mockUrl: string): Promise<void> {
+  await withFileApp(dir, "pricing-empty", mockUrl, {}, async (base, app) => {
+    const empty = await pricingOf(base);
+    assert(empty.fallbackModels.length === 0, `empty ledger fallback models ${empty.fallbackModels.length}`);
+    assert(empty.models.length === Object.keys(DEFAULT_PRICING).length, `default model count ${empty.models.length}`);
+    assert(
+      empty.models.every((row) => row.overridden === false),
+      "built-in prices should not be marked overridden",
+    );
+    const mini = empty.models.find((row) => row.model === "gpt-4o-mini");
+    assert(mini != null, "gpt-4o-mini missing from the default table");
+    assert(mini.inputPerMillion === DEFAULT_PRICING["gpt-4o-mini"].inputPerMillion, "default mini input rate");
+    assert(mini.outputPerMillion === DEFAULT_PRICING["gpt-4o-mini"].outputPerMillion, "default mini output rate");
+    assert(
+      mini.cachedInputPerMillion === (DEFAULT_PRICING["gpt-4o-mini"].cachedInputPerMillion ?? null),
+      "default mini cached rate",
+    );
+    const turbo = empty.models.find((row) => row.model === "gpt-3.5-turbo");
+    assert(turbo?.cachedInputPerMillion === null, "unset cached rate should be null");
+    assert(empty.fallback.inputPerMillion === DEFAULT_FALLBACK.inputPerMillion, "default fallback input");
+    assert(empty.fallback.outputPerMillion === DEFAULT_FALLBACK.outputPerMillion, "default fallback output");
+    assert(
+      empty.fallback.cachedInputPerMillion === (DEFAULT_FALLBACK.cachedInputPerMillion ?? null),
+      "default fallback cached",
+    );
+    const raw = JSON.stringify(empty);
+    assert(!raw.includes("sk-smoke"), "pricing response leaked the API key");
+    assert(!raw.toLowerCase().includes("authorization"), "pricing response leaked authorization");
+
+    const evil = await fetch(`${base}/api/pricing`, { headers: { origin: "https://evil.example" } });
+    assert(evil.ok, "pricing should still load without CORS");
+    assert(evil.headers.get("access-control-allow-origin") == null, "pricing must not allow a foreign origin");
+    await evil.text();
+    const local = await fetch(`${base}/api/pricing`, { headers: { origin: "http://localhost:9999" } });
+    assert(
+      local.headers.get("access-control-allow-origin") === "http://localhost:9999",
+      "pricing should reflect a localhost origin",
+    );
+    await local.text();
+
+    seedSpend(app.db, "2026-10-01T00:00:00.000Z", 0.02, "demo", "gpt-4o-mini");
+    seedSpend(app.db, "2026-10-01T00:01:00.000Z", 0.01, "demo", "gpt-4o-2024-08-06");
+    const known = await pricingOf(base);
+    assert(
+      known.fallbackModels.length === 0,
+      `known and prefix-matched models should not be fallback, got ${JSON.stringify(known.fallbackModels)}`,
+    );
+  });
+
+  await withFileApp(dir, "pricing-mix", mockUrl, {}, async (base, app) => {
+    seedSpend(app.db, "2026-10-02T00:00:00.000Z", 0.02, "demo", "gpt-4o-mini");
+    seedSpend(app.db, "2026-10-02T00:01:00.000Z", 0.02, "other", "gpt-4o-mini");
+    seedSpend(app.db, "2026-10-02T00:02:00.000Z", 0.01, "other", "gpt-4o-2024-08-06");
+    seedSpend(app.db, "2026-10-02T00:03:00.000Z", 0.1, "demo", "alpha-unknown");
+    seedSpend(app.db, "2026-10-02T00:04:00.000Z", 0.1, "demo", "alpha-unknown");
+    seedSpend(app.db, "2026-10-02T00:05:00.000Z", 0.2, "demo", "zeta-unknown");
+    const mix = await pricingOf(base);
+    assert(mix.fallbackModels.length === 2, `expected 2 fallback models, got ${JSON.stringify(mix.fallbackModels)}`);
+    const rowKeys = Object.keys(mix.fallbackModels[0] ?? {}).sort().join(",");
+    assert(rowKeys === "model,requests,spendUsd", `fallback model keys ${rowKeys}`);
+    assert(mix.fallbackModels[0]?.model === "alpha-unknown", `first fallback ${mix.fallbackModels[0]?.model}`);
+    assert(mix.fallbackModels[0]?.requests === 2, `alpha requests ${mix.fallbackModels[0]?.requests}`);
+    assert(Math.abs((mix.fallbackModels[0]?.spendUsd ?? 0) - 0.2) < 1e-9, `alpha spend ${mix.fallbackModels[0]?.spendUsd}`);
+    assert(mix.fallbackModels[1]?.model === "zeta-unknown", `second fallback ${mix.fallbackModels[1]?.model}`);
+    assert(mix.fallbackModels[1]?.requests === 1, `zeta requests ${mix.fallbackModels[1]?.requests}`);
+    assert(Math.abs((mix.fallbackModels[1]?.spendUsd ?? 0) - 0.2) < 1e-9, `zeta spend ${mix.fallbackModels[1]?.spendUsd}`);
+    assert(
+      !mix.fallbackModels.some((row) => row.model === "gpt-4o-mini" || row.model === "gpt-4o-2024-08-06"),
+      "known or prefix-matched models listed as fallback",
+    );
+    const scoped = await pricingOf(base, "?project=missing&model=nope&since=1999-01-01");
+    assert(
+      scoped.fallbackModels.length === mix.fallbackModels.length,
+      "pricing should ignore summary scope parameters",
+    );
+  });
+
+  const gpt4o = DEFAULT_PRICING["gpt-4o"];
+  await withFileApp(
+    dir,
+    "pricing-override",
+    mockUrl,
+    {
+      pricing: {
+        "gpt-4o": {
+          inputPerMillion: gpt4o.inputPerMillion,
+          outputPerMillion: gpt4o.outputPerMillion,
+          cachedInputPerMillion: gpt4o.cachedInputPerMillion,
+        },
+        "gpt-4o-mini": { inputPerMillion: 1, outputPerMillion: 2, cachedInputPerMillion: 0.25 },
+        "local-llama": { inputPerMillion: 0.01, outputPerMillion: 0.03 },
+      },
+      fallbackPrice: { inputPerMillion: 9, outputPerMillion: 11, cachedInputPerMillion: 1 },
+    },
+    async (base, app) => {
+      seedSpend(app.db, "2026-10-03T00:00:00.000Z", 0.05, "demo", "local-llama");
+      seedSpend(app.db, "2026-10-03T00:01:00.000Z", 0.07, "demo", "mystery-model");
+      const body = await pricingOf(base);
+      const mini = body.models.find((row) => row.model === "gpt-4o-mini");
+      assert(mini?.overridden === true, "config gpt-4o-mini should be overridden");
+      assert(
+        mini?.inputPerMillion === 1 && mini.outputPerMillion === 2 && mini.cachedInputPerMillion === 0.25,
+        `overridden mini rates ${JSON.stringify(mini)}`,
+      );
+      const same = body.models.find((row) => row.model === "gpt-4o");
+      assert(same?.overridden === true, "a config entry matching the built-in numbers should still be overridden");
+      assert(same?.inputPerMillion === gpt4o.inputPerMillion, "overridden gpt-4o should keep the config rate");
+      const local = body.models.find((row) => row.model === "local-llama");
+      assert(local?.overridden === true, "a model that exists only in config should be overridden");
+      assert(
+        local?.inputPerMillion === 0.01 && local.outputPerMillion === 0.03 && local.cachedInputPerMillion === null,
+        `local-llama rates ${JSON.stringify(local)}`,
+      );
+      const untouched = body.models.find((row) => row.model === "gpt-5");
+      assert(untouched?.overridden === false, "a built-in model with no config entry should not be overridden");
+      assert(
+        untouched?.inputPerMillion === DEFAULT_PRICING["gpt-5"].inputPerMillion,
+        "untouched built-in rate changed",
+      );
+      assert(
+        body.models.length === Object.keys(DEFAULT_PRICING).length + 1,
+        `override table size ${body.models.length}`,
+      );
+      assert(
+        body.fallbackModels.length === 1 && body.fallbackModels[0]?.model === "mystery-model",
+        `override fallback models ${JSON.stringify(body.fallbackModels)}`,
+      );
+      assert(body.fallbackModels[0]?.requests === 1, `mystery requests ${body.fallbackModels[0]?.requests}`);
+      assert(
+        Math.abs((body.fallbackModels[0]?.spendUsd ?? 0) - 0.07) < 1e-9,
+        `mystery spend ${body.fallbackModels[0]?.spendUsd}`,
+      );
+      assert(body.fallback.inputPerMillion === 9, `fallback input ${body.fallback.inputPerMillion}`);
+      assert(body.fallback.outputPerMillion === 11, `fallback output ${body.fallback.outputPerMillion}`);
+      assert(body.fallback.cachedInputPerMillion === 1, `fallback cached ${body.fallback.cachedInputPerMillion}`);
+    },
+  );
 }
 
 function readReq(req: IncomingMessage): Promise<string> {

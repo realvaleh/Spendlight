@@ -38,6 +38,7 @@ A single Node process that:
   │  /                 local dashboard       │
   │  /api/export.csv   spend ledger CSV      │
   │  /api/export.json  spend ledger JSON     │
+  │  /api/pricing      effective price table │
   │  /receipt.md .svg  shareable receipts    │
   │  /badge.svg        README badge          │
   │  /v1/*             reverse proxy         │
@@ -54,7 +55,7 @@ A single Node process that:
    OPENAI_BASE_URL           SPENDLIGHT_DB
 ```
 
-Pricing is a local table (sane OpenAI defaults, overridable in `spendlight.config.json`). Unknown models use a conservative fallback price. Costs are **estimates**, not provider invoices.
+Pricing is a local table (sane OpenAI defaults, overridable in `spendlight.config.json`). Unknown models use a conservative fallback price. `GET /api/pricing` shows the merged table and any ledger models billed at that fallback. Costs are **estimates**, not provider invoices.
 
 Tag traffic with `x-spendlight-project` (or `x-spendlight-tag`, `?project=`, or `spendlight_project` in the JSON body). That is the budget bucket. Tags are labels, not authentication.
 
@@ -244,6 +245,7 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 | `/receipt.svg` | Paper-style SVG receipt (same scope parameters as the markdown receipt) |
 | `/badge.svg` | Shields-style badge for a local README (`?project=` or `?model=`; time parameters are ignored) |
 | `/api/summary` | JSON for the same numbers (same scope parameters as the receipts) |
+| `/api/pricing` | Effective price table, fallback price, and ledger models billed at the fallback |
 | `/api/export.csv` | Spend ledger as CSV (same scope parameters as the receipts) |
 | `/api/export.json` | Same filtered ledger rows as the CSV, as a JSON array |
 | `/health` | Liveness |
@@ -291,6 +293,8 @@ Quiet days inside the covered span are included, with `spendUsd: 0` and `request
 
 `/api/summary` also adds `topRequests`: up to ten ledger rows inside those same filters, highest `costUsd` first. Each object is a request row, the same shape as `recent` (`id`, `createdAt`, `project`, `model`, token counts, `costUsd`, `status`, `error`, `upstreamId`, `path`, `streamed`). Equal cost is ordered by `createdAt` descending, then `id` ascending. Fewer than ten matches returns every match, and a miss is `[]`. Failed and streamed rows stay in the ranking. `recent` is still the latest requests, newest first. The dashboard **Most expensive** card lists this ranking, with a bar under each cost.
 
+`GET /api/pricing` is the price table actually in effect: built-in defaults merged with `pricing` in `spendlight.config.json`. `models` is one object per table entry, sorted by model id: `{ "model": "<id>", "inputPerMillion": <number>, "outputPerMillion": <number>, "cachedInputPerMillion": <number or null>, "overridden": <boolean> }`. `overridden` is true when that id is set in the config file, even when the numbers match the built-in default. `cachedInputPerMillion` is null when the entry does not set a cached rate; estimates then use the input rate. `fallback` is the price for a model id that matches no table key and no longer prefix of a key (`gpt-4o-2024-08-06` matches `gpt-4o` and is not listed). `fallbackModels` lists ledger model ids in that situation, highest `spendUsd` first, then model id: `{ "model": "<id>", "spendUsd": <number>, "requests": <number> }`. Spend is what the ledger already recorded. The array is empty when every logged model matched the table, including an empty ledger. The route reads the whole ledger and ignores `project`, `model`, `since`, `until`, and `window`. It does not return API keys. The dashboard shows one line naming those models when the list is non-empty, and shows nothing when it is empty.
+
 ```bash
 curl -s "http://127.0.0.1:8787/api/export.csv?since=2026-10-01&until=2026-10-05" -o october-week.csv
 curl -s "http://127.0.0.1:8787/api/export.json?since=2026-10-01&until=2026-10-05"
@@ -298,6 +302,7 @@ curl -s "http://127.0.0.1:8787/receipt.md?project=demo&since=2026-10-04"
 curl -s "http://127.0.0.1:8787/receipt.svg?model=gpt-4o-mini&since=2026-10-01&until=2026-11-01" -o month-receipt.svg
 curl -s "http://127.0.0.1:8787/api/summary?window=current"
 curl -s "http://127.0.0.1:8787/api/summary?since=2026-10-01&until=2026-10-15"
+curl -s http://127.0.0.1:8787/api/pricing
 curl -s "http://127.0.0.1:8787/receipt.md?since=2026-10-04&until=2026-10-05"
 ```
 
@@ -313,7 +318,7 @@ Streaming chat completions: Spendlight sets `stream_options.include_usage` so a 
 
 Spendlight is a **localhost reverse proxy that can spend your API key**. Treat the bind address like a secret.
 
-- **Bind localhost.** Default `SPENDLIGHT_HOST=127.0.0.1`. Docker Compose publishes `127.0.0.1:8787`. Do not put this on `0.0.0.0` / the public internet. The dashboard, receipts, badge, `/api/summary`, `/api/export.csv`, and `/api/export.json` have **no auth**.
+- **Bind localhost.** Default `SPENDLIGHT_HOST=127.0.0.1`. Docker Compose publishes `127.0.0.1:8787`. Do not put this on `0.0.0.0` / the public internet. The dashboard, receipts, badge, `/api/summary`, `/api/pricing`, `/api/export.csv`, and `/api/export.json` have **no auth**.
 - **API keys.** If `OPENAI_API_KEY` is set, any client that can reach the proxy and omits `Authorization` uses your key. If the client sends `Authorization`, that value is forwarded instead. Keys are not written to the ledger or stdout. Prefer the env var over `upstream.apiKey` in JSON (do not commit keys).
 - **Trust model.** Anyone who can talk to the port is trusted: they can complete, retag projects, and read spend. Project tags are labels, not ACLs. CORS is allowed only from `http(s)://127.0.0.1`, `localhost`, and `::1` so a random website cannot drive the proxy from the browser.
 - **Upstream URL.** `OPENAI_BASE_URL` is operator-controlled (http/https only). Clients cannot pick a different host. Do not point it at arbitrary internal URLs.
