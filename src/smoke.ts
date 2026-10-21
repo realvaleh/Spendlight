@@ -2,12 +2,14 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runInThisContext } from "node:vm";
 import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
 import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
+import { dashboardHtml } from "./ui.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
@@ -332,6 +334,21 @@ async function main(): Promise<void> {
     assert(dash.includes("highest cost first"), "dashboard should order expensive requests by cost");
     assert(dash.includes('id="top-requests"'), "dashboard missing most-expensive mount");
     assert(dash.includes("s.topRequests"), "dashboard should render topRequests");
+    assert(dash.includes('id="scope-form"'), "dashboard missing filter form");
+    assert(dash.includes('id="filter-project"'), "dashboard missing project filter");
+    assert(dash.includes('id="filter-model"'), "dashboard missing model filter");
+    assert(dash.includes('id="filter-since"'), "dashboard missing since filter");
+    assert(dash.includes('id="filter-until"'), "dashboard missing until filter");
+    assert(dash.includes('id="summary-error"'), "dashboard missing summary error");
+    assert(dash.includes("Could not reach Spendlight"), "dashboard should explain a failed refresh");
+    assert(dash.includes("Summary unavailable."), "dashboard should not present a failed load as an empty ledger");
+    assert(dash.includes("No requests in this filter."), "dashboard should distinguish a filtered empty ledger");
+    assert(dash.includes("Estimated spend · this filter"), "dashboard should label filtered spend");
+    assert(dash.includes("The budget meter still follows the configured cap"), "dashboard should say the meter ignores the filter");
+    assert(dash.includes("function pageScope"), "dashboard should read the page filter");
+    assert(dash.includes("location.search"), "dashboard filter should use the page query");
+    assert(dash.includes("location.assign"), "dashboard filter should update the page query");
+    assert(dash.includes('"/api/summary"'), "dashboard should request the summary");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -364,8 +381,9 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testDashboardFilter();
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, dashboard filter");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2791,6 +2809,425 @@ async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise
     const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
     assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
   });
+}
+
+type DashSubmit = { preventDefault(): void };
+
+type DashboardEl = {
+  id: string;
+  hidden: boolean;
+  className: string;
+  value: string;
+  textContent: string;
+  innerHTML: string;
+  href?: string;
+  download?: string;
+  style: { width: string; display: string };
+  listeners: Record<string, (event: DashSubmit) => void>;
+  setAttribute(name: string, value: string): void;
+  removeAttribute(name: string): void;
+  getAttribute(name: string): string | null;
+  addEventListener(type: string, fn: (event: DashSubmit) => void): void;
+};
+
+type DashResponse = {
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+};
+
+type DashProject = { project: string; spendUsd: number; requests: number; tokens: number };
+type DashModel = { model: string; spendUsd: number; requests: number; tokens: number };
+type DashPair = { project: string; model: string; spendUsd: number; requests: number; tokens: number };
+type DashDay = { day: string; spendUsd: number; requests: number };
+type DashRequest = { createdAt: string; project: string; model: string; totalTokens: number; costUsd: number };
+
+type DashSummary = {
+  generatedAt: string;
+  scopeProject: string | null;
+  scopeModel: string | null;
+  scopeSince: string | null;
+  scopeUntil: string | null;
+  spendUsd: number;
+  requests: number;
+  tokens: number;
+  budget: {
+    status: string;
+    globalSpend: number;
+    period: string;
+    timezone: string;
+    globalLimit: { softUsd: number | null; hardUsd: number | null };
+  };
+  byProject: DashProject[];
+  byModel: DashModel[];
+  byProjectModel: DashPair[];
+  daily: DashDay[];
+  topRequests: DashRequest[];
+  recent: DashRequest[];
+  events: { type: string; project: string; message: string }[];
+};
+
+function dashboardElements(html: string): Map<string, DashboardEl> {
+  const elements = new Map<string, DashboardEl>();
+  const idRe = /id="([^"]+)"/g;
+  let match: RegExpExecArray | null;
+  while ((match = idRe.exec(html))) {
+    const id = match[1] ?? "";
+    const tagStart = html.lastIndexOf("<", match.index);
+    const tagEnd = html.indexOf(">", match.index);
+    const tag = html.slice(tagStart, tagEnd + 1);
+    const classMatch = /class="([^"]*)"/.exec(tag);
+    const hrefMatch = /href="([^"]*)"/.exec(tag);
+    const downloadMatch = /download="([^"]*)"/.exec(tag);
+    const el: DashboardEl = {
+      id,
+      hidden: /\shidden\b/.test(tag),
+      className: classMatch?.[1] ?? "",
+      value: "",
+      textContent: "",
+      innerHTML: "",
+      href: hrefMatch?.[1],
+      download: downloadMatch?.[1],
+      style: { width: "", display: "" },
+      listeners: {},
+      setAttribute(name: string, value: string) {
+        if (name === "href") this.href = value;
+        else if (name === "download") this.download = value;
+      },
+      removeAttribute(name: string) {
+        if (name === "href") this.href = undefined;
+        else if (name === "download") this.download = undefined;
+      },
+      getAttribute(name: string) {
+        if (name === "href") return this.href ?? null;
+        if (name === "download") return this.download ?? null;
+        return null;
+      },
+      addEventListener(type: string, fn: (event: DashSubmit) => void) {
+        this.listeners[type] = fn;
+      },
+    };
+    elements.set(id, el);
+  }
+  return elements;
+}
+
+function dashboardScript(html: string): string {
+  const start = html.indexOf("<script>");
+  const end = html.lastIndexOf("</script>");
+  assert(start !== -1 && end > start, "dashboard script missing");
+  return html.slice(start + "<script>".length, end);
+}
+
+function dashEl(elements: Map<string, DashboardEl>, id: string): DashboardEl {
+  const found = elements.get(id);
+  assert(found, `missing dashboard element ${id}`);
+  return found;
+}
+
+function summaryFixture(patch: {
+  spendUsd?: number;
+  requests?: number;
+  tokens?: number;
+  scopeProject?: string | null;
+  scopeModel?: string | null;
+  scopeSince?: string | null;
+  scopeUntil?: string | null;
+  period?: string;
+  timezone?: string;
+  byProject?: DashProject[];
+  byModel?: DashModel[];
+  byProjectModel?: DashPair[];
+  daily?: DashDay[];
+  topRequests?: DashRequest[];
+  recent?: DashRequest[];
+} = {}): DashSummary {
+  const requests = patch.requests ?? 2;
+  const row = {
+    createdAt: "2026-10-21T15:00:00.000Z",
+    project: "demo",
+    model: "gpt-4o-mini",
+    totalTokens: 200,
+    costUsd: 3,
+  };
+  return {
+    generatedAt: "2026-10-21T15:00:00.000Z",
+    scopeProject: patch.scopeProject ?? null,
+    scopeModel: patch.scopeModel ?? null,
+    scopeSince: patch.scopeSince ?? null,
+    scopeUntil: patch.scopeUntil ?? null,
+    spendUsd: patch.spendUsd ?? (requests ? 4 : 0),
+    requests,
+    tokens: patch.tokens ?? (requests ? 300 : 0),
+    budget: {
+      status: "ok",
+      globalSpend: 9,
+      period: patch.period ?? "lifetime",
+      timezone: patch.timezone ?? "UTC",
+      globalLimit: { softUsd: 5, hardUsd: 20 },
+    },
+    byProject: patch.byProject ?? (requests ? [{ project: "demo", spendUsd: 4, requests: 2, tokens: 300 }] : []),
+    byModel: patch.byModel ?? (requests ? [{ model: "gpt-4o-mini", spendUsd: 4, requests: 2, tokens: 300 }] : []),
+    byProjectModel:
+      patch.byProjectModel ??
+      (requests ? [{ project: "demo", model: "gpt-4o-mini", spendUsd: 4, requests: 2, tokens: 300 }] : []),
+    daily: patch.daily ?? [
+      { day: "2026-09-01", spendUsd: 1, requests: 1 },
+      { day: "2026-10-21", spendUsd: 3, requests: 1 },
+    ],
+    topRequests: patch.topRequests ?? (requests ? [row] : []),
+    recent: patch.recent ?? (requests ? [row] : []),
+    events: [],
+  };
+}
+
+function jsonResult(body: unknown, status = 200): DashResponse {
+  return { ok: status >= 200 && status < 300, status, json: async () => body };
+}
+
+async function bootDashboard(
+  search: string,
+  fetchImpl: (url: string) => Promise<DashResponse>,
+): Promise<{
+  elements: Map<string, DashboardEl>;
+  location: { search: string; assigned: string | null; assign(url: string): void };
+  urls: string[];
+  tick: () => Promise<void>;
+}> {
+  const html = dashboardHtml();
+  const elements = dashboardElements(html);
+  const urls: string[] = [];
+  const location = {
+    search,
+    assigned: null as string | null,
+    assign(url: string) {
+      this.assigned = url;
+    },
+  };
+  const fetchBridge: { impl: (url: string) => Promise<DashResponse> } = { impl: fetchImpl };
+  let tick: (() => Promise<void>) | null = null;
+  const g = globalThis as typeof globalThis & {
+    __dashFetch?: (url: string) => Promise<DashResponse>;
+    __dashLocation?: typeof location;
+    __dashDocument?: { getElementById(id: string): DashboardEl };
+    __dashSetInterval?: (fn: () => Promise<void>, delay?: number) => number;
+    __spendlightReady?: Promise<void>;
+  };
+  const previousFetch = globalThis.fetch;
+  const previousInterval = globalThis.setInterval;
+  g.__dashFetch = (url: string) => {
+    urls.push(String(url));
+    return fetchBridge.impl(String(url));
+  };
+  g.__dashLocation = location;
+  g.__dashDocument = {
+    getElementById(id: string) {
+      const found = elements.get(id);
+      if (!found) throw new Error(`missing dashboard element ${id}`);
+      return found;
+    },
+  };
+  g.__dashSetInterval = (fn) => {
+    tick = fn;
+    return 0;
+  };
+  const script = dashboardScript(html).replace(
+    "tick();\n    setInterval(tick, 3000);",
+    "globalThis.__spendlightReady = tick();\n    setInterval(tick, 3000);",
+  );
+  assert(script.includes("__spendlightReady"), "dashboard refresh hook missing");
+  const wrapped = `(function(){\nconst fetch = globalThis.__dashFetch;\nconst location = globalThis.__dashLocation;\nconst document = globalThis.__dashDocument;\nconst setInterval = globalThis.__dashSetInterval;\n${script}\n})();`;
+  try {
+    runInThisContext(wrapped, { filename: "dashboard.js" });
+    await g.__spendlightReady;
+  } finally {
+    globalThis.fetch = previousFetch;
+    globalThis.setInterval = previousInterval;
+    delete g.__dashFetch;
+    delete g.__dashLocation;
+    delete g.__dashDocument;
+    delete g.__dashSetInterval;
+    delete g.__spendlightReady;
+  }
+  if (!tick) fail("dashboard did not schedule a refresh");
+  return { elements, location, urls, tick };
+}
+
+async function testDashboardFilter(): Promise<void> {
+  const open = await bootDashboard("", async () => jsonResult(summaryFixture()));
+  assert(open.urls[0] === "/api/summary", `unfiltered summary url ${open.urls[0] ?? "missing"}`);
+  assert(dashEl(open.elements, "spend").textContent === "$4.00", dashEl(open.elements, "spend").textContent);
+  assert(dashEl(open.elements, "spend-k").textContent === "Estimated spend", dashEl(open.elements, "spend-k").textContent);
+  assert(dashEl(open.elements, "scope-note").hidden, "unfiltered dashboard should hide the scope line");
+  assert(dashEl(open.elements, "summary-error").hidden, "a good summary should hide the error");
+  assert(dashEl(open.elements, "status-pill").textContent === "all clear", dashEl(open.elements, "status-pill").textContent);
+  assert(dashEl(open.elements, "meter-bar").style.width === "45%", `meter used the filtered hero, width ${dashEl(open.elements, "meter-bar").style.width}`);
+  const openDays = dashEl(open.elements, "by-day").innerHTML;
+  assert(openDays.includes("2026-10-21"), "spend by day should include today");
+  assert(!openDays.includes("2026-09-01"), "unfiltered spend by day should stay on the last 14 days");
+  assert(dashEl(open.elements, "daily-sub").textContent.includes("last 14 days"), dashEl(open.elements, "daily-sub").textContent);
+  assert(dashEl(open.elements, "by-project").className === "", "a filled project card should not keep the empty style");
+  assert(dashEl(open.elements, "by-project").innerHTML.includes("demo"), "project table missing the logged tag");
+  assert(dashEl(open.elements, "link-csv").href === "/api/export.csv", dashEl(open.elements, "link-csv").href ?? "missing");
+  assert(dashEl(open.elements, "link-csv").download === "spendlight-ledger.csv", "unfiltered csv should keep the ledger filename");
+  assert(dashEl(open.elements, "link-badge").href === "/badge.svg", dashEl(open.elements, "link-badge").href ?? "missing");
+
+  const filtered = await bootDashboard(
+    "?project=demo&model=gpt-4o-mini&since=2026-09-01&until=2026-09-02",
+    async () =>
+      jsonResult(
+        summaryFixture({
+          spendUsd: 2,
+          requests: 1,
+          tokens: 40,
+          scopeProject: "demo",
+          scopeModel: "gpt-4o-mini",
+          scopeSince: "2026-09-01T00:00:00.000Z",
+          scopeUntil: "2026-09-02T00:00:00.000Z",
+          period: "day",
+          timezone: "America/New_York",
+          daily: [{ day: "2026-09-01", spendUsd: 2, requests: 1 }],
+        }),
+      ),
+  );
+  const filteredQuery = "project=demo&model=gpt-4o-mini&since=2026-09-01&until=2026-09-02";
+  assert(filtered.urls[0] === `/api/summary?${filteredQuery}`, `filtered summary url ${filtered.urls[0] ?? "missing"}`);
+  assert(dashEl(filtered.elements, "filter-project").value === "demo", "project field should match the page");
+  assert(dashEl(filtered.elements, "filter-model").value === "gpt-4o-mini", "model field should match the page");
+  assert(dashEl(filtered.elements, "filter-since").value === "2026-09-01", "since field should match the page");
+  assert(dashEl(filtered.elements, "filter-until").value === "2026-09-02", "until field should match the page");
+  assert(dashEl(filtered.elements, "spend").textContent === "$2.00", `filtered hero ${dashEl(filtered.elements, "spend").textContent}`);
+  assert(
+    dashEl(filtered.elements, "spend-k").textContent === "Estimated spend · this filter",
+    dashEl(filtered.elements, "spend-k").textContent,
+  );
+  assert(dashEl(filtered.elements, "meter-bar").style.width === "45%", "a date filter must not change the budget meter");
+  const budgetCopy = dashEl(filtered.elements, "budget-copy").textContent;
+  assert(budgetCopy.includes("Today (America/New_York)"), budgetCopy);
+  assert(budgetCopy.includes("$9.00") && budgetCopy.includes("$20.00"), budgetCopy);
+  const note = dashEl(filtered.elements, "scope-note").textContent;
+  assert(note.includes("project demo") && note.includes("model gpt-4o-mini"), note);
+  assert(note.includes("since 2026-09-01T00:00:00.000Z") && note.includes("until 2026-09-02T00:00:00.000Z"), note);
+  assert(note.includes("configured cap"), note);
+  assert(dashEl(filtered.elements, "scope-note").hidden === false, "a filter should show the scope line");
+  const filteredDays = dashEl(filtered.elements, "by-day").innerHTML;
+  assert(filteredDays.includes("2026-09-01"), "a time filter should list the days in the slice");
+  assert(!filteredDays.includes("2026-10-21"), "a time filter should not fill the trailing 14 days");
+  assert(dashEl(filtered.elements, "daily-sub").textContent.startsWith("in this filter · America/New_York"), dashEl(filtered.elements, "daily-sub").textContent);
+  assert(dashEl(filtered.elements, "link-csv").href === `/api/export.csv?${filteredQuery}`, dashEl(filtered.elements, "link-csv").href ?? "missing");
+  assert(dashEl(filtered.elements, "link-json").href === `/api/export.json?${filteredQuery}`, dashEl(filtered.elements, "link-json").href ?? "missing");
+  assert(dashEl(filtered.elements, "link-md").href === `/receipt.md?${filteredQuery}`, dashEl(filtered.elements, "link-md").href ?? "missing");
+  assert(dashEl(filtered.elements, "link-csv").download == null, "filtered csv should use the server filename");
+  assert(
+    dashEl(filtered.elements, "link-badge").href === "/badge.svg?project=demo&model=gpt-4o-mini",
+    dashEl(filtered.elements, "link-badge").href ?? "missing",
+  );
+
+  const empty = await bootDashboard("?project=missing", async () =>
+    jsonResult(
+      summaryFixture({
+        requests: 0,
+        spendUsd: 0,
+        tokens: 0,
+        scopeProject: "",
+        daily: [],
+        byProject: [],
+        byModel: [],
+        byProjectModel: [],
+        topRequests: [],
+        recent: [],
+      }),
+    ),
+  );
+  assert(dashEl(empty.elements, "spend-sub").textContent === "No requests in this filter.", dashEl(empty.elements, "spend-sub").textContent);
+  assert(dashEl(empty.elements, "by-project").textContent === "" || dashEl(empty.elements, "by-project").innerHTML.includes("No projects in this filter."), "filtered project empty state");
+  assert(dashEl(empty.elements, "by-project").innerHTML.includes("No projects in this filter."), dashEl(empty.elements, "by-project").innerHTML);
+  assert(dashEl(empty.elements, "by-model").innerHTML.includes("No models in this filter."), dashEl(empty.elements, "by-model").innerHTML);
+  assert(dashEl(empty.elements, "recent").innerHTML.includes("No requests in this filter."), dashEl(empty.elements, "recent").innerHTML);
+  assert(dashEl(empty.elements, "scope-note").textContent.includes("project matches nothing"), dashEl(empty.elements, "scope-note").textContent);
+
+  const blank = await bootDashboard("?project=&model=%20%20", async () => jsonResult(summaryFixture()));
+  assert(blank.urls[0] === "/api/summary", `blank filters should be unset, got ${blank.urls[0] ?? "missing"}`);
+  assert(dashEl(blank.elements, "scope-note").hidden, "blank filters should not announce a scope");
+
+  const current = await bootDashboard("?window=current&project=demo", async () =>
+    jsonResult(summaryFixture({ scopeProject: "demo", scopeSince: "2026-10-21T00:00:00.000Z", scopeUntil: "2026-10-22T00:00:00.000Z" })),
+  );
+  assert(current.urls[0] === "/api/summary?project=demo&window=current", `window url ${current.urls[0] ?? "missing"}`);
+  assert(dashEl(current.elements, "scope-note").textContent.includes("current budget window"), dashEl(current.elements, "scope-note").textContent);
+  assert(dashEl(current.elements, "link-csv").href === "/api/export.csv?project=demo&window=current", dashEl(current.elements, "link-csv").href ?? "missing");
+  assert(dashEl(current.elements, "link-badge").href === "/badge.svg?project=demo", dashEl(current.elements, "link-badge").href ?? "missing");
+  assert(dashEl(current.elements, "daily-sub").textContent.startsWith("in this filter"), dashEl(current.elements, "daily-sub").textContent);
+
+  const dropped = await bootDashboard("?window=current&since=2026-10-01", async () =>
+    jsonResult(summaryFixture({ scopeSince: "2026-10-01T00:00:00.000Z" })),
+  );
+  assert(dropped.urls[0] === "/api/summary?since=2026-10-01", `window should yield to since, got ${dropped.urls[0] ?? "missing"}`);
+
+  const invalid = await bootDashboard("?since=yesterday", async () =>
+    jsonResult(
+      {
+        error: {
+          message: 'Invalid since "yesterday". Use an ISO date (YYYY-MM-DD) or datetime.',
+          type: "invalid_request_error",
+          param: "since",
+          code: "invalid_time_range",
+        },
+      },
+      400,
+    ),
+  );
+  assert(dashEl(invalid.elements, "summary-error").hidden === false, "a bad range should show the error");
+  assert(
+    dashEl(invalid.elements, "summary-error").textContent.includes('Invalid since "yesterday"'),
+    dashEl(invalid.elements, "summary-error").textContent,
+  );
+  assert(dashEl(invalid.elements, "spend").textContent === "—", `bad range looked like spend ${dashEl(invalid.elements, "spend").textContent}`);
+  assert(dashEl(invalid.elements, "requests").textContent === "—", "a bad range should not show zero requests");
+  assert(dashEl(invalid.elements, "tokens").textContent === "—", "a bad range should not show zero tokens");
+  assert(dashEl(invalid.elements, "avg").textContent === "—", "a bad range should not show a zero average");
+  assert(dashEl(invalid.elements, "projects").textContent === "—", "a bad range should not show zero projects");
+  assert(dashEl(invalid.elements, "status-pill").textContent === "unavailable", dashEl(invalid.elements, "status-pill").textContent);
+  assert(dashEl(invalid.elements, "status-pill").className.includes("err"), dashEl(invalid.elements, "status-pill").className);
+  assert(dashEl(invalid.elements, "by-project").textContent === "Summary unavailable.", dashEl(invalid.elements, "by-project").textContent);
+  assert(dashEl(invalid.elements, "link-csv").href === "/api/export.csv?since=yesterday", dashEl(invalid.elements, "link-csv").href ?? "missing");
+
+  const broken = await bootDashboard("", async () => jsonResult({}));
+  assert(dashEl(broken.elements, "summary-error").textContent.includes("could not show"), dashEl(broken.elements, "summary-error").textContent);
+  assert(dashEl(broken.elements, "spend").textContent === "—", "a summary the page cannot read should not stay at $0.00");
+
+  let failNetwork = false;
+  const retry = await bootDashboard("", async () => {
+    if (failNetwork) throw new Error("socket hang up");
+    return jsonResult(summaryFixture());
+  });
+  assert(dashEl(retry.elements, "spend").textContent === "$4.00", "setup render failed");
+  failNetwork = true;
+  await retry.tick();
+  assert(dashEl(retry.elements, "spend").textContent === "$4.00", "a later failure should keep the last figures");
+  assert(dashEl(retry.elements, "requests").textContent === "2", "a later failure should keep the request count");
+  assert(
+    dashEl(retry.elements, "summary-error").textContent.includes("Could not reach Spendlight"),
+    dashEl(retry.elements, "summary-error").textContent,
+  );
+  assert(dashEl(retry.elements, "by-project").innerHTML.includes("demo"), "a later failure should not blank the tables");
+  assert(dashEl(retry.elements, "status-pill").textContent === "unavailable", "a later failure should mark the page unavailable");
+
+  const form = await bootDashboard("", async () => jsonResult(summaryFixture()));
+  dashEl(form.elements, "filter-project").value = " demo ";
+  dashEl(form.elements, "filter-model").value = " ";
+  dashEl(form.elements, "filter-since").value = "2026-10-01";
+  dashEl(form.elements, "filter-until").value = "  ";
+  let prevented = false;
+  const submit = dashEl(form.elements, "scope-form").listeners.submit;
+  assert(submit, "filter form should handle submit");
+  submit({
+    preventDefault() {
+      prevented = true;
+    },
+  });
+  assert(prevented, "filter submit should build the query itself");
+  assert(form.location.assigned === "/?project=demo&since=2026-10-01", form.location.assigned ?? "missing assign");
 }
 
 function readReq(req: IncomingMessage): Promise<string> {

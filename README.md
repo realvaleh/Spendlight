@@ -239,7 +239,7 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 
 | URL | What |
 | --- | --- |
-| `/` | Dashboard (spend, budgets, spend by day, project and model pairs, most expensive requests, recent requests) |
+| `/` | Dashboard (spend, budgets, spend by day, project and model pairs, most expensive requests, recent requests), with a project, model, and date filter |
 | `/receipt.md` | Markdown receipt (`?project=`, `?model=`, optional `?since=` / `?until=` / `?window=current`) |
 | `/receipt.svg` | Paper-style SVG receipt (same scope parameters as the markdown receipt) |
 | `/badge.svg` | Shields-style badge for a local README (`?project=` or `?model=`; time parameters are ignored) |
@@ -247,6 +247,8 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 | `/api/export.csv` | Spend ledger as CSV (same scope parameters as the receipts) |
 | `/api/export.json` | Same filtered ledger rows as the CSV, as a JSON array |
 | `/health` | Liveness |
+
+The dashboard filter and the page query use the same `project`, `model`, `since`, `until`, and `window` parameters as `/api/summary`. Apply writes `project`, `model`, `since`, and `until` into the page URL and omits any field left blank. A blank value is treated as unset: it does not select the empty scope that a present-but-blank tag selects on `/api/summary`. `?window=current` is included in the summary request until `since` or `until` is set (Apply drops it, because those bounds cannot be combined). The hero total, breakdowns, most expensive requests, recent requests, and the Markdown, SVG, CSV, and JSON links follow that filter. With a time filter, **Spend by day** lists the days in the slice instead of the last 14 days. The badge link follows `project` and `model` only. The budget meter, soft warning, and kill-switch stay on the configured lifetime total or calendar window, so a filter cannot hide a cap. The line under the form names the slice. A bad range shows that request's 400 message (`invalid_request_error` / `invalid_time_range`) instead of a zero ledger: the status reads **unavailable**, and the spend, request, token, average, and project figures are dashes. If a later refresh fails, the page keeps the last figures it already showed.
 
 Sample receipt (checked in):
 
