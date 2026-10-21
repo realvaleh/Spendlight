@@ -38,7 +38,27 @@ export function dashboardHtml(): string {
     .pill { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; padding: 7px 11px; border: 1px solid var(--line); border-radius: 999px; background: #fff8ea; }
     .pill.ok { color: var(--green); }
     .pill.soft { color: var(--gold); }
-    .pill.hard { color: var(--red); background: #f8e8e4; }
+    .pill.hard, .pill.err { color: var(--red); background: #f8e8e4; }
+    .scope {
+      display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: end;
+      margin: -10px 0 18px;
+    }
+    .scope label {
+      display: flex; flex-direction: column; gap: 4px;
+      font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+    }
+    .scope input {
+      font-family: var(--mono); font-size: 13px; letter-spacing: 0; text-transform: none;
+      color: var(--ink); background: #fffaf0; border: 1px solid var(--line);
+      border-radius: 999px; padding: 8px 12px; min-width: 9.5rem;
+    }
+    .scope input:focus { outline: 2px solid rgba(224,179,74,.7); border-color: var(--gold); }
+    .scope .actions { display: flex; gap: 8px; align-items: center; }
+    .error {
+      margin: -6px 0 16px; padding: 10px 12px; border-radius: 12px;
+      background: #f8e8e4; color: var(--red); font-size: 13px;
+    }
+    #scope-note { margin: -8px 0 16px; }
     .hero {
       display: grid; grid-template-columns: 1.4fr .8fr; gap: 18px; margin-bottom: 18px;
     }
@@ -70,9 +90,14 @@ export function dashboardHtml(): string {
     .spark polygon { fill: rgba(184,134,42,.12); }
     .row-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
     .links { display: flex; gap: 10px; flex-wrap: wrap; }
-    a.btn { color: var(--ink); text-decoration: none; font-size: 12px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; background: #fff8ea; }
+    a.btn, button.btn {
+      color: var(--ink); text-decoration: none; font-family: var(--sans); font-size: 12px;
+      padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; background: #fff8ea;
+      cursor: pointer;
+    }
+    button.btn { line-height: 1.2; }
     a.btn.mini { font-size: 11px; padding: 3px 8px; }
-    a.btn:hover { border-color: var(--ink); }
+    a.btn:hover, button.btn:hover { border-color: var(--ink); }
     .proj-links { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
     footer { margin-top: 22px; color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
     .empty { padding: 28px 8px; color: var(--muted); font-family: var(--serif); font-style: italic; }
@@ -95,6 +120,19 @@ export function dashboardHtml(): string {
       <div id="status-pill" class="pill">loading</div>
     </header>
 
+    <form id="scope-form" class="scope" method="get" action="/">
+      <label>Project <input id="filter-project" name="project" type="text" autocomplete="off" spellcheck="false" placeholder="all"></label>
+      <label>Model <input id="filter-model" name="model" type="text" autocomplete="off" spellcheck="false" placeholder="all"></label>
+      <label>Since <input id="filter-since" name="since" type="text" autocomplete="off" spellcheck="false" placeholder="YYYY-MM-DD"></label>
+      <label>Until <input id="filter-until" name="until" type="text" autocomplete="off" spellcheck="false" placeholder="YYYY-MM-DD"></label>
+      <div class="actions">
+        <button class="btn" type="submit">Apply</button>
+        <a class="btn" href="/">Clear</a>
+      </div>
+    </form>
+    <p id="scope-note" class="sub" hidden></p>
+    <p id="summary-error" class="error" role="alert" hidden></p>
+
     <section class="hero">
       <article class="card">
         <div class="k" id="spend-k">Estimated spend</div>
@@ -115,11 +153,11 @@ export function dashboardHtml(): string {
           <div class="k">Share</div>
         </div>
         <div class="links">
-          <a class="btn" href="/receipt.md">Markdown receipt</a>
-          <a class="btn" href="/receipt.svg">SVG receipt</a>
-          <a class="btn" href="/badge.svg">README badge</a>
-          <a class="btn" href="/api/export.csv" download="spendlight-ledger.csv">Download CSV</a>
-          <a class="btn" href="/api/export.json" download="spendlight-ledger.json">Download JSON</a>
+          <a class="btn" id="link-md" href="/receipt.md">Markdown receipt</a>
+          <a class="btn" id="link-svg" href="/receipt.svg">SVG receipt</a>
+          <a class="btn" id="link-badge" href="/badge.svg">README badge</a>
+          <a class="btn" id="link-csv" href="/api/export.csv" download="spendlight-ledger.csv">Download CSV</a>
+          <a class="btn" id="link-json" href="/api/export.json" download="spendlight-ledger.json">Download JSON</a>
         </div>
       </article>
     </section>
@@ -254,8 +292,112 @@ export function dashboardHtml(): string {
         '<a class="btn mini" href="/api/export.json?' + q + '">JSON</a>' +
         '</div>';
     }
-    async function tick() {
-      const s = await fetch("/api/summary").then(r => r.json());
+    let loaded = false;
+    let scopeReady = false;
+    function pageScope() {
+      const page = new URLSearchParams(location.search);
+      const q = new URLSearchParams();
+      for (const key of ["project", "model", "since", "until"]) {
+        const value = (page.get(key) ?? "").trim();
+        if (!scopeReady) $("filter-" + key).value = value;
+        if (value) q.set(key, value);
+      }
+      if (!q.has("since") && !q.has("until")) {
+        const windowValue = (page.get("window") ?? "").trim();
+        if (windowValue) q.set("window", windowValue);
+      }
+      scopeReady = true;
+      return q;
+    }
+    function onScopeSubmit(event) {
+      event.preventDefault();
+      const q = new URLSearchParams();
+      for (const key of ["project", "model", "since", "until"]) {
+        const value = $("filter-" + key).value.trim();
+        if (value) q.set(key, value);
+      }
+      const next = q.toString();
+      location.assign(next ? "/?" + next : "/");
+    }
+    function showSummaryError(message) {
+      const el = $("summary-error");
+      el.hidden = false;
+      el.textContent = message;
+      const pillEl = $("status-pill");
+      pillEl.className = "pill err";
+      pillEl.textContent = "unavailable";
+      if (loaded) return;
+      $("spend").textContent = "—";
+      $("requests").textContent = "—";
+      $("tokens").textContent = "—";
+      $("avg").textContent = "—";
+      $("projects").textContent = "—";
+      $("meter-bar").style.width = "0%";
+      $("spend-sub").textContent = "Summary unavailable.";
+      $("budget-copy").textContent = "Summary unavailable.";
+      for (const id of ["by-project", "by-model", "by-pair", "by-day", "top-requests", "recent"]) {
+        const node = $(id);
+        node.className = "empty";
+        node.textContent = "Summary unavailable.";
+      }
+      $("events").innerHTML = '<li class="empty" style="border:0;padding-left:0">Summary unavailable.</li>';
+    }
+    function hideSummaryError() {
+      const el = $("summary-error");
+      el.hidden = true;
+      el.textContent = "";
+    }
+    function setShareLinks(q) {
+      const suffix = q.toString();
+      const withQuery = (path) => path + (suffix ? "?" + suffix : "");
+      $("link-md").setAttribute("href", withQuery("/receipt.md"));
+      $("link-svg").setAttribute("href", withQuery("/receipt.svg"));
+      $("link-csv").setAttribute("href", withQuery("/api/export.csv"));
+      $("link-json").setAttribute("href", withQuery("/api/export.json"));
+      const badge = new URLSearchParams();
+      if (q.has("project")) badge.set("project", q.get("project"));
+      if (q.has("model")) badge.set("model", q.get("model"));
+      const badgeSuffix = badge.toString();
+      $("link-badge").setAttribute("href", "/badge.svg" + (badgeSuffix ? "?" + badgeSuffix : ""));
+      if (suffix) {
+        $("link-csv").removeAttribute("download");
+        $("link-json").removeAttribute("download");
+      } else {
+        $("link-csv").setAttribute("download", "spendlight-ledger.csv");
+        $("link-json").setAttribute("download", "spendlight-ledger.json");
+      }
+    }
+    function scopeNote(s, q) {
+      const bits = [];
+      if (q.has("project")) bits.push(s.scopeProject ? "project " + s.scopeProject : "project matches nothing");
+      if (q.has("model")) bits.push(s.scopeModel ? "model " + s.scopeModel : "model matches nothing");
+      if (q.has("window")) bits.push("current budget window");
+      else {
+        if (s.scopeSince) bits.push("since " + s.scopeSince);
+        if (s.scopeUntil) bits.push("until " + s.scopeUntil);
+      }
+      const el = $("scope-note");
+      if (!bits.length) {
+        el.hidden = true;
+        el.textContent = "";
+        return;
+      }
+      el.hidden = false;
+      el.textContent = "Showing " + bits.join(" · ") + ". The budget meter still follows the configured cap, not this filter.";
+    }
+    function fillCard(id, html, emptyHtml) {
+      const node = $(id);
+      if (html) {
+        node.className = "";
+        node.innerHTML = html;
+      } else {
+        node.className = "empty";
+        node.innerHTML = emptyHtml;
+      }
+    }
+    function renderSummary(s, q) {
+      const filtered = q.toString().length > 0;
+      const timeFiltered = q.has("since") || q.has("until") || q.has("window");
       $("spend").textContent = fmtMoney(s.spendUsd);
       $("requests").textContent = fmtInt(s.requests);
       $("tokens").textContent = fmtInt(s.tokens);
@@ -263,26 +405,31 @@ export function dashboardHtml(): string {
       $("avg").textContent = s.requests ? fmtMoney(s.spendUsd / s.requests) : "$0";
       $("spend-sub").textContent = s.requests
         ? s.tokens.toLocaleString("en-US") + " tokens across " + s.requests + " request" + (s.requests === 1 ? "" : "s")
-        : "Waiting for the first completion…";
+        : (filtered ? "No requests in this filter." : "Waiting for the first completion…");
       pill(s.budget.status);
       const hard = s.budget.globalLimit.hardUsd;
       const spend = s.budget.globalSpend;
       const pct = hard ? Math.min(100, (spend / hard) * 100) : 0;
       $("meter").className = "meter " + s.budget.status;
       $("meter-bar").style.width = (hard ? pct : 0) + "%";
-      $("spend-k").textContent = (s.budget.period === "day" || s.budget.period === "week" || s.budget.period === "month") ? "Estimated spend · lifetime" : "Estimated spend";
+      $("spend-k").textContent = filtered
+        ? "Estimated spend · this filter"
+        : ((s.budget.period === "day" || s.budget.period === "week" || s.budget.period === "month") ? "Estimated spend · lifetime" : "Estimated spend");
       $("budget-copy").textContent = budgetCopy(s);
+      scopeNote(s, q);
       const zone = (s.budget && s.budget.timezone) || "UTC";
-      const fortnight = lastFortnight(s);
-      const fortnightSpend = fortnight.reduce((sum, d) => sum + Number(d.spendUsd || 0), 0);
       const today = ymdInZone(new Date(s.generatedAt), zone);
-      $("daily-sub").textContent = fortnightSpend
-        ? "last 14 days · " + zone
-        : "last 14 days · " + zone + " · no spend";
-      const maxD = Math.max(...fortnight.map(d => d.spendUsd), 1e-9);
+      const rows = timeFiltered
+        ? (s.daily || []).map(d => ({ day: d.day, spendUsd: d.spendUsd, requests: d.requests }))
+        : lastFortnight(s);
+      const rowSpend = rows.reduce((sum, d) => sum + Number(d.spendUsd || 0), 0);
+      $("daily-sub").textContent = timeFiltered
+        ? (rowSpend ? "in this filter · " + zone : "in this filter · " + zone + " · no spend")
+        : (rowSpend ? "last 14 days · " + zone : "last 14 days · " + zone + " · no spend");
+      const maxD = Math.max(...rows.map(d => d.spendUsd), 1e-9);
       const dailyRows = table(
         [{label:"Day"},{label:"Spend",num:true},{label:"Reqs",num:true},{label:"That day"}],
-        fortnight.map(d => [
+        rows.map(d => [
           '<span class="' + (d.day === today ? "day-today" : "") + '">' + esc(d.day) + "</span>",
           (d.spendUsd ? fmtMoney(d.spendUsd) : "$0.00") + '<div class="bar"><i style="width:' + (d.spendUsd / maxD * 100) + "%;background:" + (d.day === today ? "var(--gold)" : "var(--ink)") + '"></i></div>',
           fmtInt(d.requests),
@@ -290,9 +437,8 @@ export function dashboardHtml(): string {
         ]),
         "compact"
       );
-      $("by-day").className = "";
-      $("by-day").innerHTML = dailyRows || '<div class="empty">No days yet.</div>';
-      spark(fortnight);
+      fillCard("by-day", dailyRows, timeFiltered ? "No days in this filter." : "No days yet.");
+      spark(rows);
       const maxP = Math.max(...s.byProject.map(p => p.spendUsd), 1e-9);
       const proj = table(
         [{label:"Project"},{label:"Spend",num:true},{label:"Reqs",num:true}],
@@ -302,7 +448,7 @@ export function dashboardHtml(): string {
           p.requests
         ])
       );
-      $("by-project").innerHTML = proj || '<div class="empty">No projects yet.</div>';
+      fillCard("by-project", proj, filtered ? "No projects in this filter." : "No projects yet.");
       const models = table(
         [{label:"Model"},{label:"Spend",num:true},{label:"Tokens",num:true}],
         s.byModel.map(m => [
@@ -311,7 +457,7 @@ export function dashboardHtml(): string {
           fmtInt(m.tokens)
         ])
       );
-      $("by-model").innerHTML = models || '<div class="empty">No models yet.</div>';
+      fillCard("by-model", models, filtered ? "No models in this filter." : "No models yet.");
       const pairs = table(
         [{label:"Project"},{label:"Model"},{label:"Spend",num:true},{label:"Reqs",num:true}],
         (s.byProjectModel || []).map(p => [
@@ -321,8 +467,7 @@ export function dashboardHtml(): string {
           fmtInt(p.requests)
         ])
       );
-      $("by-pair").className = "";
-      $("by-pair").innerHTML = pairs || '<div class="empty">No project and model pairs yet.</div>';
+      fillCard("by-pair", pairs, filtered ? "No project and model pairs in this filter." : "No project and model pairs yet.");
       const ranked = s.topRequests || [];
       const maxT = Math.max(...ranked.map(r => r.costUsd), 1e-9);
       const top = table(
@@ -335,8 +480,7 @@ export function dashboardHtml(): string {
           fmtMoney(r.costUsd) + '<div class="bar"><i style="width:' + (r.costUsd / maxT * 100) + '%"></i></div>'
         ])
       );
-      $("top-requests").className = "";
-      $("top-requests").innerHTML = top || '<div class="empty">No requests yet.</div>';
+      fillCard("top-requests", top, filtered ? "No requests in this filter." : "No requests yet.");
       const recent = table(
         [{label:"When"},{label:"Project"},{label:"Model"},{label:"Tokens",num:true},{label:"Cost",num:true}],
         s.recent.map(r => [
@@ -347,10 +491,44 @@ export function dashboardHtml(): string {
           fmtMoney(r.costUsd)
         ])
       );
-      $("recent").innerHTML = recent || '<div class="empty">Point a client at <code>/v1</code> to light this up.</div>';
+      fillCard("recent", recent, filtered ? "No requests in this filter." : "Point a client at <code>/v1</code> to light this up.");
       $("events").innerHTML = s.events.length
         ? s.events.map(e => "<li><strong>" + esc(e.type) + "</strong> · " + esc(e.project) + " · " + esc(e.message) + "</li>").join("")
         : '<li class="empty" style="border:0;padding-left:0">None yet.</li>';
+    }
+    async function tick() {
+      const q = pageScope();
+      setShareLinks(q);
+      let res;
+      try {
+        const suffix = q.toString();
+        res = await fetch("/api/summary" + (suffix ? "?" + suffix : ""));
+      } catch {
+        showSummaryError("Could not reach Spendlight. The dashboard will retry.");
+        return;
+      }
+      let body = null;
+      try {
+        body = await res.json();
+      } catch {
+        showSummaryError("Spendlight returned a response the dashboard could not read.");
+        return;
+      }
+      if (!res.ok) {
+        const message = body && body.error && body.error.message
+          ? String(body.error.message)
+          : "Could not load the summary (" + res.status + ").";
+        showSummaryError(message);
+        return;
+      }
+      try {
+        renderSummary(body, q);
+      } catch {
+        showSummaryError("Spendlight returned a summary the dashboard could not show.");
+        return;
+      }
+      loaded = true;
+      hideSummaryError();
     }
     function projectLinks(name) {
       const q = encodeURIComponent(name);
@@ -394,6 +572,7 @@ export function dashboardHtml(): string {
       if (hard == null) return head + "no global hard budget" + softBit + ".";
       return head + "hard budget " + fmtMoney(spend) + " / " + fmtMoney(hard) + softBit;
     }
+    $("scope-form").addEventListener("submit", onScopeSubmit);
     tick();
     setInterval(tick, 3000);
   </script>
