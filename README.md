@@ -244,6 +244,7 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 | `/receipt.svg` | Paper-style SVG receipt (same scope parameters as the markdown receipt) |
 | `/badge.svg` | Shields-style badge for a local README (`?project=` or `?model=`; time parameters are ignored) |
 | `/api/summary` | JSON for the same numbers (same scope parameters as the receipts) |
+| `/api/tokens` | Prompt, cached, and completion token totals (same scope parameters as `/api/summary`) |
 | `/api/export.csv` | Spend ledger as CSV (same scope parameters as the receipts) |
 | `/api/export.json` | Same filtered ledger rows as the CSV, as a JSON array |
 | `/health` | Liveness |
@@ -299,6 +300,12 @@ curl -s "http://127.0.0.1:8787/receipt.svg?model=gpt-4o-mini&since=2026-10-01&un
 curl -s "http://127.0.0.1:8787/api/summary?window=current"
 curl -s "http://127.0.0.1:8787/api/summary?since=2026-10-01&until=2026-10-15"
 curl -s "http://127.0.0.1:8787/receipt.md?since=2026-10-04&until=2026-10-05"
+```
+
+`GET /api/tokens` totals the token columns already stored on each ledger row: prompt, completion, cached, and total, plus the request count and how many of those requests had a non-zero cache count. The same `project`, `model`, `since`, `until`, and `window` filters as `/api/summary` apply, including a bare `YYYY-MM-DD` at midnight in the budget timezone. An empty ledger is all zeros. A bad range is the same 400 as the CSV (`invalid_request_error` / `invalid_time_range`). The route does not return API keys or upstream credentials, and it uses the same localhost CORS rules as the other `/api` routes. The dashboard **Token mix** card draws a bar of uncached prompt, cached prompt, and completion from that response. `/api/summary` already returns a `daily` spend series, so this route is the token split that series does not include. Receipts, the badge, exports, budgets, and the kill-switch are unchanged.
+
+```bash
+curl -s "http://127.0.0.1:8787/api/tokens?project=demo&since=2026-10-01&until=2026-10-08"
 ```
 
 Local README badge (only useful on a machine that can reach the proxy):

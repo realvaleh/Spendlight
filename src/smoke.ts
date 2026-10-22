@@ -361,6 +361,7 @@ async function main(): Promise<void> {
     await testModelScope(dir, mockUrl);
     await testTimeScope(dir, mockUrl);
     await testJsonExport(dir, mockUrl);
+    await testTokenMix(dir, mockUrl);
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
@@ -2772,6 +2773,390 @@ function civilYmd(timeZone: string, date: Date): string {
     if (part.type !== "literal") map[part.type] = part.value;
   }
   return `${map.year}-${map.month}-${map.day}`;
+}
+
+const TOKEN_MIX_KEYS = [
+  "cachedRequests",
+  "cachedTokens",
+  "completionTokens",
+  "generatedAt",
+  "promptTokens",
+  "requests",
+  "scopeModel",
+  "scopeProject",
+  "scopeSince",
+  "scopeUntil",
+  "totalTokens",
+] as const;
+
+type TokenMixBody = {
+  generatedAt: string;
+  scopeProject: string | null;
+  scopeModel: string | null;
+  scopeSince: string | null;
+  scopeUntil: string | null;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
+  requests: number;
+  cachedRequests: number;
+};
+
+function assertTokenMix(
+  body: TokenMixBody,
+  label: string,
+  expected: Partial<TokenMixBody> & {
+    promptTokens: number;
+    completionTokens: number;
+    cachedTokens: number;
+    totalTokens: number;
+    requests: number;
+    cachedRequests: number;
+  },
+): void {
+  const keys = Object.keys(body).sort();
+  assert(keys.join(",") === TOKEN_MIX_KEYS.join(","), `${label} keys ${keys.join(",")}`);
+  assert(typeof body.generatedAt === "string" && body.generatedAt.includes("T"), `${label} generatedAt ${body.generatedAt}`);
+  assert(!JSON.stringify(body).includes("sk-"), `${label} leaked a key-like string`);
+  for (const key of [
+    "promptTokens",
+    "completionTokens",
+    "cachedTokens",
+    "totalTokens",
+    "requests",
+    "cachedRequests",
+  ] as const) {
+    assert(body[key] === expected[key], `${label} ${key} ${body[key]} !== ${expected[key]}`);
+  }
+  if ("scopeProject" in expected) assert(body.scopeProject === expected.scopeProject, `${label} project ${body.scopeProject}`);
+  if ("scopeModel" in expected) assert(body.scopeModel === expected.scopeModel, `${label} model ${body.scopeModel}`);
+  if ("scopeSince" in expected) assert(body.scopeSince === expected.scopeSince, `${label} since ${body.scopeSince}`);
+  if ("scopeUntil" in expected) assert(body.scopeUntil === expected.scopeUntil, `${label} until ${body.scopeUntil}`);
+}
+
+async function testTokenMix(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "tokens", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
+    const emptyRes = await fetch(`${base}/api/tokens`);
+    assert(emptyRes.status === 200, `empty tokens status ${emptyRes.status}`);
+    const empty = (await emptyRes.json()) as TokenMixBody;
+    assertTokenMix(empty, "empty ledger", {
+      promptTokens: 0,
+      completionTokens: 0,
+      cachedTokens: 0,
+      totalTokens: 0,
+      requests: 0,
+      cachedRequests: 0,
+      scopeProject: null,
+      scopeModel: null,
+      scopeSince: null,
+      scopeUntil: null,
+    });
+
+    const evil = await fetch(`${base}/api/tokens`, { headers: { origin: "https://evil.example" } });
+    assert(evil.status === 200, `foreign tokens status ${evil.status}`);
+    assert(evil.headers.get("access-control-allow-origin") == null, "token route allowed a foreign origin");
+    const local = await fetch(`${base}/api/tokens`, { headers: { origin: "http://127.0.0.1:9999" } });
+    assert(
+      local.headers.get("access-control-allow-origin") === "http://127.0.0.1:9999",
+      "token route should reflect a localhost origin",
+    );
+    const preflight = await fetch(`${base}/api/tokens`, {
+      method: "OPTIONS",
+      headers: { origin: "https://evil.example", "access-control-request-method": "GET" },
+    });
+    assert(preflight.status === 204, `token preflight ${preflight.status}`);
+    assert(preflight.headers.get("access-control-allow-origin") == null, "token preflight allowed a foreign origin");
+
+    await expectRange400(`${base}/api/tokens?since=yesterday`, "since", "Invalid since");
+    await expectRange400(`${base}/api/tokens?window=current`, "window", "lifetime");
+    await expectRange400(`${base}/api/tokens?since=2026-10-01&window=current`, "window", "cannot be combined");
+
+    const dash = await fetch(`${base}/`).then((r) => r.text());
+    assert(dash.includes("Token mix"), "dashboard missing token mix card");
+    assert(dash.includes('id="token-mix"'), "dashboard missing token mix mount");
+    assert(dash.includes('fetch("/api/tokens"'), "dashboard should load /api/tokens");
+    assert(dash.includes("function renderTokenMix"), "dashboard missing token mix renderer");
+    assert(dash.includes('class="mix"'), "dashboard missing token mix bar");
+    assert(dash.includes("Uncached"), "dashboard token mix should label uncached prompt");
+    assert(dash.includes("Cached"), "dashboard token mix should label cached prompt");
+    assert(dash.includes("Completion"), "dashboard token mix should label completion");
+
+    const seed = (
+      id: string,
+      createdAt: string,
+      project: string,
+      model: string,
+      usage: { promptTokens: number; completionTokens: number; cachedTokens: number; totalTokens: number },
+      costUsd: number,
+    ) => {
+      insertRequest(app.db, {
+        id,
+        createdAt,
+        project,
+        model,
+        usage,
+        costUsd,
+        status: 200,
+        path: "/v1/chat/completions",
+      });
+    };
+    seed("d1", "2026-10-01T12:00:00.000Z", "demo", "gpt-4o-mini", {
+      promptTokens: 1000,
+      completionTokens: 100,
+      cachedTokens: 400,
+      totalTokens: 1100,
+    }, 1);
+    seed("d2", "2026-10-02T12:00:00.000Z", "demo", "gpt-4o", {
+      promptTokens: 200,
+      completionTokens: 50,
+      cachedTokens: 0,
+      totalTokens: 250,
+    }, 2);
+    seed("d3", "2026-10-03T12:00:00.000Z", "other", "gpt-4o-mini", {
+      promptTokens: 10,
+      completionTokens: 10,
+      cachedTokens: 10,
+      totalTokens: 20,
+    }, 4);
+    seed("d4", "2026-10-03T18:00:00.000Z", "demo", "gpt-4o-mini", {
+      promptTokens: 5,
+      completionTokens: 0,
+      cachedTokens: 0,
+      totalTokens: 5,
+    }, 8);
+
+    const all = (await fetch(`${base}/api/tokens`).then((r) => r.json())) as TokenMixBody;
+    assertTokenMix(all, "multi-day", {
+      promptTokens: 1215,
+      completionTokens: 160,
+      cachedTokens: 410,
+      totalTokens: 1375,
+      requests: 4,
+      cachedRequests: 2,
+      scopeProject: null,
+      scopeModel: null,
+      scopeSince: null,
+      scopeUntil: null,
+    });
+
+    const project = (await fetch(`${base}/api/tokens?project=demo`).then((r) => r.json())) as TokenMixBody;
+    assertTokenMix(project, "project filter", {
+      promptTokens: 1205,
+      completionTokens: 150,
+      cachedTokens: 400,
+      totalTokens: 1355,
+      requests: 3,
+      cachedRequests: 1,
+      scopeProject: "demo",
+    });
+
+    const model = (await fetch(`${base}/api/tokens?model=gpt-4o`).then((r) => r.json())) as TokenMixBody;
+    assertTokenMix(model, "model filter", {
+      promptTokens: 200,
+      completionTokens: 50,
+      cachedTokens: 0,
+      totalTokens: 250,
+      requests: 1,
+      cachedRequests: 0,
+      scopeModel: "gpt-4o",
+    });
+
+    const day = (await fetch(`${base}/api/tokens?since=2026-10-03&until=2026-10-04`).then((r) => r.json())) as TokenMixBody;
+    assertTokenMix(day, "utc day slice", {
+      promptTokens: 15,
+      completionTokens: 10,
+      cachedTokens: 10,
+      totalTokens: 25,
+      requests: 2,
+      cachedRequests: 1,
+      scopeSince: "2026-10-03T00:00:00.000Z",
+      scopeUntil: "2026-10-04T00:00:00.000Z",
+    });
+
+    const both = (await fetch(
+      `${base}/api/tokens?project=demo&model=gpt-4o-mini&since=2026-10-01&until=2026-10-02`,
+    ).then((r) => r.json())) as TokenMixBody;
+    assertTokenMix(both, "project+model+range", {
+      promptTokens: 1000,
+      completionTokens: 100,
+      cachedTokens: 400,
+      totalTokens: 1100,
+      requests: 1,
+      cachedRequests: 1,
+      scopeProject: "demo",
+      scopeModel: "gpt-4o-mini",
+    });
+
+    const miss = (await fetch(`${base}/api/tokens?model=missing`).then((r) => r.json())) as TokenMixBody;
+    assertTokenMix(miss, "unknown model", {
+      promptTokens: 0,
+      completionTokens: 0,
+      cachedTokens: 0,
+      totalTokens: 0,
+      requests: 0,
+      cachedRequests: 0,
+      scopeModel: "missing",
+    });
+
+    const blank = (await fetch(`${base}/api/tokens?project=`).then((r) => r.json())) as TokenMixBody;
+    assertTokenMix(blank, "blank project", {
+      promptTokens: 0,
+      completionTokens: 0,
+      cachedTokens: 0,
+      totalTokens: 0,
+      requests: 0,
+      cachedRequests: 0,
+      scopeProject: "",
+    });
+
+    const summary = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+      tokens: number;
+      requests: number;
+      spendUsd: number;
+      budget: { globalSpend: number; status: string };
+    };
+    assert(summary.tokens === 1375, `summary tokens ${summary.tokens}`);
+    assert(summary.requests === 4, `summary requests ${summary.requests}`);
+    assert(Math.abs(summary.spendUsd - 15) < 1e-6, `summary spend ${summary.spendUsd}`);
+    assert(Math.abs(summary.budget.globalSpend - 15) < 1e-6, "token route changed kill-switch spend");
+    assert(summary.budget.status === "ok", `token route changed budget status ${summary.budget.status}`);
+
+    const md = await fetch(`${base}/receipt.md`).then((r) => r.text());
+    assert(md.includes("Spendlight receipt"), "receipt missing title");
+    assert(md.includes("| Total spend | $15.00 |"), md);
+    assert(!md.includes("Token mix"), "receipt grew a token mix section");
+    assert(!md.includes("cachedRequests"), "receipt listed cachedRequests");
+    const badge = await fetch(`${base}/badge.svg`).then((r) => r.text());
+    assert(badge.includes("spendlight"), "badge missing label");
+    assert(!badge.includes("cached"), "badge grew a cache label");
+    const csv = await fetch(`${base}/api/export.csv`).then((r) => r.text());
+    assert(
+      csv.startsWith(
+        "timestamp,project,model,promptTokens,completionTokens,cachedTokens,totalTokens,costUsd,streamed,id,error\n",
+      ),
+      "csv header changed",
+    );
+    assert(csvLines(csv).length === 5, `csv rows ${csvLines(csv).length}`);
+  });
+
+  await withApp(
+    dir,
+    "tokens-ny",
+    mockUrl,
+    { softUsd: null, hardUsd: 100, period: "day", timezone: "America/New_York" },
+    async (base, app) => {
+      insertRequest(app.db, {
+        id: "before",
+        createdAt: "2026-10-04T03:59:59.000Z",
+        project: "demo",
+        model: "gpt-4o-mini",
+        usage: { promptTokens: 9, completionTokens: 1, cachedTokens: 0, totalTokens: 10 },
+        costUsd: 9,
+        status: 200,
+        path: "/v1/chat/completions",
+      });
+      insertRequest(app.db, {
+        id: "midnight",
+        createdAt: "2026-10-04T04:00:00.000Z",
+        project: "demo",
+        model: "gpt-4o",
+        usage: { promptTokens: 3, completionTokens: 2, cachedTokens: 3, totalTokens: 5 },
+        costUsd: 3,
+        status: 200,
+        path: "/v1/chat/completions",
+      });
+      insertRequest(app.db, {
+        id: "evening",
+        createdAt: "2026-10-05T03:59:59.000Z",
+        project: "other",
+        model: "gpt-4o-mini",
+        usage: { promptTokens: 4, completionTokens: 4, cachedTokens: 1, totalTokens: 8 },
+        costUsd: 4,
+        status: 200,
+        path: "/v1/chat/completions",
+      });
+      insertRequest(app.db, {
+        id: "next",
+        createdAt: "2026-10-05T04:00:00.000Z",
+        project: "demo",
+        model: "gpt-4o-mini",
+        usage: { promptTokens: 8, completionTokens: 8, cachedTokens: 0, totalTokens: 16 },
+        costUsd: 8,
+        status: 200,
+        path: "/v1/chat/completions",
+      });
+
+      const localDay = (await fetch(`${base}/api/tokens?since=2026-10-04&until=2026-10-05`).then((r) => r.json())) as TokenMixBody;
+      assertTokenMix(localDay, "ny local day", {
+        promptTokens: 7,
+        completionTokens: 6,
+        cachedTokens: 4,
+        totalTokens: 13,
+        requests: 2,
+        cachedRequests: 2,
+        scopeSince: "2026-10-04T04:00:00.000Z",
+        scopeUntil: "2026-10-05T04:00:00.000Z",
+      });
+      assert(localDay.requests === 2, "row just before local midnight was counted on the new day");
+
+      const previous = (await fetch(`${base}/api/tokens?since=2026-10-03&until=2026-10-04`).then((r) => r.json())) as TokenMixBody;
+      assertTokenMix(previous, "ny previous day", {
+        promptTokens: 9,
+        completionTokens: 1,
+        cachedTokens: 0,
+        totalTokens: 10,
+        requests: 1,
+        cachedRequests: 0,
+      });
+
+      const probe = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+        budget: { windowStart: string | null; windowEnd: string | null; globalSpend: number; period: string };
+        spendUsd: number;
+      };
+      assert(probe.budget.period === "day", `expected day budget, got ${probe.budget.period}`);
+      const start = probe.budget.windowStart;
+      const end = probe.budget.windowEnd;
+      assert(start != null && end != null, "day window missing bounds");
+      insertRequest(app.db, {
+        id: "old",
+        createdAt: new Date(Date.parse(start) - 1000).toISOString(),
+        project: "demo",
+        model: "gpt-4o",
+        usage: { promptTokens: 50, completionTokens: 0, cachedTokens: 0, totalTokens: 50 },
+        costUsd: 50,
+        status: 200,
+        path: "/v1/chat/completions",
+      });
+      insertRequest(app.db, {
+        id: "now",
+        createdAt: start,
+        project: "demo",
+        model: "gpt-4o-mini",
+        usage: { promptTokens: 2, completionTokens: 2, cachedTokens: 1, totalTokens: 4 },
+        costUsd: 2,
+        status: 200,
+        path: "/v1/chat/completions",
+      });
+
+      const current = (await fetch(`${base}/api/tokens?window=current`).then((r) => r.json())) as TokenMixBody;
+      assert(current.scopeSince === start, `window since ${current.scopeSince}`);
+      assert(current.scopeUntil === end, `window until ${current.scopeUntil}`);
+      assert(current.promptTokens === 2 && current.completionTokens === 2 && current.cachedTokens === 1, "window=current counted outside the day");
+      assert(current.requests === 1 && current.cachedRequests === 1, `window requests ${current.requests}/${current.cachedRequests}`);
+
+      const open = (await fetch(`${base}/api/tokens`).then((r) => r.json())) as TokenMixBody;
+      assert(open.requests === 6, `unscoped token requests ${open.requests}`);
+      assert(open.promptTokens === 9 + 3 + 4 + 8 + 50 + 2, `unscoped prompt ${open.promptTokens}`);
+
+      const after = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+        budget: { globalSpend: number };
+        spendUsd: number;
+      };
+      assert(Math.abs(after.spendUsd - (9 + 3 + 4 + 8 + 50 + 2)) < 1e-6, `lifetime hero ${after.spendUsd}`);
+      assert(Math.abs(after.budget.globalSpend - 2) < 1e-6, `day kill-switch spend ${after.budget.globalSpend}`);
+    },
+  );
 }
 
 async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise<void> {
