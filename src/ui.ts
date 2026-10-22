@@ -79,6 +79,15 @@ export function dashboardHtml(): string {
     code { font-family: var(--mono); font-size: 12px; background: var(--paper-2); padding: 1px 5px; border-radius: 4px; }
     .events { list-style: none; padding: 0; margin: 0; }
     .events li { font-size: 13px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+    .mix { display: flex; height: 10px; border-radius: 99px; overflow: hidden; background: var(--paper-2); margin: 12px 0; }
+    .mix > i { display: block; height: 100%; }
+    .mix .prompt { background: var(--ink); }
+    .mix .cached { background: var(--gold-2); }
+    .mix .completion { background: var(--green); }
+    .mix-legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; }
+    .mix-legend span { color: var(--muted); }
+    .mix-legend b { color: var(--ink); font-weight: 650; font-family: var(--mono); }
+    .swatch { display: inline-block; width: 8px; height: 8px; border-radius: 99px; margin-right: 6px; }
     @media (max-width: 820px) {
       .hero, .grid, .stats { grid-template-columns: 1fr; }
       header { flex-direction: column; }
@@ -165,6 +174,14 @@ export function dashboardHtml(): string {
         <div class="sub">auto-refresh 3s</div>
       </div>
       <div id="recent" class="empty">Point a client at <code>/v1</code> to light this up.</div>
+    </article>
+
+    <article class="card" style="margin-bottom:18px">
+      <div class="row-head">
+        <div class="k">Token mix</div>
+        <div class="sub" id="mix-sub">prompt, cache, and completion</div>
+      </div>
+      <div id="token-mix" class="empty">No tokens yet.</div>
     </article>
 
     <article class="card">
@@ -396,6 +413,78 @@ export function dashboardHtml(): string {
     }
     tick();
     setInterval(tick, 3000);
+    function tokenQuery() {
+      const page = new URLSearchParams(location.search);
+      const q = new URLSearchParams();
+      for (const key of ["project", "model", "since", "until", "window"]) {
+        const value = (page.get(key) ?? "").trim();
+        if (value) q.set(key, value);
+      }
+      return q;
+    }
+    function mixBar(prompt, cached, completion) {
+      const uncached = Math.max(0, prompt - Math.min(cached, prompt));
+      const cachedShown = Math.min(cached, prompt);
+      const parts = [
+        { cls: "prompt", n: uncached },
+        { cls: "cached", n: Math.max(0, cachedShown) },
+        { cls: "completion", n: Math.max(0, completion) }
+      ].filter(p => p.n > 0);
+      const sum = parts.reduce((total, p) => total + p.n, 0);
+      if (sum <= 0) return "";
+      return '<div class="mix" aria-hidden="true">' + parts.map(p =>
+        '<i class="' + p.cls + '" style="width:' + (p.n / sum * 100) + '%"></i>'
+      ).join("") + "</div>";
+    }
+    function renderTokenMix(mix) {
+      const el = $("token-mix");
+      const sub = $("mix-sub");
+      if (!mix || mix.error) {
+        el.className = "empty";
+        el.textContent = (mix && mix.error && mix.error.message) ? String(mix.error.message) : "Could not load token mix.";
+        sub.textContent = "prompt, cache, and completion";
+        return;
+      }
+      const prompt = Number(mix.promptTokens) || 0;
+      const completion = Number(mix.completionTokens) || 0;
+      const cached = Number(mix.cachedTokens) || 0;
+      const requests = Number(mix.requests) || 0;
+      const cachedRequests = Number(mix.cachedRequests) || 0;
+      if (prompt + completion + cached <= 0) {
+        el.className = "empty";
+        el.textContent = requests ? "Requests logged, no tokens yet." : "No tokens yet.";
+        sub.textContent = "prompt, cache, and completion";
+        return;
+      }
+      const scope = [];
+      if (mix.scopeProject) scope.push(String(mix.scopeProject));
+      if (mix.scopeModel) scope.push(String(mix.scopeModel));
+      sub.textContent = (scope.length ? scope.join(" · ") + " · " : "") +
+        fmtInt(mix.totalTokens) + " tokens · " +
+        fmtInt(cachedRequests) + " cached of " + fmtInt(requests) + " request" + (requests === 1 ? "" : "s");
+      const uncached = Math.max(0, prompt - Math.min(cached, prompt));
+      el.className = "";
+      el.innerHTML = mixBar(prompt, cached, completion) +
+        '<div class="mix-legend">' +
+        '<span><i class="swatch" style="background:var(--ink)"></i>Uncached <b>' + fmtInt(uncached) + "</b></span>" +
+        '<span><i class="swatch" style="background:var(--gold-2)"></i>Cached <b>' + fmtInt(cached) + "</b></span>" +
+        '<span><i class="swatch" style="background:var(--green)"></i>Completion <b>' + fmtInt(completion) + "</b></span>" +
+        "</div>";
+    }
+    async function tickTokens() {
+      const q = tokenQuery();
+      const suffix = q.toString();
+      try {
+        const res = await fetch("/api/tokens" + (suffix ? "?" + suffix : ""));
+        const body = await res.json();
+        if (!res.ok) renderTokenMix({ error: body && body.error ? body.error : { message: "Could not load token mix." } });
+        else renderTokenMix(body);
+      } catch {
+        renderTokenMix({ error: { message: "Could not load token mix." } });
+      }
+    }
+    tickTokens();
+    setInterval(tickTokens, 3000);
   </script>
 </body>
 </html>`;

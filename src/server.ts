@@ -6,6 +6,7 @@ import { dashboardHtml, FAVICON_SVG } from "./ui.js";
 import { badgeSvg, receiptMarkdown, receiptSvg } from "./receipts.js";
 import { proxyRequest, corsHeaders, normalizeModelId, normalizeProjectTag } from "./proxy.js";
 import { parseExportRange, type ParsedExportRange } from "./range.js";
+import { loadTokenMix } from "./db.js";
 
 export type App = {
   server: Server;
@@ -110,6 +111,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
   if (req.method === "GET" && url.pathname === "/badge.svg") {
     res.setHeader("cache-control", "no-cache");
     return send(res, 200, "image/svg+xml; charset=utf-8", badgeSvg(summaryFor(db, config, url)), req);
+  }
+  if (req.method === "GET" && url.pathname === "/api/tokens") {
+    const parsed = exportRangeOr400(url, config, res, req);
+    if (!parsed) return;
+    return sendJson(res, 200, tokenMixFor(db, config, url, parsed.range), req);
   }
 
   if (url.pathname.startsWith("/v1/") || url.pathname === "/v1") {
@@ -285,4 +291,38 @@ function csvCell(value: string | number): string {
   const text = String(value);
   if (/[",\r\n]/.test(text)) return `"${text.replaceAll('"', '""')}"`;
   return text;
+}
+
+/**
+ * Prompt, completion, and cached token totals for the same project, model,
+ * and time slice as `/api/summary`. Does not include budget or ledger rows.
+ */
+export function tokenMixFor(
+  db: Db,
+  config: Config,
+  url: URL,
+  range?: CreatedRange | null,
+): {
+  generatedAt: string;
+  scopeProject: string | null;
+  scopeModel: string | null;
+  scopeSince: string | null;
+  scopeUntil: string | null;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
+  requests: number;
+  cachedRequests: number;
+} {
+  const project = queryProject(url);
+  const model = queryModel(url);
+  return {
+    generatedAt: new Date().toISOString(),
+    scopeProject: project === undefined ? null : project,
+    scopeModel: model === undefined ? null : model,
+    scopeSince: range?.sinceIso ?? null,
+    scopeUntil: range?.untilIso ?? null,
+    ...loadTokenMix(db, project, model, range),
+  };
 }

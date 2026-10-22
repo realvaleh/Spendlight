@@ -432,6 +432,50 @@ export function roundUsd(n: number): number {
   return Math.round(n * 1e8) / 1e8;
 }
 
+export type TokenMixTotals = {
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
+  requests: number;
+  /** Rows whose stored `cached_tokens` is greater than zero. */
+  cachedRequests: number;
+};
+
+/**
+ * Sum the token columns already stored on the ledger. `cachedTokens` is the
+ * stored cache count, not recomputed from the price table. An empty slice is
+ * all zeros. Does not read or change reservations.
+ */
+export function loadTokenMix(
+  db: Db,
+  project?: string,
+  model?: string,
+  range?: CreatedRange | null,
+): TokenMixTotals {
+  const { clause, args } = requestWhere({ project, model }, range);
+  const row = db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(prompt_tokens), 0) AS promptTokens,
+         COALESCE(SUM(completion_tokens), 0) AS completionTokens,
+         COALESCE(SUM(cached_tokens), 0) AS cachedTokens,
+         COALESCE(SUM(total_tokens), 0) AS totalTokens,
+         COUNT(*) AS requests,
+         COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0) AS cachedRequests
+       FROM requests${clause}`,
+    )
+    .get(...args) as TokenMixTotals;
+  return {
+    promptTokens: Number(row.promptTokens) || 0,
+    completionTokens: Number(row.completionTokens) || 0,
+    cachedTokens: Number(row.cachedTokens) || 0,
+    totalTokens: Number(row.totalTokens) || 0,
+    requests: Number(row.requests) || 0,
+    cachedRequests: Number(row.cachedRequests) || 0,
+  };
+}
+
 export function releaseReservation(db: Db, reservationId: string | null): void {
   if (!reservationId) return;
   withImmediate(db, () => {
