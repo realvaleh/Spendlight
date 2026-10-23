@@ -307,7 +307,7 @@ Local README badge (only useful on a machine that can reach the proxy):
 ![spend](http://127.0.0.1:8787/badge.svg)
 ```
 
-Streaming chat completions: Spendlight sets `stream_options.include_usage` so a finished stream can log provider usage. If a running estimate hits the hard cap first, forwarding stops and the ledger records the partial estimate instead of waiting for the final SSE usage chunk.
+Streaming chat completions: Spendlight sets `stream_options.include_usage` so a finished stream can log provider usage. If a running estimate hits the hard cap first, forwarding stops and the ledger records the partial estimate instead of waiting for the final SSE usage chunk. A JSON body is recorded as a normal completion even when the client asked for a stream — the usual shape of a 429 or other error before any event stream starts, and of a gateway that ignores `stream`. The ledger keeps the HTTP status, `streamed` false, and the upstream error message (an OpenAI-style `error.message` when the body has one). That response is not charged a prompt estimate. A declared `text/event-stream` body is still a stream. The markdown receipt lists the error next to the status.
 
 ## Security (local proxy)
 
