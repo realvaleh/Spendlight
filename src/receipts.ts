@@ -46,13 +46,13 @@ export function receiptMarkdown(summary: Summary): string {
     ``,
     `## Recent requests`,
     ``,
-    `| When | Project | Model | Tokens | Cost | Status |`,
-    `| --- | --- | --- | ---: | ---: | ---: |`,
+    `| When | Project | Model | Tokens | Cost | Status | Error |`,
+    `| --- | --- | --- | ---: | ---: | ---: | --- |`,
     ...summary.recent
       .slice(0, 20)
       .map(
         (r) =>
-          `| ${r.createdAt} | ${r.project} | \`${r.model}\` | ${r.totalTokens} | ${fmt(r.costUsd)} | ${r.status} |`,
+          `| ${r.createdAt} | ${r.project} | \`${r.model}\` | ${r.totalTokens} | ${fmt(r.costUsd)} | ${r.status} | ${receiptError(r.error)} |`,
       ),
     ``,
     `_Logged by [Spendlight](https://github.com/realvaleh/Spendlight). Costs are estimates from the configured price table._`,
@@ -261,6 +261,12 @@ function statusLabel(summary: Summary): string {
   if (summary.budget.status === "hard") return "HARD KILL-SWITCH";
   if (summary.budget.status === "soft") return "SOFT WARNING";
   return "OK";
+}
+
+/** One table cell. Pipes would add a column; the ledger text is otherwise one line. */
+function receiptError(error: string | null): string {
+  if (!error) return "";
+  return error.replace(/\|/g, "\\|").replace(/`/g, "'");
 }
 
 function truncate(s: string, n: number): string {

@@ -140,7 +140,11 @@ export async function proxyRequest(
     }
 
     const contentType = upstream.headers.get("content-type") ?? "";
-    const streamed = stream || contentType.includes("text/event-stream");
+    // A client can set stream:true and still get JSON (a 429, or a gateway that
+    // ignored stream). Buffer those so the ledger keeps the status and error
+    // text, and so the prompt estimate is not charged. Declared event streams
+    // stay on the SSE path.
+    const streamed = responseIsStream(stream, upstream.status, contentType);
 
     if (streamed && upstream.body) {
       for (const key of Object.keys(outHeaders)) {
@@ -205,7 +209,7 @@ export async function proxyRequest(
         path: url.pathname,
         streamed: false,
         upstreamId,
-        error: upstream.ok ? null : buf.toString("utf8").slice(0, 500),
+        error: upstream.ok ? null : upstreamErrorText(buf.toString("utf8")),
         reservationId,
       });
       settled = true;
@@ -318,6 +322,64 @@ function completionCharsFromEvent(event: string): number {
     chars += completionCharsFromSseData(trimmed.slice(5).trim());
   }
   return chars;
+}
+
+/**
+ * True when the upstream body should be forwarded and logged as an event stream.
+ * JSON is never a stream, even if the client asked for one. A non-OK response
+ * that did not declare `text/event-stream` is buffered so its error is kept.
+ * A stream request with no content type and a 2xx status stays on the SSE path.
+ */
+export function responseIsStream(requestedStream: boolean, status: number, contentType: string): boolean {
+  const type = contentType.toLowerCase();
+  if (type.includes("text/event-stream")) return true;
+  if (isJsonContentType(type)) return false;
+  if (!requestedStream) return false;
+  return status >= 200 && status < 300;
+}
+
+function isJsonContentType(contentType: string): boolean {
+  const base = contentType.split(";")[0]?.trim().toLowerCase() ?? "";
+  return base === "application/json" || base === "text/json" || base.endsWith("+json");
+}
+
+const ERROR_TEXT_LIMIT = 500;
+
+/**
+ * Ledger text for a non-OK upstream body. Uses an OpenAI-style `error.message`
+ * when the body is JSON, otherwise the body itself, as one line.
+ */
+export function upstreamErrorText(body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return "";
+  const extracted = trimmed.length <= 8192 ? messageFromJson(trimmed) : null;
+  return clipError(extracted ?? trimmed);
+}
+
+function messageFromJson(text: string): string | null {
+  if (!text.startsWith("{") && !text.startsWith("[")) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const record = parsed as { error?: unknown; message?: unknown };
+  const nested = record.error;
+  if (nested && typeof nested === "object") {
+    const message = (nested as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message.trim();
+  }
+  if (typeof nested === "string" && nested.trim()) return nested.trim();
+  if (typeof record.message === "string" && record.message.trim()) return record.message.trim();
+  return null;
+}
+
+function clipError(text: string): string {
+  const oneLine = text.replace(/[\r\n\0]+/g, " ").trim();
+  if (oneLine.length <= ERROR_TEXT_LIMIT) return oneLine;
+  return `${oneLine.slice(0, ERROR_TEXT_LIMIT - 1)}…`;
 }
 
 function isMutating(method: string): boolean {
