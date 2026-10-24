@@ -20,13 +20,15 @@ export function estimateCostUsd(
   fallback: ModelPrice,
 ): { costUsd: number; matched: string | null } {
   const { price, matched } = lookupPrice(model, pricing, fallback);
-  const cached = Math.min(usage.cachedTokens, usage.promptTokens);
-  const uncachedPrompt = Math.max(0, usage.promptTokens - cached);
+  const promptTokens = nonNegative(usage.promptTokens);
+  const completionTokens = nonNegative(usage.completionTokens);
+  const cached = Math.min(nonNegative(usage.cachedTokens), promptTokens);
+  const uncachedPrompt = promptTokens - cached;
   const cachedRate = price.cachedInputPerMillion ?? price.inputPerMillion;
   const costUsd =
     (uncachedPrompt / 1_000_000) * price.inputPerMillion +
     (cached / 1_000_000) * cachedRate +
-    (usage.completionTokens / 1_000_000) * price.outputPerMillion;
+    (completionTokens / 1_000_000) * price.outputPerMillion;
   return { costUsd, matched };
 }
 
@@ -34,14 +36,31 @@ export function parseUsage(payload: unknown): Usage | null {
   if (!payload || typeof payload !== "object") return null;
   const usage = (payload as { usage?: Record<string, unknown> }).usage;
   if (!usage || typeof usage !== "object") return null;
-  const prompt = num(usage.prompt_tokens) ?? num(usage.input_tokens) ?? 0;
-  const completion = num(usage.completion_tokens) ?? num(usage.output_tokens) ?? 0;
-  const details = usage.prompt_tokens_details;
-  const cachedFromDetails =
-    details && typeof details === "object" ? num((details as { cached_tokens?: unknown }).cached_tokens) : undefined;
-  const cached = cachedFromDetails ?? num(usage.cached_tokens) ?? 0;
-  const total = num(usage.total_tokens) ?? prompt + completion;
+  const prompt = nonNegative(num(usage.prompt_tokens) ?? num(usage.input_tokens) ?? 0);
+  const completion = nonNegative(num(usage.completion_tokens) ?? num(usage.output_tokens) ?? 0);
+  // Chat completions report cache hits on prompt_tokens_details. The Responses
+  // API uses input_tokens_details for the same count. Prefer the chat field
+  // when it is present so the two are not added together.
+  const cached = nonNegative(
+    detailCachedTokens(usage.prompt_tokens_details) ??
+      detailCachedTokens(usage.input_tokens_details) ??
+      num(usage.cached_tokens) ??
+      0,
+  );
+  const reportedTotal = num(usage.total_tokens);
+  const total = nonNegative(reportedTotal == null || reportedTotal < 0 ? prompt + completion : reportedTotal);
   return { promptTokens: prompt, completionTokens: completion, cachedTokens: cached, totalTokens: total };
+}
+
+function detailCachedTokens(details: unknown): number | undefined {
+  if (!details || typeof details !== "object") return undefined;
+  return num((details as { cached_tokens?: unknown }).cached_tokens);
+}
+
+/** Token counts below zero are not usage. They must not credit the ledger. */
+function nonNegative(n: number): number {
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return n;
 }
 
 function num(v: unknown): number | undefined {

@@ -54,7 +54,7 @@ A single Node process that:
    OPENAI_BASE_URL           SPENDLIGHT_DB
 ```
 
-Pricing is a local table (sane OpenAI defaults, overridable in `spendlight.config.json`). Unknown models use a conservative fallback price. Costs are **estimates**, not provider invoices.
+Pricing is a local table (sane OpenAI defaults, overridable in `spendlight.config.json`). Unknown models use a conservative fallback price. Costs are **estimates**, not provider invoices. Cached input is read from `prompt_tokens_details.cached_tokens` on chat completions, or from `input_tokens_details.cached_tokens` on the Responses API, and priced at `cachedInputPerMillion` when that rate is set. A negative token count is treated as zero, so a bad usage payload cannot credit the ledger.
 
 Tag traffic with `x-spendlight-project` (or `x-spendlight-tag`, `?project=`, or `spendlight_project` in the JSON body). That is the budget bucket. Tags are labels, not authentication.
 
