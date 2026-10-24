@@ -7,7 +7,7 @@ import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } f
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
-import { estimateCostUsd } from "./pricing.js";
+import { estimateCostUsd, parseUsage } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
@@ -122,6 +122,32 @@ async function main(): Promise<void> {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(body);
       }
+      return;
+    }
+    if (url.pathname === "/responses" || url.pathname === "/v1/responses") {
+      const negative = payload.usageMode === "negative";
+      const usage = negative
+        ? {
+            input_tokens: -1_000_000,
+            output_tokens: -20,
+            total_tokens: -1_000_020,
+            input_tokens_details: { cached_tokens: -500 },
+          }
+        : {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            total_tokens: 1_000_000,
+            input_tokens_details: { cached_tokens: 800_000 },
+          };
+      const body = JSON.stringify({
+        id: negative ? "resp_negative" : "resp_cached",
+        object: "response",
+        model: "gpt-4o-mini",
+        output: [],
+        usage,
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(body);
       return;
     }
     if (url.pathname === "/models" || url.pathname === "/v1/models") {
@@ -364,8 +390,9 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testCachedUsage(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, cached usage");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -438,6 +465,150 @@ async function testBoundedRace(dir: string, mockUrl: string): Promise<void> {
     );
     assert(again.status === 200, `hold should release after settle, got ${again.status}`);
     await again.text();
+  });
+}
+
+function testUsageMath(): void {
+  const chat = parseUsage({
+    usage: {
+      prompt_tokens: 100_000,
+      completion_tokens: 0,
+      total_tokens: 100_000,
+      prompt_tokens_details: { cached_tokens: 80_000 },
+    },
+  });
+  assert(chat != null, "chat usage should parse");
+  assert(chat.cachedTokens === 80_000, `chat cached ${chat.cachedTokens}`);
+  const chatCost = estimateCostUsd("gpt-4o-mini", chat, DEFAULT_PRICING, DEFAULT_FALLBACK).costUsd;
+  assert(Math.abs(chatCost - 0.009) < 1e-9, `chat cached cost ${chatCost}`);
+
+  const responses = parseUsage({
+    usage: {
+      input_tokens: 1_000_000,
+      output_tokens: 0,
+      total_tokens: 1_000_000,
+      input_tokens_details: { cached_tokens: 800_000 },
+    },
+  });
+  assert(responses != null, "responses usage should parse");
+  assert(responses.promptTokens === 1_000_000, `responses prompt ${responses.promptTokens}`);
+  assert(responses.cachedTokens === 800_000, `responses cached ${responses.cachedTokens}`);
+  const responsesCost = estimateCostUsd("gpt-4o-mini", responses, DEFAULT_PRICING, DEFAULT_FALLBACK).costUsd;
+  // 200k uncached at $0.15/M + 800k cached at $0.075/M. Full input price would be $0.15.
+  assert(Math.abs(responsesCost - 0.09) < 1e-9, `responses cached cost ${responsesCost}`);
+
+  const both = parseUsage({
+    usage: {
+      prompt_tokens: 100,
+      completion_tokens: 0,
+      total_tokens: 100,
+      prompt_tokens_details: { cached_tokens: 40 },
+      input_tokens_details: { cached_tokens: 90 },
+    },
+  });
+  assert(both?.cachedTokens === 40, `chat cache should win, got ${both?.cachedTokens}`);
+
+  const explicitZero = parseUsage({
+    usage: {
+      prompt_tokens: 100,
+      prompt_tokens_details: { cached_tokens: 0 },
+      input_tokens_details: { cached_tokens: 90 },
+    },
+  });
+  assert(explicitZero?.cachedTokens === 0, `explicit zero cache should stay zero, got ${explicitZero?.cachedTokens}`);
+
+  const asStrings = parseUsage({
+    usage: {
+      input_tokens: "1000",
+      output_tokens: "10",
+      input_tokens_details: { cached_tokens: "250" },
+    },
+  });
+  assert(
+    asStrings?.promptTokens === 1000 && asStrings.completionTokens === 10 && asStrings.cachedTokens === 250,
+    `string usage ${JSON.stringify(asStrings)}`,
+  );
+  assert(asStrings?.totalTokens === 1010, `string total ${asStrings?.totalTokens}`);
+
+  const negative = parseUsage({
+    usage: {
+      input_tokens: -1_000_000,
+      output_tokens: -20,
+      total_tokens: -1_000_020,
+      input_tokens_details: { cached_tokens: -500 },
+    },
+  });
+  assert(
+    negative?.promptTokens === 0 &&
+      negative.completionTokens === 0 &&
+      negative.cachedTokens === 0 &&
+      negative.totalTokens === 0,
+    `negative usage ${JSON.stringify(negative)}`,
+  );
+  const credit = estimateCostUsd(
+    "gpt-4o-mini",
+    { promptTokens: -1_000_000, completionTokens: -20, cachedTokens: -500, totalTokens: -1_000_020 },
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  ).costUsd;
+  assert(credit === 0, `negative usage credited the ledger (${credit})`);
+  assert(parseUsage({}) == null, "missing usage should stay null");
+  assert(parseUsage({ usage: null }) == null, "null usage should stay null");
+}
+
+async function testCachedUsage(dir: string, mockUrl: string): Promise<void> {
+  testUsageMath();
+  await withApp(dir, "cached-usage", mockUrl, { softUsd: null, hardUsd: 10 }, async (base) => {
+    const cached = await fetch(`${base}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-spendlight-project": "demo" },
+      body: JSON.stringify({ model: "gpt-4o-mini", input: "hello" }),
+    });
+    assert(cached.status === 200, `responses status ${cached.status}`);
+    const cachedHeader = Number(cached.headers.get("x-spendlight-cost-usd"));
+    assert(Math.abs(cachedHeader - 0.09) < 1e-9, `responses cost header ${cachedHeader}`);
+    await cached.text();
+
+    const negative = await fetch(`${base}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-spendlight-project": "demo" },
+      body: JSON.stringify({ model: "gpt-4o-mini", input: "hello", usageMode: "negative" }),
+    });
+    assert(negative.status === 200, `negative responses status ${negative.status}`);
+    const negativeHeader = Number(negative.headers.get("x-spendlight-cost-usd"));
+    assert(negativeHeader === 0, `negative usage cost header ${negativeHeader}`);
+    await negative.text();
+
+    const summary = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+      spendUsd: number;
+      requests: number;
+      budget: { status: string; globalSpend: number; allowed?: boolean };
+      recent: {
+        path: string;
+        promptTokens: number;
+        completionTokens: number;
+        cachedTokens: number;
+        totalTokens: number;
+        costUsd: number;
+        upstreamId: string | null;
+      }[];
+    };
+    assert(summary.requests === 2, `cached usage logged ${summary.requests} rows`);
+    assert(Math.abs(summary.spendUsd - 0.09) < 1e-9, `cached usage spend ${summary.spendUsd}`);
+    assert(Math.abs(summary.budget.globalSpend - 0.09) < 1e-9, `kill-switch spend ${summary.budget.globalSpend}`);
+    assert(summary.budget.status === "ok", `negative usage changed budget status ${summary.budget.status}`);
+
+    const credit = summary.recent.find((row) => row.upstreamId === "resp_negative");
+    assert(credit != null, "negative usage row missing");
+    assert(credit.path === "/v1/responses", `negative path ${credit.path}`);
+    assert(
+      credit.promptTokens === 0 && credit.completionTokens === 0 && credit.cachedTokens === 0 && credit.costUsd === 0,
+      `negative row ${JSON.stringify(credit)}`,
+    );
+    const hit = summary.recent.find((row) => row.upstreamId === "resp_cached");
+    assert(hit != null, "cached responses row missing");
+    assert(hit.cachedTokens === 800_000 && hit.promptTokens === 1_000_000, `cached row ${JSON.stringify(hit)}`);
+    assert(Math.abs(hit.costUsd - 0.09) < 1e-9, `cached row cost ${hit.costUsd}`);
   });
 }
 
