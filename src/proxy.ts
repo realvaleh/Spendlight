@@ -94,7 +94,7 @@ export async function proxyRequest(
     }
   }
 
-  const upstreamUrl = joinUpstream(config.upstreamBaseUrl, url.pathname, url.search);
+  const upstreamUrl = joinUpstream(config.upstreamBaseUrl, url.pathname, upstreamSearch(url.search));
   const headers = forwardHeaders(req, config, outboundBody.length);
   const ac = new AbortController();
   let settled = false;
@@ -361,6 +361,30 @@ function logCompleted(args: {
     path: args.path,
     streamed: args.streamed,
   });
+}
+
+const SPENDLIGHT_QUERY_KEYS = new Set(["project", "tag"]);
+
+/**
+ * Query string to forward. `project` and `tag` select a Spendlight budget
+ * bucket (the same labels as the headers) and are not part of the provider API.
+ * Other parameters are forwarded unchanged, including their original encoding.
+ */
+export function upstreamSearch(search: string): string {
+  if (!search || search === "?") return "";
+  const raw = search.startsWith("?") ? search.slice(1) : search;
+  const kept = raw.split("&").filter((part) => {
+    if (!part) return false;
+    const name = part.split("=", 1)[0] ?? "";
+    let key = name;
+    try {
+      key = decodeURIComponent(name.replace(/\+/g, " "));
+    } catch {
+      key = name;
+    }
+    return !SPENDLIGHT_QUERY_KEYS.has(key);
+  });
+  return kept.length ? `?${kept.join("&")}` : "";
 }
 
 export function joinUpstream(base: string, pathname: string, search = ""): string {

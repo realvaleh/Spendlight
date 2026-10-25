@@ -12,11 +12,11 @@ Swap the base URL. That is the whole integration.
 
 A single Node process that:
 
-1. Speaks the OpenAI Chat Completions API at `/v1/chat/completions` (other `/v1/*` paths pass through).
+1. Speaks an OpenAI-compatible `/v1` API. Chat completions, legacy completions, embeddings, and responses are priced into the ledger. Every other `/v1/*` path is forwarded and still stops at a hard budget, but it is not priced.
 2. Forwards to any OpenAI-compatible upstream (`OPENAI_BASE_URL` + `OPENAI_API_KEY`).
 3. Writes a spend ledger (model, tokens, estimated USD, project tag, timestamp, request id).
 4. Warns on a **soft** budget and rejects further mutating `/v1` calls with **402** when a **hard** budget is hit.
-5. Serves a one-page dashboard, Markdown + SVG receipts, and a README badge.
+5. Serves a dashboard at `/` and `/dashboard`, Markdown and SVG receipts, a README badge, `/api/summary`, and CSV and JSON ledger exports. `GET /health` returns `{ "ok": true, "service": "spendlight" }`.
 
 ## What it isn’t (v1 non-goals)
 
@@ -98,7 +98,7 @@ npm install
 npm start                     # http://127.0.0.1:8787
 ```
 
-CLI flags: `spendlight --config ./spendlight.config.json --port 8787`
+CLI flags: `spendlight --config ./spendlight.config.json --host 127.0.0.1 --port 8787 --db ./data/spendlight.db` (`-h` / `--help`, `-v` / `--version`).
 
 ## Quickstart
 
@@ -132,6 +132,51 @@ await openai.chat.completions.create({
   messages: [{ role: "user", content: "hi" }],
 });
 ```
+
+## Pricing
+
+Costs are estimates from a local table, not a provider invoice. Each model has a USD price per 1,000,000 tokens:
+
+```
+uncached prompt × inputPerMillion
++ cached prompt × (cachedInputPerMillion, or inputPerMillion when that rate is unset)
++ completion × outputPerMillion
+```
+
+Cached tokens are capped at the prompt count, so one token is not billed twice. Chat completions read the cache count from `usage.prompt_tokens_details.cached_tokens` when that field is present. Prompt and completion counts accept `prompt_tokens` / `completion_tokens`, or `input_tokens` / `output_tokens`.
+
+A model id uses an exact table row, or else the longest configured id that is a prefix of it. `gpt-4o-mini-2024-07-18` uses `gpt-4o-mini`, not the shorter `gpt-4o`. An id that matches nothing uses `fallbackPrice`: **5** input, **15** output, and **0.5** cached per million tokens. Override `fallbackPrice` in `spendlight.config.json` to change that.
+
+`pricing` overrides one model at a time. A field you omit keeps the built-in rate. A model id that is not in the built-in table uses the fallback input and output rates for fields you omit, and has no separate cache rate unless you set `cachedInputPerMillion` (cached tokens are then billed at that model's input rate).
+
+```bash
+curl http://127.0.0.1:8787/v1/embeddings \
+  -H "content-type: application/json" \
+  -H "x-spendlight-project: demo" \
+  -d '{"model":"text-embedding-3-small","input":"hi"}'
+```
+
+Defaults (USD per 1M tokens). `—` means no cached rate; those tokens use the input rate. Embedding output rates are 0.
+
+| Model | inputPerMillion | outputPerMillion | cachedInputPerMillion |
+| --- | ---: | ---: | ---: |
+| `gpt-4o-mini` | 0.15 | 0.6 | 0.075 |
+| `gpt-4o` | 2.5 | 10 | 1.25 |
+| `gpt-4.1-nano` | 0.1 | 0.4 | 0.025 |
+| `gpt-4.1-mini` | 0.4 | 1.6 | 0.1 |
+| `gpt-4.1` | 2 | 8 | 0.5 |
+| `gpt-5-mini` | 0.25 | 2 | 0.025 |
+| `gpt-5` | 1.25 | 10 | 0.125 |
+| `gpt-5.6` | 5 | 30 | 0.5 |
+| `o4-mini` | 1.1 | 4.4 | 0.275 |
+| `o3-mini` | 1.1 | 4.4 | 0.55 |
+| `o3` | 2 | 8 | 0.5 |
+| `o1-mini` | 1.1 | 4.4 | 0.55 |
+| `o1` | 15 | 60 | 7.5 |
+| `gpt-3.5-turbo` | 0.5 | 1.5 | — |
+| `text-embedding-3-small` | 0.02 | 0 | — |
+| `text-embedding-3-large` | 0.13 | 0 | — |
+| *(fallback)* | 5 | 15 | 0.5 |
 
 ## Budgets
 
@@ -203,7 +248,7 @@ export SPENDLIGHT_BUDGET_TIMEZONE=America/New_York
 
 Env overrides the file. An invalid timezone fails startup instead of quietly using UTC. If `period` is `day`, `week`, or `month` and no timezone is set, Spendlight warns and uses UTC. Any other period fails startup.
 
-Tag the bucket on every call:
+Tag the bucket on every call. `x-spendlight-tag` is an alias of `x-spendlight-project`, and `?tag=` is an alias of `?project=`.
 
 ```bash
 # header (preferred)
@@ -219,14 +264,16 @@ curl "http://127.0.0.1:8787/v1/chat/completions?project=demo" ...
 curl ... -d '{"model":"gpt-4o-mini","spendlight_project":"demo","messages":[...]}'
 ```
 
+`spendlight_project` is removed from the JSON body before forwarding. `project` and `tag` are removed from the query string. Other query parameters are forwarded unchanged.
+
 Mutating priced calls take a SQLite `BEGIN IMMEDIATE` reservation before upstream: the preflight estimate when `max_tokens` / `max_completion_tokens` is set, otherwise the remaining hard headroom. That hold counts toward the hard cap until the call settles to **actual** usage, so a concurrent request sees the in-flight hold. A single call can still finish above the cap when real usage exceeds the estimate; the ledger stores that actual cost. Streaming chats stop forwarding once a running token estimate reaches the reserved amount. A finished stream logs provider usage; a cut stream logs the partial estimate. Reservations older than 15 minutes are dropped so a crash cannot wedge the kill-switch.
 
-Hard-limit responses look like OpenAI errors:
+Hard-limit responses look like OpenAI errors. Amounts from one cent up to $1 are printed to four decimal places (`$0.0450` / `$0.0400` for the 100k + 50k `gpt-4o-mini` estimate against a $0.04 cap). $1 and above use two decimal places. Amounts under one cent use six.
 
 ```json
 {
   "error": {
-    "message": "Spendlight hard budget exceeded (global 'global'): $0.045 / $0.040. Kill-switch is on; further completions are rejected.",
+    "message": "Spendlight hard budget exceeded (global 'global'): $0.0450 / $0.0400. Kill-switch is on; further completions are rejected.",
     "type": "spendlight_budget_exceeded",
     "code": "budget_hard_limit"
   }
@@ -325,6 +372,7 @@ Spendlight is a **localhost reverse proxy that can spend your API key**. Treat t
 | --- | --- | --- |
 | `OPENAI_API_KEY` | — | Upstream key if the client does not send `Authorization` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Upstream OpenAI-compatible base |
+| `SPENDLIGHT_UPSTREAM_URL` | — | Same as `OPENAI_BASE_URL` when that variable is unset |
 | `SPENDLIGHT_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` inside Docker) |
 | `SPENDLIGHT_PORT` | `8787` | Listen port |
 | `SPENDLIGHT_DB` | `./data/spendlight.db` | SQLite path (`/data/spendlight.db` in Docker) |
@@ -336,7 +384,7 @@ Spendlight is a **localhost reverse proxy that can spend your API key**. Treat t
 
 ## Smoke test
 
-Proves logging + kill-switch against a **mock** upstream (no paid call):
+Proves logging and the kill-switch against a **mock** upstream (no paid call), and checks pricing, the ledger, budgets, summaries, and exports:
 
 ```bash
 npm test

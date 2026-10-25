@@ -120,10 +120,15 @@ export function loadConfig(explicitPath?: string): Config {
 
   const pricing = { ...DEFAULT_PRICING };
   for (const [model, price] of Object.entries(file.pricing ?? {})) {
+    // Omitted fields keep the built-in rate. A new id uses the unknown-model
+    // price for input and output. An omitted cache rate stays unset (bill at
+    // the input rate) when that model has no built-in cache rate.
+    const base = pricing[model];
     pricing[model] = {
-      inputPerMillion: Number(price.inputPerMillion ?? DEFAULT_FALLBACK.inputPerMillion),
-      outputPerMillion: Number(price.outputPerMillion ?? DEFAULT_FALLBACK.outputPerMillion),
-      cachedInputPerMillion: price.cachedInputPerMillion == null ? undefined : Number(price.cachedInputPerMillion),
+      inputPerMillion: Number(price.inputPerMillion ?? base?.inputPerMillion ?? DEFAULT_FALLBACK.inputPerMillion),
+      outputPerMillion: Number(price.outputPerMillion ?? base?.outputPerMillion ?? DEFAULT_FALLBACK.outputPerMillion),
+      cachedInputPerMillion:
+        price.cachedInputPerMillion == null ? base?.cachedInputPerMillion : Number(price.cachedInputPerMillion),
     };
   }
 
