@@ -1,9 +1,11 @@
+import { spawnSync } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
-import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
+import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl, SpendlightStartupError } from "./config.js";
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
@@ -343,6 +345,7 @@ async function main(): Promise<void> {
     testCalendarWeekBounds();
     testCalendarMonthBounds();
     testBudgetConfig(dir);
+    testStartupFiles(dir);
     testDayLedgerWindow(dir);
     testWeekLedgerWindow(dir);
     testMonthLedgerWindow(dir);
@@ -365,7 +368,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, config and ledger startup errors");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2791,6 +2794,165 @@ async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise
     const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
     assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
   });
+}
+
+function testStartupFiles(dir: string): void {
+  const savedConfig = process.env.SPENDLIGHT_CONFIG;
+  try {
+    delete process.env.SPENDLIGHT_CONFIG;
+    if (!existsSync(resolve("spendlight.config.json"))) {
+      const none = loadConfig();
+      assert(none.configPath === null, `missing default config should stay unset, got ${none.configPath}`);
+      assert(none.budgets.global.hardUsd === null, "missing default config invented a hard budget");
+    }
+
+    process.env.SPENDLIGHT_CONFIG = "   ";
+    const blank = loadConfig();
+    assert(blank.configPath === null, `blank SPENDLIGHT_CONFIG should be unset, got ${blank.configPath}`);
+    assert(blank.budgets.global.hardUsd === null, "blank config invented a hard budget");
+    delete process.env.SPENDLIGHT_CONFIG;
+
+    const missing = join(dir, "missing-config.json");
+    const missingErr = startupError(() => loadConfig(missing));
+    assert(missingErr.message === `Spendlight config not found: ${missing}`, missingErr.message);
+
+    process.env.SPENDLIGHT_CONFIG = missing;
+    const envMissing = startupError(() => loadConfig());
+    assert(envMissing.message === `Spendlight config not found: ${missing}`, envMissing.message);
+    delete process.env.SPENDLIGHT_CONFIG;
+
+    const bad = join(dir, "bad-config.json");
+    writeFileSync(bad, "{\n");
+    const badErr = startupError(() => loadConfig(bad));
+    assert(badErr.message.includes(`Spendlight could not parse config ${bad}`), badErr.message);
+    assert(badErr.message.includes("JSON"), badErr.message);
+    assert(!badErr.message.includes("\n    at "), badErr.message);
+
+    const empty = join(dir, "empty-config.json");
+    writeFileSync(empty, " \n");
+    const emptyErr = startupError(() => loadConfig(empty));
+    assert(emptyErr.message === `Spendlight could not parse config ${empty}: file is empty.`, emptyErr.message);
+
+    const bom = join(dir, "bom-config.json");
+    writeFileSync(bom, `\uFEFF${JSON.stringify({ budgets: { global: { hardUsd: 1.5 } } })}`);
+    const bomCfg = loadConfig(bom);
+    assert(bomCfg.budgets.global.hardUsd === 1.5, `BOM config hard budget ${bomCfg.budgets.global.hardUsd}`);
+
+    for (const body of ["null", "[]", '"hello"', "1", "true"]) {
+      const path = join(dir, `shape-${body.length}-${body.charCodeAt(0)}.json`);
+      writeFileSync(path, body);
+      const shapeErr = startupError(() => loadConfig(path));
+      assert(shapeErr.message === `Spendlight config ${path} must be a JSON object.`, shapeErr.message);
+    }
+
+    const cfgDir = join(dir, "config-is-dir");
+    mkdirSync(cfgDir);
+    const dirErr = startupError(() => loadConfig(cfgDir));
+    assert(dirErr.message === `Spendlight could not read config ${cfgDir}: path is a directory (EISDIR)`, dirErr.message);
+
+    if (process.getuid?.() !== 0) {
+      const secret = join(dir, "unreadable-config.json");
+      writeFileSync(secret, JSON.stringify({ port: 9 }));
+      chmodSync(secret, 0);
+      try {
+        const unread = startupError(() => loadConfig(secret));
+        assert(
+          unread.message === `Spendlight could not read config ${secret}: permission denied (EACCES)`,
+          unread.message,
+        );
+      } finally {
+        chmodSync(secret, 0o644);
+      }
+    }
+
+    const ok = join(dir, "ok-config.json");
+    writeFileSync(ok, JSON.stringify({ budgets: { global: { hardUsd: 3 } } }));
+    const loaded = loadConfig(ok);
+    assert(loaded.budgets.global.hardUsd === 3, `valid config hard budget ${loaded.budgets.global.hardUsd}`);
+    assert(loaded.configPath === ok, `config path ${loaded.configPath}`);
+
+    const freshPath = join(dir, "fresh-ledger", "spendlight.db");
+    const fresh = openDb(freshPath);
+    try {
+      const row = fresh.prepare("SELECT COUNT(*) AS n FROM requests").get() as { n: number };
+      assert(row.n === 0, "fresh ledger should be empty and queryable");
+    } finally {
+      closeDb(fresh);
+    }
+    closeDb(openDb(":memory:"));
+
+    const garbage = join(dir, "garbage.db");
+    writeFileSync(garbage, "this is not sqlite");
+    const garbageErr = startupError(() => openDb(garbage));
+    assert(
+      garbageErr.message === `Spendlight could not open the ledger at ${garbage}: file is not a database`,
+      garbageErr.message,
+    );
+
+    const dbDir = join(dir, "ledger-is-dir");
+    mkdirSync(dbDir);
+    const dbDirErr = startupError(() => openDb(dbDir));
+    assert(dbDirErr.message === `Spendlight could not open the ledger at ${dbDir}: path is a directory`, dbDirErr.message);
+
+    if (process.getuid?.() !== 0) {
+      const locked = join(dir, "locked.db");
+      writeFileSync(locked, "not a database");
+      chmodSync(locked, 0);
+      try {
+        const lockedErr = startupError(() => openDb(locked));
+        assert(
+          lockedErr.message === `Spendlight could not open the ledger at ${locked}: permission denied (EACCES)`,
+          lockedErr.message,
+        );
+      } finally {
+        chmodSync(locked, 0o644);
+      }
+    }
+
+    const cliEnv: NodeJS.ProcessEnv = { ...process.env, NODE_NO_WARNINGS: "1" };
+    delete cliEnv.SPENDLIGHT_CONFIG;
+    delete cliEnv.SPENDLIGHT_DB;
+    delete cliEnv.SPENDLIGHT_PORT;
+    delete cliEnv.SPENDLIGHT_HOST;
+
+    const missingCli = spawnCli(["--config", missing], cliEnv);
+    assert(missingCli.status === 1, `missing config exit ${missingCli.status}\n${missingCli.stderr}`);
+    assert(missingCli.stderr.trim() === `Spendlight config not found: ${missing}`, JSON.stringify(missingCli.stderr));
+    assert(!missingCli.stdout.includes("listening"), missingCli.stdout);
+
+    const ledgerConfig = join(dir, "ledger-cli.json");
+    writeFileSync(ledgerConfig, JSON.stringify({ host: "127.0.0.1", port: 0, dbPath: garbage }));
+    const ledgerCli = spawnCli(["--config", ledgerConfig], cliEnv);
+    assert(ledgerCli.status === 1, `bad ledger exit ${ledgerCli.status}\n${ledgerCli.stderr}`);
+    assert(
+      ledgerCli.stderr.trim() === `Spendlight could not open the ledger at ${garbage}: file is not a database`,
+      JSON.stringify(ledgerCli.stderr),
+    );
+    assert(!ledgerCli.stdout.includes("listening"), ledgerCli.stdout);
+  } finally {
+    if (savedConfig == null) delete process.env.SPENDLIGHT_CONFIG;
+    else process.env.SPENDLIGHT_CONFIG = savedConfig;
+  }
+}
+
+function startupError(fn: () => unknown): SpendlightStartupError {
+  try {
+    fn();
+  } catch (err) {
+    assert(err instanceof SpendlightStartupError, err instanceof Error ? `${err.name}: ${err.message}` : String(err));
+    return err;
+  }
+  fail("expected a startup error");
+}
+
+function spawnCli(args: string[], env: NodeJS.ProcessEnv): { status: number | null; stdout: string; stderr: string } {
+  const indexJs = fileURLToPath(new URL("./index.js", import.meta.url));
+  const result = spawnSync(process.execPath, [indexJs, ...args], {
+    encoding: "utf8",
+    env,
+    timeout: 15_000,
+  });
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
 function readReq(req: IncomingMessage): Promise<string> {

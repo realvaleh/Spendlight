@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { HELP, isWildcardBind, loadConfig, parseArgs } from "./config.js";
+import { HELP, isWildcardBind, loadConfig, parseArgs, SpendlightStartupError } from "./config.js";
 import { createApp, listen } from "./server.js";
 
 const args = parseArgs(process.argv.slice(2));
@@ -12,8 +12,20 @@ if (args.version) {
   process.exit(0);
 }
 
-const config = loadConfig(args.configPath);
-const app = createApp(config);
+function startup<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof SpendlightStartupError) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    throw err;
+  }
+}
+
+const config = startup(() => loadConfig(args.configPath));
+const app = startup(() => createApp(config));
 const url = await listen(app);
 
 console.log(`Spendlight listening on ${url}`);
