@@ -3,6 +3,35 @@ import { resolve } from "node:path";
 import { assertIanaTimeZone } from "./day.js";
 import type { BudgetLimit, BudgetPeriod, Config, ModelPrice } from "./types.js";
 
+/**
+ * Config or ledger cannot be used. The CLI prints `message` and exits
+ * without a stack trace. Other startup failures still surface as usual.
+ */
+export class SpendlightStartupError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "SpendlightStartupError";
+  }
+}
+
+export function ioErrorCode(err: unknown): string | undefined {
+  if (err && typeof err === "object" && "code" in err && typeof (err as { code?: unknown }).code === "string") {
+    return (err as { code: string }).code;
+  }
+  return undefined;
+}
+
+/** Short reason for a filesystem failure, without a second copy of the path. */
+export function formatStartupIoError(err: unknown): string {
+  const code = ioErrorCode(err);
+  if (code === "EACCES" || code === "EPERM") return `permission denied (${code})`;
+  if (code === "EISDIR") return "path is a directory (EISDIR)";
+  if (code === "ENOTDIR") return "part of the path is not a directory (ENOTDIR)";
+  if (code === "ENOENT") return "file not found (ENOENT)";
+  if (err instanceof Error && err.message) return err.message;
+  return String(err);
+}
+
 /** Default USD prices per 1M tokens. Overridable via spendlight.config.json. */
 export const DEFAULT_PRICING: Record<string, ModelPrice> = {
   "gpt-4o-mini": { inputPerMillion: 0.15, outputPerMillion: 0.6, cachedInputPerMillion: 0.075 },
@@ -107,16 +136,55 @@ export function parseArgs(argv: string[]): { configPath?: string; help?: boolean
   return out;
 }
 
+/**
+ * `--config` wins, then `SPENDLIGHT_CONFIG`. A blank value means no file.
+ * When neither is set, `./spendlight.config.json` is used only if it exists.
+ */
+function resolveConfigPath(explicitPath?: string): string | null {
+  const requested = explicitPath !== undefined ? explicitPath : process.env.SPENDLIGHT_CONFIG;
+  if (requested != null) {
+    const trimmed = requested.trim();
+    return trimmed === "" ? null : trimmed;
+  }
+  const fallback = resolve("spendlight.config.json");
+  return existsSync(fallback) ? fallback : null;
+}
+
+function readConfigObject(configPath: string): FileConfig {
+  const resolved = resolve(configPath);
+  let text: string;
+  try {
+    text = readFileSync(resolved, "utf8");
+  } catch (err) {
+    if (ioErrorCode(err) === "ENOENT") {
+      throw new SpendlightStartupError(`Spendlight config not found: ${resolved}`);
+    }
+    throw new SpendlightStartupError(`Spendlight could not read config ${resolved}: ${formatStartupIoError(err)}`, {
+      cause: err,
+    });
+  }
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  if (text.trim() === "") {
+    throw new SpendlightStartupError(`Spendlight could not parse config ${resolved}: file is empty.`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new SpendlightStartupError(`Spendlight could not parse config ${resolved}: ${detail}`, { cause: err });
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new SpendlightStartupError(`Spendlight config ${resolved} must be a JSON object.`);
+  }
+  return parsed as FileConfig;
+}
+
 export function loadConfig(explicitPath?: string): Config {
-  const configPath =
-    explicitPath ??
-    process.env.SPENDLIGHT_CONFIG ??
-    (existsSync(resolve("spendlight.config.json")) ? resolve("spendlight.config.json") : null);
+  const configPath = resolveConfigPath(explicitPath);
 
   let file: FileConfig = {};
-  if (configPath && existsSync(configPath)) {
-    file = JSON.parse(readFileSync(configPath, "utf8")) as FileConfig;
-  }
+  if (configPath) file = readConfigObject(configPath);
 
   const pricing = { ...DEFAULT_PRICING };
   for (const [model, price] of Object.entries(file.pricing ?? {})) {
@@ -187,6 +255,11 @@ Env:
   SPENDLIGHT_HARD_BUDGET_USD     Global hard budget (kill-switch)
   SPENDLIGHT_BUDGET_PERIOD       lifetime (default), day, week, or month
   SPENDLIGHT_BUDGET_TIMEZONE     IANA zone when period is day, week, or month (e.g. America/New_York)
+
+A --config path or SPENDLIGHT_CONFIG that is missing, unreadable, or not a JSON object
+stops startup. A ledger path that is unreadable, a directory, or not a SQLite database
+stops startup. With neither config setting set, ./spendlight.config.json is read when
+that file exists.
 
 Bind to 127.0.0.1 (the default). The dashboard, receipts, and /api/summary have no auth.
 `;

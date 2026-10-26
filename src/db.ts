@@ -1,7 +1,8 @@
-import { mkdirSync } from "node:fs";
+import { accessSync, constants, mkdirSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { formatStartupIoError, ioErrorCode, SpendlightStartupError } from "./config.js";
 import { calendarDayKey, shiftCalendarDay } from "./day.js";
 import type { LedgerRow, Usage } from "./types.js";
 
@@ -9,13 +10,12 @@ export type Db = DatabaseSync;
 
 export function openDb(dbPath: string): Db {
   const absolute = dbPath === ":memory:" ? dbPath : resolve(dbPath);
-  if (absolute !== ":memory:") {
-    mkdirSync(dirname(absolute), { recursive: true });
-  }
-  const db = new DatabaseSync(absolute);
-  db.exec("PRAGMA journal_mode = WAL;");
-  db.exec("PRAGMA foreign_keys = ON;");
-  db.exec(`
+  try {
+    if (absolute !== ":memory:") prepareLedgerPath(absolute);
+    const db = new DatabaseSync(absolute);
+    db.exec("PRAGMA journal_mode = WAL;");
+    db.exec("PRAGMA foreign_keys = ON;");
+    db.exec(`
     CREATE TABLE IF NOT EXISTS requests (
       id TEXT PRIMARY KEY,
       created_at TEXT NOT NULL,
@@ -48,7 +48,45 @@ export function openDb(dbPath: string): Db {
       cost_usd REAL NOT NULL
     );
   `);
-  return db;
+    return db;
+  } catch (err) {
+    if (err instanceof SpendlightStartupError) throw err;
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new SpendlightStartupError(`Spendlight could not open the ledger at ${absolute}: ${detail}`, { cause: err });
+  }
+}
+
+function prepareLedgerPath(absolute: string): void {
+  try {
+    mkdirSync(dirname(absolute), { recursive: true });
+  } catch (err) {
+    throw new SpendlightStartupError(`Spendlight could not open the ledger at ${absolute}: ${formatStartupIoError(err)}`, {
+      cause: err,
+    });
+  }
+  let info: ReturnType<typeof statSync>;
+  try {
+    info = statSync(absolute);
+  } catch (err) {
+    if (ioErrorCode(err) === "ENOENT") return;
+    throw new SpendlightStartupError(`Spendlight could not open the ledger at ${absolute}: ${formatStartupIoError(err)}`, {
+      cause: err,
+    });
+  }
+  if (info.isDirectory()) {
+    throw new SpendlightStartupError(`Spendlight could not open the ledger at ${absolute}: path is a directory`);
+  }
+  try {
+    accessSync(absolute, constants.R_OK | constants.W_OK);
+  } catch (err) {
+    const code = ioErrorCode(err);
+    if (code === "EACCES" || code === "EPERM") {
+      throw new SpendlightStartupError(`Spendlight could not open the ledger at ${absolute}: permission denied (${code})`, {
+        cause: err,
+      });
+    }
+    throw err;
+  }
 }
 
 /** Drop in-flight holds left behind by a crashed process so they cannot wedge the kill-switch. */
