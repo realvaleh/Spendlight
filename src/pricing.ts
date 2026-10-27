@@ -101,10 +101,15 @@ export function preflightFromBody(
   }
   const promptTokens = roughTokens(promptChars);
   const embeddings = pathname.endsWith("/embeddings");
+  const responses = pathname.endsWith("/responses");
   let outputTokens = 0;
   let outputBounded = embeddings;
   if (!embeddings && body) {
-    const cap = finiteNum(body.max_completion_tokens) ?? finiteNum(body.max_tokens);
+    // Responses uses max_output_tokens. max_tokens on that route is not a cap
+    // the provider honors, so it must not shrink the reservation.
+    const cap = responses
+      ? finiteNum(body.max_output_tokens)
+      : (finiteNum(body.max_completion_tokens) ?? finiteNum(body.max_tokens));
     if (cap != null && cap >= 0) {
       outputTokens = Math.floor(cap);
       outputBounded = true;
@@ -134,11 +139,21 @@ export function completionCharsFromSseData(data: string): number {
   }
 }
 
+/** Incremental Responses API text. Done/completed events repeat the full output and must not be counted again. */
+const RESPONSES_TEXT_DELTAS = new Set([
+  "response.output_text.delta",
+  "response.refusal.delta",
+  "response.function_call_arguments.delta",
+  "response.reasoning_summary_text.delta",
+  "response.reasoning_text.delta",
+]);
+
 function completionCharsFromPayload(payload: unknown): number {
   if (!payload || typeof payload !== "object") return 0;
-  const choices = (payload as { choices?: unknown }).choices;
-  if (!Array.isArray(choices)) return 0;
-  let chars = 0;
+  const record = payload as { type?: unknown; delta?: unknown; choices?: unknown };
+  let chars = responsesTextDeltaChars(record);
+  const choices = record.choices;
+  if (!Array.isArray(choices)) return chars;
   for (const choice of choices) {
     if (!choice || typeof choice !== "object") continue;
     const row = choice as { delta?: unknown; text?: unknown; message?: unknown };
@@ -147,6 +162,11 @@ function completionCharsFromPayload(payload: unknown): number {
     chars += deltaChars(row.message);
   }
   return chars;
+}
+
+function responsesTextDeltaChars(record: { type?: unknown; delta?: unknown }): number {
+  if (typeof record.type !== "string" || !RESPONSES_TEXT_DELTAS.has(record.type)) return 0;
+  return typeof record.delta === "string" ? record.delta.length : 0;
 }
 
 function deltaChars(delta: unknown): number {
@@ -165,6 +185,19 @@ function deltaChars(delta: unknown): number {
   return chars;
 }
 
+/**
+ * Chat chunks carry top-level `usage`. A Responses stream puts the same object
+ * on `response.usage` inside `response.completed` and `response.incomplete`.
+ */
+function usageFromSsePayload(payload: unknown): Usage | null {
+  const direct = parseUsage(payload);
+  if (direct) return direct;
+  if (!payload || typeof payload !== "object") return null;
+  const response = (payload as { response?: unknown }).response;
+  if (!response || typeof response !== "object") return null;
+  return parseUsage(response);
+}
+
 export function extractUsageFromSse(buffer: string): Usage | null {
   let found: Usage | null = null;
   for (const line of buffer.split(/\r?\n/)) {
@@ -173,7 +206,7 @@ export function extractUsageFromSse(buffer: string): Usage | null {
     const data = trimmed.slice(5).trim();
     if (!data || data === "[DONE]") continue;
     try {
-      const usage = parseUsage(JSON.parse(data));
+      const usage = usageFromSsePayload(JSON.parse(data));
       if (usage && (usage.totalTokens > 0 || usage.promptTokens > 0 || usage.completionTokens > 0)) {
         found = usage;
       }

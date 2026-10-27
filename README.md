@@ -309,6 +309,8 @@ Local README badge (only useful on a machine that can reach the proxy):
 
 Streaming chat completions: Spendlight sets `stream_options.include_usage` so a finished stream can log provider usage. If a running estimate hits the hard cap first, forwarding stops and the ledger records the partial estimate instead of waiting for the final SSE usage chunk.
 
+Streaming `/v1/responses` is priced from `response.usage` on the terminal event (`response.completed` or `response.incomplete`). Output-text, refusal, function-call, and reasoning deltas count toward the hard-budget cutoff while the stream is open. The terminal event repeats the full output and is not counted again. `max_output_tokens` bounds that call's reservation. `max_tokens` on a responses request does not. Without `max_output_tokens`, the call still holds the remaining hard headroom.
+
 ## Security (local proxy)
 
 Spendlight is a **localhost reverse proxy that can spend your API key**. Treat the bind address like a secret.
