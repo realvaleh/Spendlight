@@ -465,6 +465,9 @@ async function testStreamCutoff(dir: string, mockUrl: string): Promise<void> {
     assert(summary.spendUsd > 0.0004 && summary.spendUsd < 0.001, `stream partial spend ${summary.spendUsd}`);
     assert((row?.totalTokens ?? 0) < 20_000, `stream logged provider usage (${row?.totalTokens} tokens) instead of the cutoff`);
   });
+  // Responses streams use their own upstream. This keeps that coverage in `npm test`.
+  const { runResponsesStreamSmoke } = await import("./responses-stream-smoke.js");
+  await runResponsesStreamSmoke(dir);
 }
 
 type SmokeBudgets = {

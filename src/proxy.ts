@@ -524,8 +524,10 @@ function extractSseId(buffer: string): string | null {
     const data = trimmed.slice(5).trim();
     if (!data || data === "[DONE]") continue;
     try {
-      const parsed = JSON.parse(data) as { id?: unknown };
+      const parsed = JSON.parse(data) as { id?: unknown; response?: { id?: unknown } };
       if (typeof parsed.id === "string") return parsed.id;
+      const responseId = parsed.response?.id;
+      if (typeof responseId === "string") return responseId;
     } catch {
       // ignore
     }
