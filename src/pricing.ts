@@ -54,7 +54,10 @@ const CHARS_PER_TOKEN = 4;
 
 export type Preflight = {
   usage: Usage;
-  /** True when output is capped (max_tokens / embeddings). False holds the remaining hard headroom. */
+  /**
+   * True when output is capped (`max_tokens` / `max_completion_tokens`, times `n` on
+   * chat and legacy completions) or the route is embeddings. False holds the remaining hard headroom.
+   */
   outputBounded: boolean;
   costUsd: number;
   promptCostUsd: number;
@@ -63,6 +66,19 @@ export type Preflight = {
 function finiteNum(v: unknown): number | undefined {
   if (typeof v === "number" && Number.isFinite(v)) return v;
   return undefined;
+}
+
+/**
+ * How many billed outputs a bounded completion will generate.
+ * OpenAI charges prompt tokens once and completion tokens across every choice.
+ * `n` omitted, below 1, or not a finite number counts as one choice so the hold
+ * cannot shrink. Responses and embeddings do not use `n`.
+ */
+function outputChoiceCount(pathname: string, body: Record<string, unknown>): number {
+  if (!pathname.endsWith("/completions")) return 1;
+  const n = finiteNum(body.n);
+  if (n == null || n < 1) return 1;
+  return Math.max(1, Math.floor(n));
 }
 
 function textChars(value: unknown): number {
@@ -106,7 +122,9 @@ export function preflightFromBody(
   if (!embeddings && body) {
     const cap = finiteNum(body.max_completion_tokens) ?? finiteNum(body.max_tokens);
     if (cap != null && cap >= 0) {
-      outputTokens = Math.floor(cap);
+      // Chat and legacy completions generate `n` choices and bill each output.
+      // Prompt tokens are shared. Other priced routes ignore `n`.
+      outputTokens = Math.floor(cap) * outputChoiceCount(pathname, body);
       outputBounded = true;
     }
   }

@@ -104,6 +104,7 @@ export function evaluateBudget(db: Db, config: Config, project: string, now = ne
  * inside BEGIN IMMEDIATE, then this call's hold is inserted before we talk to upstream.
  * Unbounded completions (no max_tokens) hold the entire remaining headroom so a second
  * concurrent call cannot pass the same check. Bounded calls hold their preflight estimate.
+ * On chat and legacy completions that estimate multiplies the output cap by `n`.
  */
 export function admitMutating(
   db: Db,

@@ -7,7 +7,7 @@ import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } f
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
-import { estimateCostUsd } from "./pricing.js";
+import { estimateCostUsd, preflightFromBody } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
@@ -24,7 +24,7 @@ const SMALL_USAGE = {
   prompt_tokens_details: { cached_tokens: 0 },
 };
 
-const hits = { bounded: 0, unbounded: 0 };
+const hits = { bounded: 0, unbounded: 0, multi: 0 };
 
 function fail(message: string): never {
   console.error(`SMOKE FAIL: ${message}`);
@@ -95,6 +95,7 @@ async function main(): Promise<void> {
       payload = {};
     }
     if (url.pathname === "/chat/completions" || url.pathname === "/v1/chat/completions") {
+      if (payload.track === "multi") hits.multi += 1;
       if (payload.stream === true) {
         writeStream(res);
         return;
@@ -338,6 +339,7 @@ async function main(): Promise<void> {
 
     await testUnboundedRace(dir, mockUrl);
     await testBoundedRace(dir, mockUrl);
+    await testChoiceCountBudget(dir, mockUrl);
     await testStreamCutoff(dir, mockUrl);
     testCalendarDayBounds();
     testCalendarWeekBounds();
@@ -365,7 +367,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, choice count, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -437,6 +439,160 @@ async function testBoundedRace(dir: string, mockUrl: string): Promise<void> {
       }),
     );
     assert(again.status === 200, `hold should release after settle, got ${again.status}`);
+    await again.text();
+  });
+}
+
+async function testChoiceCountBudget(dir: string, mockUrl: string): Promise<void> {
+  const chat = "/v1/chat/completions";
+  const messages = [{ role: "user", content: "hi" }];
+  const capped = (extra: Record<string, unknown>) =>
+    preflightFromBody(
+      "gpt-4o-mini",
+      { model: "gpt-4o-mini", messages, max_tokens: 100_000, ...extra },
+      chat,
+      DEFAULT_PRICING,
+      DEFAULT_FALLBACK,
+    );
+  const one = capped({});
+  const two = capped({ n: 2 });
+  assert(one.outputBounded && two.outputBounded, "capped completions should be output-bounded");
+  assert(one.usage.completionTokens === 100_000, `n omitted reserved ${one.usage.completionTokens} output tokens`);
+  assert(two.usage.completionTokens === 200_000, `n=2 reserved ${two.usage.completionTokens} output tokens`);
+  assert(one.usage.promptTokens === two.usage.promptTokens && one.usage.promptTokens > 0, "prompt tokens are not multiplied by n");
+  assert(two.promptCostUsd === one.promptCostUsd, "prompt cost is not multiplied by n");
+  assert(two.costUsd > one.costUsd, "n=2 preflight should cost more than one choice");
+
+  const explicitOne = capped({ n: 1 });
+  assert(explicitOne.usage.completionTokens === one.usage.completionTokens, "n=1 should match an omitted n");
+  for (const n of [0, -3, 0.4, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const row = capped({ n });
+    assert(row.usage.completionTokens === one.usage.completionTokens, `n=${n} should not shrink the hold`);
+  }
+  assert(capped({ n: "4" }).usage.completionTokens === one.usage.completionTokens, "string n is not a choice count");
+  assert(capped({ n: 2.9 }).usage.completionTokens === 200_000, "fractional n floors to whole choices");
+
+  const preferred = preflightFromBody(
+    "gpt-4o-mini",
+    { model: "gpt-4o-mini", messages, max_completion_tokens: 100_000, max_tokens: 1, n: 3 },
+    chat,
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(preferred.usage.completionTokens === 300_000, "n multiplies max_completion_tokens, not the ignored max_tokens");
+
+  const legacy = preflightFromBody(
+    "gpt-4o-mini",
+    { model: "gpt-4o-mini", prompt: "hi", max_tokens: 10, n: 4 },
+    "/v1/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(legacy.usage.completionTokens === 40, `legacy completions n=4 reserved ${legacy.usage.completionTokens}`);
+
+  const responsesWithN = preflightFromBody(
+    "gpt-4o-mini",
+    { model: "gpt-4o-mini", input: "hi", max_tokens: 10, n: 4 },
+    "/v1/responses",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  const responses = preflightFromBody(
+    "gpt-4o-mini",
+    { model: "gpt-4o-mini", input: "hi", max_tokens: 10 },
+    "/v1/responses",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(
+    responsesWithN.usage.completionTokens === responses.usage.completionTokens,
+    "responses preflight ignores n",
+  );
+  const embeddings = preflightFromBody(
+    "text-embedding-3-small",
+    { model: "text-embedding-3-small", input: "hi", max_tokens: 10, n: 4 },
+    "/v1/embeddings",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(embeddings.usage.completionTokens === 0 && embeddings.outputBounded, "embeddings stay a single input charge");
+
+  const between = (one.costUsd + two.costUsd) / 2;
+  assert(one.costUsd < between && between < two.costUsd, `bracket ${one.costUsd} < ${between} < ${two.costUsd}`);
+  hits.multi = 0;
+  await withApp(dir, "choice-reject", mockUrl, { softUsd: null, hardUsd: between }, async (base) => {
+    const rejected = await postChat(
+      base,
+      "choices",
+      JSON.stringify({ model: "gpt-4o-mini", max_tokens: 100_000, n: 2, track: "multi", messages }),
+    );
+    const rejectedText = await rejected.text();
+    assert(rejected.status === 402, `n=2 over preflight status ${rejected.status}: ${rejectedText.slice(0, 180)}`);
+    assert(rejectedText.includes("preflight"), "n=2 rejection should be the preflight hold");
+    assert(rejectedText.includes("budget_hard_limit"), "n=2 rejection missing budget code");
+    const missedUpstream = hits.multi;
+    assert(missedUpstream === 0, `n=2 over preflight reached upstream ${missedUpstream} times`);
+
+    const allowed = await postChat(
+      base,
+      "choices",
+      JSON.stringify({ model: "gpt-4o-mini", max_tokens: 100_000, n: 1, track: "multi", small: true, messages }),
+    );
+    assert(allowed.status === 200, `n=1 under the same cap status ${allowed.status}`);
+    const settled = estimateCostUsd(
+      "gpt-4o-mini",
+      { promptTokens: 100, completionTokens: 100, cachedTokens: 0, totalTokens: 200 },
+      DEFAULT_PRICING,
+      DEFAULT_FALLBACK,
+    ).costUsd;
+    const billed = Number(allowed.headers.get("x-spendlight-cost-usd"));
+    assert(Math.abs(billed - settled) < 1e-9, `n=1 billed the hold instead of usage (${billed} vs ${settled})`);
+    await allowed.text();
+    const reachedUpstream = hits.multi;
+    assert(reachedUpstream === 1, `n=1 should reach upstream once, got ${reachedUpstream}`);
+    const summary = await summaryOf(base);
+    assert(summary.requests === 1, `choice reject logged ${summary.requests} rows`);
+    assert(Math.abs(summary.spendUsd - settled) < 1e-9, `choice reject spend ${summary.spendUsd}`);
+  });
+
+  const raceHard = two.costUsd + (two.costUsd - one.costUsd) / 2;
+  assert(two.costUsd < raceHard && raceHard < two.costUsd * 2, `race bracket ${two.costUsd} < ${raceHard} < ${two.costUsd * 2}`);
+  hits.multi = 0;
+  await withApp(dir, "choice-race", mockUrl, { softUsd: null, hardUsd: raceHard }, async (base) => {
+    const body = JSON.stringify({
+      model: "gpt-4o-mini",
+      max_tokens: 100_000,
+      n: 2,
+      delay: true,
+      small: true,
+      track: "multi",
+      messages,
+    });
+    const [a, b] = await Promise.all([postChat(base, "choices", body), postChat(base, "choices", body)]);
+    const statuses = [a.status, b.status].sort((x, y) => x - y);
+    assert(statuses[0] === 200 && statuses[1] === 402, `n=2 race statuses ${statuses.join(",")}`);
+    const raceUpstream = hits.multi;
+    assert(raceUpstream === 1, `n=2 race reached upstream ${raceUpstream} times`);
+    const winner = a.status === 200 ? a : b;
+    const billed = Number(winner.headers.get("x-spendlight-cost-usd"));
+    const settled = estimateCostUsd(
+      "gpt-4o-mini",
+      { promptTokens: 100, completionTokens: 100, cachedTokens: 0, totalTokens: 200 },
+      DEFAULT_PRICING,
+      DEFAULT_FALLBACK,
+    ).costUsd;
+    assert(Math.abs(billed - settled) < 1e-9, `n=2 race billed ${billed}, expected usage ${settled}`);
+    await Promise.all([a.text(), b.text()]);
+    const summary = await summaryOf(base);
+    assert(summary.requests === 1, `n=2 race logged ${summary.requests} rows`);
+    assert(Math.abs(summary.spendUsd - settled) < 1e-9, `n=2 race spend ${summary.spendUsd}`);
+
+    const again = await postChat(
+      base,
+      "choices",
+      JSON.stringify({ model: "gpt-4o-mini", max_tokens: 100_000, n: 2, small: true, messages }),
+    );
+    assert(again.status === 200, `n=2 hold should release after settle, got ${again.status}`);
     await again.text();
   });
 }
