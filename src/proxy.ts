@@ -98,120 +98,160 @@ export async function proxyRequest(
   const headers = forwardHeaders(req, config, outboundBody.length);
   const ac = new AbortController();
   let settled = false;
+  let clientGone = false;
   const release = () => {
     if (!settled) {
       releaseReservation(db, reservationId);
       settled = true;
     }
   };
-
-  let upstream: Response;
-  try {
-    upstream = await fetch(upstreamUrl, {
-      method: req.method,
-      headers,
-      body: req.method === "GET" || req.method === "HEAD" ? undefined : outboundBody,
-      signal: ac.signal,
-    });
-  } catch (err) {
-    release();
-    const message = err instanceof Error ? err.message : String(err);
-    json(
-      res,
-      502,
-      {
-        error: { message: `Spendlight could not reach upstream: ${message}`, type: "spendlight_upstream_error" },
-      },
-      {},
-      req,
-    );
-    return;
-  }
+  // A disconnected client used to leave the preflight hold (often the entire
+  // remaining hard cap) until upstream finished or the 15-minute TTL elapsed.
+  const onClientGone = () => {
+    if (res.writableFinished) return;
+    clientGone = true;
+    ac.abort();
+  };
+  res.on("close", onClientGone);
+  res.on("error", onClientGone);
+  req.socket?.on("close", onClientGone);
 
   try {
-    const outHeaders = filterResponseHeaders(upstream.headers, req);
-    outHeaders["x-spendlight-project"] = project;
-    outHeaders["x-spendlight-budget-status"] = decision.status;
-    if (decision.message) outHeaders["x-spendlight-budget-warning"] = decision.message;
-    if (priced && decision.status === "soft") {
-      insertEvent(db, "soft_warn", project, decision.message ?? "soft budget", {
-        dedupeSinceIso: decision.windowStart,
+    let upstream: Response;
+    try {
+      // req.destroyed is true once the body has been read, even while the client
+      // is still waiting. Only a dead socket means the client already left.
+      if (req.socket?.destroyed || res.destroyed) {
+        release();
+        return;
+      }
+      upstream = await fetch(upstreamUrl, {
+        method: req.method,
+        headers,
+        body: req.method === "GET" || req.method === "HEAD" ? undefined : outboundBody,
+        signal: ac.signal,
       });
+    } catch (err) {
+      release();
+      if (clientGone || ac.signal.aborted || res.destroyed || res.writableEnded) return;
+      const message = err instanceof Error ? err.message : String(err);
+      json(
+        res,
+        502,
+        {
+          error: { message: `Spendlight could not reach upstream: ${message}`, type: "spendlight_upstream_error" },
+        },
+        {},
+        req,
+      );
+      return;
     }
 
-    const contentType = upstream.headers.get("content-type") ?? "";
-    const streamed = stream || contentType.includes("text/event-stream");
-
-    if (streamed && upstream.body) {
-      for (const key of Object.keys(outHeaders)) {
-        if (key.toLowerCase() === "content-length") delete outHeaders[key];
+    try {
+      const outHeaders = filterResponseHeaders(upstream.headers, req);
+      outHeaders["x-spendlight-project"] = project;
+      outHeaders["x-spendlight-budget-status"] = decision.status;
+      if (decision.message) outHeaders["x-spendlight-budget-warning"] = decision.message;
+      if (priced && decision.status === "soft") {
+        insertEvent(db, "soft_warn", project, decision.message ?? "soft budget", {
+          dedupeSinceIso: decision.windowStart,
+        });
       }
-      res.writeHead(upstream.status, outHeaders);
-      const piped = await pipeSse(upstream.body, res, {
-        ac,
-        capUsd: reserveUsd > 0 ? reserveUsd : null,
-        preflight,
-        model,
-        pricing: config.pricing,
-        fallback: config.fallbackPrice,
-      });
-      if (priced || piped.usage.totalTokens > 0) {
+
+      const contentType = upstream.headers.get("content-type") ?? "";
+      const streamed = stream || contentType.includes("text/event-stream");
+
+      if (streamed && upstream.body) {
+        for (const key of Object.keys(outHeaders)) {
+          if (key.toLowerCase() === "content-length") delete outHeaders[key];
+        }
+        if (clientGone || res.destroyed || res.writableEnded) {
+          try {
+            await upstream.body.cancel();
+          } catch {
+            // The client already left; the hold is released below.
+          }
+          return;
+        }
+        res.writeHead(upstream.status, outHeaders);
+        const piped = await pipeSse(upstream.body, res, {
+          ac,
+          capUsd: reserveUsd > 0 ? reserveUsd : null,
+          preflight,
+          model,
+          pricing: config.pricing,
+          fallback: config.fallbackPrice,
+        });
+        if (priced || piped.usage.totalTokens > 0) {
+          logCompleted({
+            db,
+            config,
+            project,
+            model,
+            usage: piped.usage,
+            status: upstream.status,
+            path: url.pathname,
+            streamed: true,
+            upstreamId: piped.upstreamId,
+            error: piped.stopped ? "stream stopped at hard budget" : piped.disconnected ? "client disconnected" : null,
+            reservationId,
+          });
+          settled = true;
+        }
+        return;
+      }
+
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      let usage = zeroUsage();
+      let upstreamId: string | null = null;
+      let loggedModel = model;
+      if (contentType.includes("json")) {
+        try {
+          const parsedJson = JSON.parse(buf.toString("utf8")) as Record<string, unknown>;
+          usage = parseUsage(parsedJson) ?? zeroUsage();
+          if (typeof parsedJson.id === "string") upstreamId = parsedJson.id;
+          if (typeof parsedJson.model === "string") loggedModel = parsedJson.model;
+        } catch {
+          // ignore
+        }
+      }
+      outHeaders["content-length"] = String(buf.length);
+      const cost = estimateCostUsd(loggedModel, usage, config.pricing, config.fallbackPrice).costUsd;
+      outHeaders["x-spendlight-cost-usd"] = String(cost);
+      if (!clientGone && !res.destroyed && !res.writableEnded) {
+        try {
+          res.writeHead(upstream.status, outHeaders);
+          res.end(buf);
+        } catch {
+          // The client left after upstream answered. Still record the usage below.
+        }
+      }
+
+      if (priced || usage.totalTokens > 0) {
         logCompleted({
           db,
           config,
           project,
-          model,
-          usage: piped.usage,
+          model: loggedModel,
+          usage,
           status: upstream.status,
           path: url.pathname,
-          streamed: true,
-          upstreamId: piped.upstreamId,
-          error: piped.stopped ? "stream stopped at hard budget" : null,
+          streamed: false,
+          upstreamId,
+          error: upstream.ok ? null : buf.toString("utf8").slice(0, 500),
           reservationId,
         });
         settled = true;
       }
-      return;
-    }
-
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    let usage = zeroUsage();
-    let upstreamId: string | null = null;
-    let loggedModel = model;
-    if (contentType.includes("json")) {
-      try {
-        const parsedJson = JSON.parse(buf.toString("utf8")) as Record<string, unknown>;
-        usage = parseUsage(parsedJson) ?? zeroUsage();
-        if (typeof parsedJson.id === "string") upstreamId = parsedJson.id;
-        if (typeof parsedJson.model === "string") loggedModel = parsedJson.model;
-      } catch {
-        // ignore
-      }
-    }
-    outHeaders["content-length"] = String(buf.length);
-    const cost = estimateCostUsd(loggedModel, usage, config.pricing, config.fallbackPrice).costUsd;
-    outHeaders["x-spendlight-cost-usd"] = String(cost);
-    res.writeHead(upstream.status, outHeaders);
-    res.end(buf);
-
-    if (priced || usage.totalTokens > 0) {
-      logCompleted({
-        db,
-        config,
-        project,
-        model: loggedModel,
-        usage,
-        status: upstream.status,
-        path: url.pathname,
-        streamed: false,
-        upstreamId,
-        error: upstream.ok ? null : buf.toString("utf8").slice(0, 500),
-        reservationId,
-      });
-      settled = true;
+    } catch (err) {
+      if (!(clientGone || ac.signal.aborted || res.destroyed)) throw err;
+    } finally {
+      release();
     }
   } finally {
-    release();
+    res.off("close", onClientGone);
+    res.off("error", onClientGone);
+    req.socket?.off("close", onClientGone);
   }
 }
 
@@ -228,12 +268,13 @@ async function pipeSse(
   body: ReadableStream<Uint8Array>,
   res: ServerResponse,
   args: PipeArgs,
-): Promise<{ usage: Usage; upstreamId: string | null; stopped: boolean }> {
+): Promise<{ usage: Usage; upstreamId: string | null; stopped: boolean; disconnected: boolean }> {
   const reader = body.getReader();
   let pending = Buffer.alloc(0);
   let completionChars = 0;
   let forwarded = "";
   let stopped = false;
+  let disconnected = false;
   const promptTokens = args.preflight?.usage.promptTokens ?? 0;
 
   const runningCost = (chars: number) =>
@@ -250,11 +291,24 @@ async function pipeSse(
     ).costUsd;
 
   try {
-    while (!stopped) {
-      const { done, value } = await reader.read();
+    while (!stopped && !disconnected) {
+      let done = false;
+      let value: Uint8Array | undefined;
+      try {
+        const next = await reader.read();
+        done = next.done;
+        value = next.value;
+      } catch (err) {
+        // Client abort cancels this read. Any other failure still surfaces.
+        if (res.destroyed || res.writableEnded || args.ac.signal.aborted) {
+          disconnected = true;
+          break;
+        }
+        throw err;
+      }
       if (done) break;
-      pending = Buffer.concat([pending, Buffer.from(value)]);
-      while (!stopped) {
+      pending = Buffer.concat([pending, Buffer.from(value ?? new Uint8Array())]);
+      while (!stopped && !disconnected) {
         const sep = findBlankLine(pending);
         if (!sep) break;
         const eventBuf = pending.subarray(0, sep.index + sep.len);
@@ -268,7 +322,16 @@ async function pipeSse(
         completionChars = nextChars;
         pending = pending.subarray(sep.index + sep.len);
         forwarded += eventText;
-        res.write(eventBuf);
+        if (res.destroyed || res.writableEnded) {
+          disconnected = true;
+          break;
+        }
+        try {
+          res.write(eventBuf);
+        } catch {
+          disconnected = true;
+          break;
+        }
       }
     }
   } finally {
@@ -280,12 +343,35 @@ async function pipeSse(
         // Upstream is already going away.
       }
       const frame = `data: ${JSON.stringify(budgetErrorBody("Spendlight hard budget reached while streaming; forwarding stopped."))}\n\n`;
-      if (!res.writableEnded) res.write(frame);
-    } else if (pending.length && !res.writableEnded) {
-      forwarded += pending.toString("utf8");
-      res.write(pending);
+      if (!res.writableEnded && !res.destroyed) {
+        try {
+          res.write(frame);
+        } catch {
+          // The client left while the cap was closing the stream.
+        }
+      }
+    } else if (disconnected) {
+      args.ac.abort();
+      try {
+        await reader.cancel();
+      } catch {
+        // Upstream is already going away.
+      }
+    } else if (pending.length && !res.writableEnded && !res.destroyed) {
+      try {
+        forwarded += pending.toString("utf8");
+        res.write(pending);
+      } catch {
+        disconnected = true;
+      }
     }
-    if (!res.writableEnded) res.end();
+    if (!res.writableEnded && !res.destroyed) {
+      try {
+        res.end();
+      } catch {
+        // The client left as the last byte was flushed. Usage is already counted.
+      }
+    }
   }
 
   const counted: Usage = {
@@ -299,6 +385,7 @@ async function pipeSse(
     usage: official ?? counted,
     upstreamId: extractSseId(forwarded),
     stopped,
+    disconnected,
   };
 }
 

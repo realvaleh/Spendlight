@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -364,8 +364,10 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testClientAbortReleasesStreamHold(dir);
+    await testClientAbortReleasesPendingHold(dir);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, client disconnect, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2791,6 +2793,257 @@ async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise
     const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
     assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
   });
+}
+
+/**
+ * An unbounded in-flight call holds the rest of the hard cap. Dropping the client
+ * must abort upstream and settle that hold, or the next call stays 402.
+ */
+async function testClientAbortReleasesStreamHold(dir: string): Promise<void> {
+  const state = { aborted: 0 };
+  const mock = createServer(async (req, res) => {
+    res.on("error", () => {});
+    req.on("error", () => {});
+    const raw = await readReq(req).catch(() => "");
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    } catch {
+      payload = {};
+    }
+    if (payload.hang === true) {
+      res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" });
+      res.write(`data: ${JSON.stringify({ id: "chatcmpl-hang", choices: [{ index: 0, delta: { content: "hi" } }] })}\n\n`);
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 15_000);
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          if (!res.writableFinished) state.aborted += 1;
+          resolve();
+        };
+        res.on("close", finish);
+        req.socket.on("close", finish);
+      });
+      return;
+    }
+    if (!res.writableEnded) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "chatcmpl-ok",
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, message: { role: "assistant", content: "ok" } }],
+          usage: SMALL_USAGE,
+        }),
+      );
+    }
+  });
+  await new Promise<void>((resolve) => mock.listen(0, "127.0.0.1", resolve));
+  const addr = mock.address();
+  assert(addr && typeof addr === "object", "abort mock failed to bind");
+  const mockUrl = `http://127.0.0.1:${addr.port}/v1`;
+  try {
+    await withApp(dir, "abort-stream", mockUrl, { softUsd: null, hardUsd: 0.01 }, async (base) => {
+      const hung = openPost(
+        base,
+        "hang",
+        JSON.stringify({
+          model: "gpt-4o-mini",
+          stream: true,
+          hang: true,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      const res = await hung.response;
+      assert(res, "hang stream produced no response");
+      await onceData(res);
+      const blocked = await postChat(
+        base,
+        "probe",
+        JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "next" }] }),
+      );
+      assert(blocked.status === 402, `in-flight unbounded stream should hold the hard cap, got ${blocked.status}`);
+      await blocked.arrayBuffer();
+      hung.req.destroy();
+      await waitUntil("upstream abort after stream disconnect", () => state.aborted >= 1);
+      await waitUntil("disconnected stream ledger row", async () => {
+        const summary = await summaryOf(base);
+        return summary.recent.some((row) => row.error?.includes("client disconnected") === true);
+      });
+      const again = await postChat(
+        base,
+        "next",
+        JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "next" }] }),
+      );
+      assert(again.status === 200, `hold should release after disconnect, got ${again.status}`);
+      await again.arrayBuffer();
+      const summary = await summaryOf(base);
+      const row = summary.recent.find((item) => item.error?.includes("client disconnected") === true);
+      assert(summary.requests === 2, `disconnect should log the partial stream and the follow-up, got ${summary.requests}`);
+      assert(row?.streamed === 1, "disconnected stream should stay marked streamed");
+      assert((row?.totalTokens ?? 0) < 1000, `disconnected stream logged too many tokens (${row?.totalTokens})`);
+      assert(summary.spendUsd < 0.001, `disconnect should not keep the full hold as spend, got ${summary.spendUsd}`);
+    });
+  } finally {
+    mock.closeAllConnections();
+    await new Promise<void>((resolve) => mock.close(() => resolve()));
+  }
+}
+
+/** Same hold, but the client leaves before upstream sends any response bytes. */
+async function testClientAbortReleasesPendingHold(dir: string): Promise<void> {
+  const state = { started: 0, aborted: 0 };
+  const mock = createServer(async (req, res) => {
+    res.on("error", () => {});
+    req.on("error", () => {});
+    const raw = await readReq(req).catch(() => "");
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    } catch {
+      payload = {};
+    }
+    if (payload.block === true) {
+      state.started += 1;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 15_000);
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          if (!res.writableFinished) state.aborted += 1;
+          resolve();
+        };
+        res.on("close", finish);
+        req.socket.on("close", finish);
+      });
+      return;
+    }
+    if (!res.writableEnded) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "chatcmpl-ok",
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, message: { role: "assistant", content: "ok" } }],
+          usage: SMALL_USAGE,
+        }),
+      );
+    }
+  });
+  await new Promise<void>((resolve) => mock.listen(0, "127.0.0.1", resolve));
+  const addr = mock.address();
+  assert(addr && typeof addr === "object", "pending abort mock failed to bind");
+  const mockUrl = `http://127.0.0.1:${addr.port}/v1`;
+  try {
+    await withApp(dir, "abort-pending", mockUrl, { softUsd: null, hardUsd: 0.01 }, async (base) => {
+      const pending = openPost(
+        base,
+        "pending",
+        JSON.stringify({
+          model: "gpt-4o-mini",
+          block: true,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      await waitUntil("upstream received the pending call", () => state.started >= 1);
+      const blocked = await postChat(
+        base,
+        "probe",
+        JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "next" }] }),
+      );
+      assert(blocked.status === 402, `pending unbounded call should hold the hard cap, got ${blocked.status}`);
+      await blocked.arrayBuffer();
+      pending.req.destroy();
+      await waitUntil("upstream abort after pending disconnect", () => state.aborted >= 1);
+      let status = 0;
+      const deadline = Date.now() + 1000;
+      while (Date.now() < deadline) {
+        const again = await postChat(
+          base,
+          "next",
+          JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "next" }] }),
+        );
+        status = again.status;
+        await again.arrayBuffer();
+        if (status === 200) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert(status === 200, `pending hold should release after disconnect, got ${status}`);
+      const summary = await summaryOf(base);
+      assert(summary.requests === 1, `a call with no upstream response should not be charged, got ${summary.requests}`);
+      assert(
+        summary.recent.every((row) => row.error?.includes("client disconnected") !== true),
+        "pending disconnect should not log a disconnected stream",
+      );
+      assert(summary.spendUsd > 0 && summary.spendUsd < 0.001, `follow-up spend ${summary.spendUsd}`);
+    });
+  } finally {
+    mock.closeAllConnections();
+    await new Promise<void>((resolve) => mock.close(() => resolve()));
+  }
+}
+
+function openPost(
+  base: string,
+  project: string,
+  body: string,
+): { req: ReturnType<typeof httpRequest>; response: Promise<IncomingMessage | null> } {
+  const url = new URL(`${base}/v1/chat/completions`);
+  const req = httpRequest({
+    hostname: url.hostname,
+    port: url.port,
+    path: url.pathname,
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(body),
+      "x-spendlight-project": project,
+      connection: "close",
+    },
+  });
+  const response = new Promise<IncomingMessage | null>((resolve) => {
+    let settled = false;
+    const finish = (value: IncomingMessage | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    req.on("response", (res) => {
+      res.on("error", () => {});
+      finish(res);
+    });
+    req.on("error", () => finish(null));
+  });
+  req.write(body);
+  req.end();
+  return { req, response };
+}
+
+function onceData(res: IncomingMessage): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timed out waiting for a stream byte")), 2000);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    res.on("data", done);
+    res.on("end", done);
+    res.on("error", done);
+  });
+}
+
+async function waitUntil(label: string, pred: () => boolean | Promise<boolean>, timeoutMs = 1000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await pred()) return;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+  fail(`timed out waiting for ${label}`);
 }
 
 function readReq(req: IncomingMessage): Promise<string> {
