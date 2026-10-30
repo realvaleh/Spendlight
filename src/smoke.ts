@@ -7,7 +7,14 @@ import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } f
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
-import { estimateCostUsd } from "./pricing.js";
+import {
+  BINARY_MEDIA_PREFLIGHT_TOKENS,
+  IMAGE_PREFLIGHT_TOKENS,
+  LOW_DETAIL_IMAGE_PREFLIGHT_TOKENS,
+  estimateCostUsd,
+  preflightFromBody,
+  roughTokens,
+} from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
@@ -339,6 +346,8 @@ async function main(): Promise<void> {
     await testUnboundedRace(dir, mockUrl);
     await testBoundedRace(dir, mockUrl);
     await testStreamCutoff(dir, mockUrl);
+    testMediaPreflightMath();
+    await testMediaPreflightAdmission(dir, mockUrl);
     testCalendarDayBounds();
     testCalendarWeekBounds();
     testCalendarMonthBounds();
@@ -365,7 +374,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, media preflight, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2791,6 +2800,289 @@ async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise
     const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
     assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
   });
+}
+
+function testMediaPreflightMath(): void {
+  const big = "A".repeat(400_000);
+  const dataUrl = `data:image/png;base64,${big}`;
+  const shortUrl = "https://cdn.example/a.png";
+  const longUrl = `https://cdn.example/${"a".repeat(4_000)}.png`;
+  const textOverhead = "user".length + "text".length + "hi".length + "image_url".length;
+
+  const base64Image = preflightFromBody(
+    "gpt-4o-mini",
+    chatWithImage(dataUrl),
+    "/v1/chat/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(
+    base64Image.usage.promptTokens === IMAGE_PREFLIGHT_TOKENS + roughTokens(textOverhead),
+    `base64 image counted as text (${base64Image.usage.promptTokens} tokens)`,
+  );
+  assert(base64Image.usage.promptTokens < big.length / 8, "base64 image hold still scales with the payload");
+
+  const low = preflightFromBody(
+    "gpt-4o",
+    chatWithImage(dataUrl, "low"),
+    "/v1/chat/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(
+    low.usage.promptTokens === LOW_DETAIL_IMAGE_PREFLIGHT_TOKENS + roughTokens(textOverhead),
+    `low-detail image tokens ${low.usage.promptTokens}`,
+  );
+
+  const remoteShort = preflightFromBody(
+    "gpt-4o",
+    chatWithImage(shortUrl, "high"),
+    "/v1/chat/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  const remoteLong = preflightFromBody(
+    "gpt-4o",
+    chatWithImage(longUrl, "HIGH"),
+    "/v1/chat/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(
+    remoteShort.usage.promptTokens === IMAGE_PREFLIGHT_TOKENS + roughTokens(textOverhead),
+    `remote image tokens ${remoteShort.usage.promptTokens}`,
+  );
+  assert(
+    remoteLong.usage.promptTokens === remoteShort.usage.promptTokens,
+    "a longer image URL must not increase the hold",
+  );
+
+  const two = preflightFromBody(
+    "gpt-4o-mini",
+    {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "hi" },
+            { type: "image_url", image_url: { url: shortUrl } },
+            { type: "input_image", image_url: dataUrl, detail: "auto" },
+          ],
+        },
+      ],
+    },
+    "/v1/chat/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  const twoOverhead = "user".length + "text".length + "hi".length + "image_url".length + "input_image".length + "auto".length;
+  assert(
+    two.usage.promptTokens === IMAGE_PREFLIGHT_TOKENS * 2 + roughTokens(twoOverhead),
+    `two images should hold two stand-ins, got ${two.usage.promptTokens}`,
+  );
+
+  const bare = preflightFromBody(
+    "gpt-4o-mini",
+    { messages: [{ role: "user", content: dataUrl }] },
+    "/v1/chat/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(
+    bare.usage.promptTokens === IMAGE_PREFLIGHT_TOKENS + roughTokens("user".length),
+    `bare image data URL tokens ${bare.usage.promptTokens}`,
+  );
+
+  const audioA = preflightFromBody("gpt-4o-mini", chatWithAudio(big), "/v1/chat/completions", DEFAULT_PRICING, DEFAULT_FALLBACK);
+  const audioB = preflightFromBody(
+    "gpt-4o-mini",
+    chatWithAudio("A".repeat(20)),
+    "/v1/chat/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  const audioOverhead = "user".length + "input_audio".length;
+  assert(
+    audioA.usage.promptTokens === BINARY_MEDIA_PREFLIGHT_TOKENS + roughTokens(audioOverhead),
+    `audio hold ${audioA.usage.promptTokens}`,
+  );
+  assert(audioA.usage.promptTokens === audioB.usage.promptTokens, "audio hold must not scale with the base64");
+
+  const pdf = preflightFromBody(
+    "gpt-4o-mini",
+    {
+      input: [
+        {
+          type: "input_file",
+          filename: "notes.pdf",
+          file_data: `data:application/pdf;base64,${big}`,
+        },
+      ],
+    },
+    "/v1/responses",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(
+    pdf.usage.promptTokens === BINARY_MEDIA_PREFLIGHT_TOKENS + roughTokens("input_file".length + "notes.pdf".length),
+    `pdf hold ${pdf.usage.promptTokens}`,
+  );
+
+  const prose = "A".repeat(4_000);
+  const textOnly = preflightFromBody(
+    "gpt-4o-mini",
+    { messages: [{ role: "user", content: prose }] },
+    "/v1/chat/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(
+    textOnly.usage.promptTokens === roughTokens("user".length + prose.length),
+    `plain text should still scale, got ${textOnly.usage.promptTokens}`,
+  );
+  const mentioned = preflightFromBody(
+    "gpt-4o-mini",
+    { messages: [{ role: "user", content: "the header is data:image/png;base64,AAAA and that is all" }] },
+    "/v1/chat/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(
+    mentioned.usage.promptTokens < 100,
+    `a sentence mentioning base64 was held as an image (${mentioned.usage.promptTokens})`,
+  );
+}
+
+async function testMediaPreflightAdmission(dir: string, mockUrl: string): Promise<void> {
+  const big = "A".repeat(400_000);
+  const dataUrl = `data:image/png;base64,${big}`;
+  const hardUsd = 0.008;
+
+  await withApp(dir, "media-image-allowed", mockUrl, { softUsd: null, hardUsd }, async (base) => {
+    const res = await postChat(
+      base,
+      "vision",
+      JSON.stringify({
+        model: "gpt-4o-mini",
+        small: true,
+        max_tokens: 16,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "hi" },
+              { type: "image_url", image_url: { url: dataUrl } },
+            ],
+          },
+        ],
+      }),
+    );
+    const body = await res.text();
+    assert(res.status === 200, `base64 image should fit the hard cap, got ${res.status}: ${body.slice(0, 180)}`);
+    const summary = await summaryOf(base);
+    assert(summary.requests === 1, `image request logged ${summary.requests} rows`);
+    assert(summary.spendUsd < 0.001, `image request billed the stand-in (${summary.spendUsd}) instead of provider usage`);
+
+    const again = await postChat(
+      base,
+      "vision",
+      JSON.stringify({ model: "gpt-4o-mini", small: true, max_tokens: 16, messages: [{ role: "user", content: "next" }] }),
+    );
+    assert(again.status === 200, `image hold should release after settle, got ${again.status}`);
+    await again.text();
+  });
+
+  await withApp(dir, "media-text-rejected", mockUrl, { softUsd: null, hardUsd }, async (base) => {
+    const res = await postChat(
+      base,
+      "vision",
+      JSON.stringify({
+        model: "gpt-4o-mini",
+        small: true,
+        max_tokens: 16,
+        messages: [{ role: "user", content: big }],
+      }),
+    );
+    const blocked = (await res.json()) as { error?: { code?: string; message?: string } };
+    assert(res.status === 402, `plain text of the same size should still 402, got ${res.status}`);
+    assert(blocked.error?.code === "budget_hard_limit", "plain text 402 missing budget code");
+    assert(blocked.error?.message?.includes("preflight") === true, blocked.error?.message ?? "missing preflight message");
+    const summary = await summaryOf(base);
+    assert(summary.requests === 0, "rejected plain text must not reach the ledger");
+  });
+
+  await withApp(dir, "media-remote-detail", mockUrl, { softUsd: null, hardUsd: 0.02 }, async (base) => {
+    const high = await postChat(
+      base,
+      "vision",
+      JSON.stringify({
+        model: "gpt-4o",
+        small: true,
+        max_tokens: 16,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "image_url", image_url: { url: "https://cdn.example/shot.png", detail: "high" } }],
+          },
+        ],
+      }),
+    );
+    const highBody = (await high.json()) as { error?: { code?: string; message?: string } };
+    assert(high.status === 402, `remote high-detail image should exceed $0.02, got ${high.status}`);
+    assert(highBody.error?.code === "budget_hard_limit", "remote image 402 missing budget code");
+    assert(highBody.error?.message?.includes("preflight") === true, highBody.error?.message ?? "missing preflight");
+    assert((await summaryOf(base)).requests === 0, "rejected remote image must not be logged");
+
+    const low = await postChat(
+      base,
+      "vision",
+      JSON.stringify({
+        model: "gpt-4o",
+        small: true,
+        max_tokens: 16,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "input_image", image_url: "https://cdn.example/shot.png", detail: "low" },
+            ],
+          },
+        ],
+      }),
+    );
+    const lowText = await low.text();
+    assert(low.status === 200, `low-detail image should fit $0.02, got ${low.status}: ${lowText.slice(0, 180)}`);
+    const summary = await summaryOf(base);
+    assert(summary.requests === 1, `low-detail image logged ${summary.requests} rows`);
+    assert(summary.spendUsd < 0.001, `low-detail image billed ${summary.spendUsd}`);
+  });
+}
+
+function chatWithImage(url: string, detail?: string): Record<string, unknown> {
+  const imageUrl: Record<string, string> = { url };
+  if (detail) imageUrl.detail = detail;
+  return {
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "hi" },
+          { type: "image_url", image_url: imageUrl },
+        ],
+      },
+    ],
+  };
+}
+
+function chatWithAudio(data: string): Record<string, unknown> {
+  return {
+    messages: [
+      {
+        role: "user",
+        content: [{ type: "input_audio", input_audio: { data, format: "wav" } }],
+      },
+    ],
+  };
 }
 
 function readReq(req: IncomingMessage): Promise<string> {

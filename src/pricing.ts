@@ -52,6 +52,25 @@ function num(v: unknown): number | undefined {
 
 const CHARS_PER_TOKEN = 4;
 
+/**
+ * Tokens reserved for one image when detail is omitted, auto, high, or original.
+ * Pixel size is not known here. This is a stand-in so a screenshot is not priced
+ * as one token per four base64 characters, and a remote URL is not priced as a
+ * handful of characters.
+ */
+export const IMAGE_PREFLIGHT_TOKENS = 16_384;
+
+/** Tokens reserved for an image part with detail "low". */
+export const LOW_DETAIL_IMAGE_PREFLIGHT_TOKENS = 4_096;
+
+/** Tokens reserved for one audio clip or file payload. Base64 length is not the token count. */
+export const BINARY_MEDIA_PREFLIGHT_TOKENS = 16_384;
+
+const IMAGE_TYPES = new Set(["image_url", "input_image", "image"]);
+const MEDIA_TYPES = new Set(["input_audio", "audio", "input_file", "file"]);
+const IMAGE_PAYLOAD_KEYS = new Set(["image_url", "file_id", "image_base64", "url"]);
+const MEDIA_PAYLOAD_KEYS = new Set(["input_audio", "data", "file_data", "file", "audio"]);
+
 export type Preflight = {
   usage: Usage;
   /** True when output is capped (max_tokens / embeddings). False holds the remaining hard headroom. */
@@ -66,18 +85,77 @@ function finiteNum(v: unknown): number | undefined {
 }
 
 function textChars(value: unknown): number {
-  if (typeof value === "string") return value.length;
+  if (typeof value === "string") return charsOfString(value);
   if (Array.isArray(value)) {
     let n = 0;
     for (const item of value) n += textChars(item);
     return n;
   }
   if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    if (isImagePart(obj)) return tokenChars(imageTokensFor(obj)) + textCharsExcept(obj, IMAGE_PAYLOAD_KEYS);
+    if (isMediaPart(obj)) return tokenChars(BINARY_MEDIA_PREFLIGHT_TOKENS) + textCharsExcept(obj, MEDIA_PAYLOAD_KEYS);
     let n = 0;
-    for (const v of Object.values(value as Record<string, unknown>)) n += textChars(v);
+    for (const v of Object.values(obj)) n += textChars(v);
     return n;
   }
   return 0;
+}
+
+function textCharsExcept(obj: Record<string, unknown>, skip: Set<string>): number {
+  let n = 0;
+  for (const [key, value] of Object.entries(obj)) {
+    if (skip.has(key)) continue;
+    n += textChars(value);
+  }
+  return n;
+}
+
+function isImagePart(obj: Record<string, unknown>): boolean {
+  const type = typeof obj.type === "string" ? obj.type : "";
+  if (!IMAGE_TYPES.has(type)) return false;
+  return "image_url" in obj || "file_id" in obj || "image_base64" in obj || "url" in obj;
+}
+
+function isMediaPart(obj: Record<string, unknown>): boolean {
+  const type = typeof obj.type === "string" ? obj.type : "";
+  if (!MEDIA_TYPES.has(type)) return false;
+  return "input_audio" in obj || "data" in obj || "file_data" in obj || "file" in obj || "audio" in obj;
+}
+
+function imageTokensFor(obj: Record<string, unknown>): number {
+  return imageDetail(obj) === "low" ? LOW_DETAIL_IMAGE_PREFLIGHT_TOKENS : IMAGE_PREFLIGHT_TOKENS;
+}
+
+function imageDetail(obj: Record<string, unknown>): string {
+  if (typeof obj.detail === "string") return obj.detail.trim().toLowerCase();
+  const nested = obj.image_url;
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+    const detail = (nested as Record<string, unknown>).detail;
+    if (typeof detail === "string") return detail.trim().toLowerCase();
+  }
+  return "";
+}
+
+function charsOfString(value: string): number {
+  const tokens = dataUrlTokens(value);
+  return tokens == null ? value.length : tokenChars(tokens);
+}
+
+/** Image and file data URLs are payloads, not prompt text. Other strings stay as text. */
+function dataUrlTokens(value: string): number | null {
+  if (!value.startsWith("data:")) return null;
+  const comma = value.indexOf(",");
+  if (comma <= 5 || comma > 256) return null;
+  const header = value.slice(0, comma);
+  if (!/;base64/i.test(header)) return null;
+  const mime = /^data:([^;,]+)/i.exec(header)?.[1]?.toLowerCase() ?? "";
+  if (mime.startsWith("image/")) return IMAGE_PREFLIGHT_TOKENS;
+  return BINARY_MEDIA_PREFLIGHT_TOKENS;
+}
+
+function tokenChars(tokens: number): number {
+  return tokens * CHARS_PER_TOKEN;
 }
 
 export function roughTokens(chars: number): number {
