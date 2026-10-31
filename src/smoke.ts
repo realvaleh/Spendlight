@@ -108,7 +108,7 @@ async function main(): Promise<void> {
         id: "chatcmpl-smoke",
         object: "chat.completion",
         created: 1_700_000_000,
-        model: "gpt-4o-mini",
+        model: payload.routeModel === true && typeof payload.model === "string" ? payload.model : "gpt-4o-mini",
         choices: [
           {
             index: 0,
@@ -364,8 +364,9 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testVendorPrefixedModels(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, vendor model prices");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2790,6 +2791,140 @@ async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise
     await res.text();
     const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
     assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
+  });
+}
+
+const MILLION_IN: UsageTokens = { promptTokens: 1_000_000, completionTokens: 0, cachedTokens: 0, totalTokens: 1_000_000 };
+
+type UsageTokens = { promptTokens: number; completionTokens: number; cachedTokens: number; totalTokens: number };
+
+function priced(model: string, usage: UsageTokens, pricing: typeof DEFAULT_PRICING = DEFAULT_PRICING) {
+  return estimateCostUsd(model, usage, pricing, DEFAULT_FALLBACK);
+}
+
+function testVendorPriceTable(): void {
+  const mini = priced("openai/gpt-4o-mini", MILLION_IN);
+  assert(mini.matched === "gpt-4o-mini", `openai/gpt-4o-mini matched ${mini.matched}`);
+  assert(Math.abs(mini.costUsd - 0.15) < 1e-9, `openai/gpt-4o-mini cost ${mini.costUsd}`);
+
+  const dated = priced("openai/gpt-4o-mini-2024-07-18", MILLION_IN);
+  assert(dated.matched === "gpt-4o-mini", `dated vendor snapshot matched ${dated.matched}`);
+  assert(Math.abs(dated.costUsd - 0.15) < 1e-9, `dated vendor snapshot cost ${dated.costUsd}`);
+
+  const full = priced("openai/gpt-4o", MILLION_IN);
+  assert(full.matched === "gpt-4o", `openai/gpt-4o matched ${full.matched}`);
+  assert(Math.abs(full.costUsd - 2.5) < 1e-9, `openai/gpt-4o cost ${full.costUsd}`);
+
+  const snapshot = priced("openai/gpt-4o-2024-08-06", MILLION_IN);
+  assert(snapshot.matched === "gpt-4o", `openai/gpt-4o-2024-08-06 matched ${snapshot.matched}`);
+
+  const nested = priced("org/team/gpt-4o-mini", MILLION_IN);
+  assert(nested.matched === "gpt-4o-mini", `nested vendor id matched ${nested.matched}`);
+
+  const gpt5 = priced("openai/gpt-5", MILLION_IN);
+  const gpt56 = priced("openai/gpt-5.6", MILLION_IN);
+  const gpt5Mini = priced("openai/gpt-5-mini", MILLION_IN);
+  assert(gpt5.matched === "gpt-5", `openai/gpt-5 matched ${gpt5.matched}`);
+  assert(gpt56.matched === "gpt-5.6", `openai/gpt-5.6 matched ${gpt56.matched}`);
+  assert(gpt5Mini.matched === "gpt-5-mini", `openai/gpt-5-mini matched ${gpt5Mini.matched}`);
+  assert(Math.abs(gpt56.costUsd - 5) < 1e-9, `openai/gpt-5.6 cost ${gpt56.costUsd}`);
+
+  const o3mini = priced("openai/o3-mini", MILLION_IN);
+  assert(o3mini.matched === "o3-mini", `openai/o3-mini matched ${o3mini.matched}`);
+
+  const bare = priced("gpt-4o-2024-08-06", MILLION_IN);
+  assert(bare.matched === "gpt-4o", `bare snapshot matched ${bare.matched}`);
+  const bareMini = priced("gpt-4o-mini", MILLION_IN);
+  assert(bareMini.matched === "gpt-4o-mini" && Math.abs(bareMini.costUsd - 0.15) < 1e-9, "bare gpt-4o-mini price changed");
+
+  const unknown = priced("openai/no-such-model", MILLION_IN);
+  assert(unknown.matched == null, `unknown vendor id matched ${unknown.matched}`);
+  assert(Math.abs(unknown.costUsd - 5) < 1e-9, `unknown vendor id cost ${unknown.costUsd}`);
+
+  const finetune = priced("ft:gpt-4o-mini-2024-07-18:acme:custom:abc", MILLION_IN);
+  assert(finetune.matched == null, `fine-tune id matched ${finetune.matched}`);
+  assert(Math.abs(finetune.costUsd - 5) < 1e-9, `fine-tune id cost ${finetune.costUsd}`);
+
+  const override = priced("openai/gpt-4o-mini", MILLION_IN, {
+    ...DEFAULT_PRICING,
+    "openai/gpt-4o-mini": { inputPerMillion: 9, outputPerMillion: 9 },
+  });
+  assert(override.matched === "openai/gpt-4o-mini", `explicit vendor row matched ${override.matched}`);
+  assert(Math.abs(override.costUsd - 9) < 1e-9, `explicit vendor row cost ${override.costUsd}`);
+}
+
+async function testVendorPrefixedModels(dir: string, mockUrl: string): Promise<void> {
+  testVendorPriceTable();
+
+  const mockUsage: UsageTokens = { promptTokens: 100_000, completionTokens: 50_000, cachedTokens: 0, totalTokens: 150_000 };
+  const smallUsage: UsageTokens = { promptTokens: 100, completionTokens: 100, cachedTokens: 0, totalTokens: 200 };
+
+  await withApp(dir, "vendor-price", mockUrl, { softUsd: null, hardUsd: 10 }, async (base) => {
+    const cases = [
+      ["openai/gpt-4o-mini", "gpt-4o-mini"],
+      ["openai/gpt-4o-mini-2024-07-18", "gpt-4o-mini"],
+      ["openai/gpt-4o", "gpt-4o"],
+      ["openai/no-such-model", null],
+    ] as const;
+    let expectedSpend = 0;
+    for (const [requested, table] of cases) {
+      const res = await postRouted(base, requested);
+      assert(res.status === 200, `${requested} status ${res.status}`);
+      const header = Number(res.headers.get("x-spendlight-cost-usd"));
+      const expected = priced(table ?? "no-such-model-fallback-probe", mockUsage).costUsd;
+      const fallback = priced("no-such-model-fallback-probe", mockUsage).costUsd;
+      if (table) assert(Math.abs(expected - fallback) > 1e-4, `${requested} fixture matches fallback`);
+      assert(Math.abs(header - expected) < 1e-9, `${requested} billed ${header}, table price is ${expected}`);
+      await res.text();
+      expectedSpend += expected;
+    }
+    const summary = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+      spendUsd: number;
+      requests: number;
+      recent: { model: string; costUsd: number }[];
+    };
+    assert(summary.requests === cases.length, `vendor models logged ${summary.requests}`);
+    assert(Math.abs(summary.spendUsd - expectedSpend) < 1e-6, `vendor spend ${summary.spendUsd}, expected ${expectedSpend}`);
+    for (const [requested, table] of cases) {
+      const row = summary.recent.find((item) => item.model === requested);
+      assert(row != null, `ledger dropped ${requested}`);
+      const expected = priced(table ?? "no-such-model-fallback-probe", mockUsage).costUsd;
+      assert(Math.abs(row.costUsd - expected) < 1e-9, `${requested} ledger cost ${row.costUsd}`);
+    }
+  });
+
+  await withApp(dir, "vendor-gate", mockUrl, { softUsd: null, hardUsd: 0.2 }, async (base) => {
+    const mini = await postRouted(base, "openai/gpt-4o-mini", { max_tokens: 100_000, small: true });
+    assert(mini.status === 200, `openai/gpt-4o-mini was blocked on the fallback hold (${mini.status})`);
+    const miniHeader = Number(mini.headers.get("x-spendlight-cost-usd"));
+    const miniExpected = priced("gpt-4o-mini", smallUsage).costUsd;
+    assert(Math.abs(miniHeader - miniExpected) < 1e-9, `gated mini settled at ${miniHeader}, expected ${miniExpected}`);
+    await mini.text();
+
+    const full = await postRouted(base, "openai/gpt-4o", { max_tokens: 100_000, small: true });
+    assert(full.status === 402, `openai/gpt-4o should exceed a $0.20 cap, got ${full.status}`);
+    await full.text();
+
+    const unknown = await postRouted(base, "openai/not-a-real-model", { max_tokens: 100_000, small: true });
+    assert(unknown.status === 402, `unknown vendor model should keep the fallback hold, got ${unknown.status}`);
+    await unknown.text();
+
+    const summary = await summaryOf(base);
+    assert(summary.requests === 1, `vendor gate logged ${summary.requests} rows`);
+    assert(summary.budget.status === "ok", `vendor gate budget status ${summary.budget.status}`);
+  });
+}
+
+function postRouted(base: string, model: string, extra: Record<string, unknown> = {}): Promise<Response> {
+  return fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-spendlight-project": "vendor" },
+    body: JSON.stringify({
+      model,
+      routeModel: true,
+      messages: [{ role: "user", content: "hi" }],
+      ...extra,
+    }),
   });
 }
 
