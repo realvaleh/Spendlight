@@ -1,16 +1,39 @@
 import type { ModelPrice, Usage } from "./types.js";
 
+/**
+ * Exact table keys win. Otherwise the longest key that is a prefix wins, so a
+ * dated snapshot such as `gpt-4o-2024-08-06` uses the `gpt-4o` row.
+ * If that misses, the segment after the last `/` is matched the same way:
+ * `openai/gpt-4o-mini` and `openai/gpt-4o-mini-2024-07-18` use the `gpt-4o-mini`
+ * row. An exact key for the full prefixed id still wins over the bare row.
+ */
 export function lookupPrice(
   model: string,
   pricing: Record<string, ModelPrice>,
   fallback: ModelPrice,
 ): { price: ModelPrice; matched: string | null } {
+  return matchListedPrice(model, pricing) ?? matchVendorSuffix(model, pricing) ?? { price: fallback, matched: null };
+}
+
+function matchListedPrice(
+  model: string,
+  pricing: Record<string, ModelPrice>,
+): { price: ModelPrice; matched: string } | null {
   if (pricing[model]) return { price: pricing[model], matched: model };
   const keys = Object.keys(pricing).sort((a, b) => b.length - a.length);
   for (const key of keys) {
     if (model.startsWith(key)) return { price: pricing[key], matched: key };
   }
-  return { price: fallback, matched: null };
+  return null;
+}
+
+function matchVendorSuffix(
+  model: string,
+  pricing: Record<string, ModelPrice>,
+): { price: ModelPrice; matched: string } | null {
+  const slash = model.lastIndexOf("/");
+  if (slash <= 0 || slash >= model.length - 1) return null;
+  return matchListedPrice(model.slice(slash + 1), pricing);
 }
 
 export function estimateCostUsd(
