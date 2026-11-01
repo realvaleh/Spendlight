@@ -85,7 +85,34 @@ export function roughTokens(chars: number): number {
   return Math.ceil(chars / CHARS_PER_TOKEN);
 }
 
-/** Rough input size from chat messages, completion prompts, or embedding inputs. */
+function billedPromptChars(body: Record<string, unknown>, pathname: string): number {
+  let chars = 0;
+  if (body.messages != null) chars += textChars(body.messages);
+  if (body.prompt != null) chars += textChars(body.prompt);
+  if (body.input != null) chars += textChars(body.input);
+  const chat = pathname.endsWith("/chat/completions");
+  const responses = pathname.endsWith("/responses");
+  const legacyCompletion = !chat && pathname.endsWith("/completions");
+  if (chat || responses) {
+    if (body.tools != null) chars += textChars(body.tools);
+    if (body.response_format != null) chars += textChars(body.response_format);
+  }
+  if (chat && body.functions != null) chars += textChars(body.functions);
+  if (responses) {
+    if (body.instructions != null) chars += textChars(body.instructions);
+    if (body.text != null) chars += textChars(body.text);
+  }
+  if (legacyCompletion && body.suffix != null) chars += textChars(body.suffix);
+  return chars;
+}
+
+/**
+ * Rough input size from billed prompt text.
+ * Messages, completion prompts, and embedding inputs are included.
+ * Tool and function schemas, structured-output schemas, Responses instructions
+ * and text format, and a legacy completion suffix are included too. Those are
+ * billed as input tokens; leaving them out under-reserves a hard budget.
+ */
 export function preflightFromBody(
   model: string,
   body: Record<string, unknown> | null,
@@ -94,11 +121,7 @@ export function preflightFromBody(
   fallback: ModelPrice,
 ): Preflight {
   let promptChars = 0;
-  if (body) {
-    if (body.messages != null) promptChars += textChars(body.messages);
-    if (body.prompt != null) promptChars += textChars(body.prompt);
-    if (body.input != null) promptChars += textChars(body.input);
-  }
+  if (body) promptChars += billedPromptChars(body, pathname);
   const promptTokens = roughTokens(promptChars);
   const embeddings = pathname.endsWith("/embeddings");
   let outputTokens = 0;
