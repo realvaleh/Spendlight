@@ -7,7 +7,7 @@ import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } f
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
-import { estimateCostUsd } from "./pricing.js";
+import { estimateCostUsd, preflightFromBody } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
@@ -24,7 +24,7 @@ const SMALL_USAGE = {
   prompt_tokens_details: { cached_tokens: 0 },
 };
 
-const hits = { bounded: 0, unbounded: 0 };
+const hits = { bounded: 0, unbounded: 0, schema: 0 };
 
 function fail(message: string): never {
   console.error(`SMOKE FAIL: ${message}`);
@@ -95,6 +95,7 @@ async function main(): Promise<void> {
       payload = {};
     }
     if (url.pathname === "/chat/completions" || url.pathname === "/v1/chat/completions") {
+      if (payload.hold === "schema") hits.schema += 1;
       if (payload.stream === true) {
         writeStream(res);
         return;
@@ -338,6 +339,7 @@ async function main(): Promise<void> {
 
     await testUnboundedRace(dir, mockUrl);
     await testBoundedRace(dir, mockUrl);
+    await testToolSchemaHold(dir, mockUrl);
     await testStreamCutoff(dir, mockUrl);
     testCalendarDayBounds();
     testCalendarWeekBounds();
@@ -365,7 +367,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, tool schema hold, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -437,6 +439,223 @@ async function testBoundedRace(dir: string, mockUrl: string): Promise<void> {
       }),
     );
     assert(again.status === 200, `hold should release after settle, got ${again.status}`);
+    await again.text();
+  });
+}
+
+async function testToolSchemaHold(dir: string, mockUrl: string): Promise<void> {
+  const pricing = DEFAULT_PRICING;
+  const messages = [{ role: "user", content: "hi" }];
+  const big = "x".repeat(80_000);
+  const tools = [
+    { type: "function", function: { name: "lookup", description: big, parameters: { type: "object", properties: {} } } },
+  ];
+  const withTools = preflightFromBody(
+    "gpt-4o",
+    { messages, tools, max_tokens: 100 },
+    "/v1/chat/completions",
+    pricing,
+    DEFAULT_FALLBACK,
+  );
+  const bare = preflightFromBody(
+    "gpt-4o",
+    { messages, max_tokens: 100 },
+    "/v1/chat/completions",
+    pricing,
+    DEFAULT_FALLBACK,
+  );
+  assert(
+    withTools.promptCostUsd > 0.04 && withTools.costUsd > bare.costUsd,
+    `tool schema should raise the gpt-4o hold above $0.04, got prompt ${withTools.promptCostUsd} total ${withTools.costUsd} bare ${bare.costUsd}`,
+  );
+
+  const functions = preflightFromBody(
+    "gpt-4o",
+    { messages, functions: [{ name: "lookup", description: big, parameters: {} }], max_tokens: 10 },
+    "/v1/chat/completions",
+    pricing,
+    DEFAULT_FALLBACK,
+  );
+  assert(functions.promptCostUsd > 0.04, `legacy functions omitted from hold (${functions.promptCostUsd})`);
+
+  const schema = preflightFromBody(
+    "gpt-4o",
+    {
+      messages,
+      max_tokens: 10,
+      response_format: { type: "json_schema", json_schema: { name: "out", schema: { description: big } } },
+    },
+    "/v1/chat/completions",
+    pricing,
+    DEFAULT_FALLBACK,
+  );
+  assert(schema.promptCostUsd > 0.04, `response_format schema omitted from hold (${schema.promptCostUsd})`);
+
+  const instructions = preflightFromBody(
+    "gpt-4o",
+    { input: "hi", instructions: big, max_tokens: 10 },
+    "/v1/responses",
+    pricing,
+    DEFAULT_FALLBACK,
+  );
+  assert(instructions.promptCostUsd > 0.04, `responses instructions omitted from hold (${instructions.promptCostUsd})`);
+
+  const format = preflightFromBody(
+    "gpt-4o",
+    { input: "hi", max_tokens: 10, text: { format: { type: "json_schema", schema: { description: big } } } },
+    "/v1/responses",
+    pricing,
+    DEFAULT_FALLBACK,
+  );
+  assert(format.promptCostUsd > 0.04, `responses text format omitted from hold (${format.promptCostUsd})`);
+
+  const suffix = preflightFromBody(
+    "gpt-4o",
+    { prompt: "hi", suffix: big, max_tokens: 10 },
+    "/v1/completions",
+    pricing,
+    DEFAULT_FALLBACK,
+  );
+  assert(suffix.promptCostUsd > 0.04, `completion suffix omitted from hold (${suffix.promptCostUsd})`);
+
+  const embedded = preflightFromBody(
+    "text-embedding-3-large",
+    { input: "hi", tools },
+    "/v1/embeddings",
+    pricing,
+    DEFAULT_FALLBACK,
+  );
+  const embeddedBare = preflightFromBody(
+    "text-embedding-3-large",
+    { input: "hi" },
+    "/v1/embeddings",
+    pricing,
+    DEFAULT_FALLBACK,
+  );
+  assert(
+    embedded.costUsd === embeddedBare.costUsd && embedded.usage.promptTokens === embeddedBare.usage.promptTokens,
+    "embedding preflight must ignore a tools field",
+  );
+
+  hits.schema = 0;
+  await withApp(dir, "tool-schema", mockUrl, { softUsd: null, hardUsd: 0.02 }, async (base) => {
+    const blocked = await postChat(
+      base,
+      "schema",
+      JSON.stringify({ model: "gpt-4o", max_tokens: 100, messages, tools, hold: "schema" }),
+    );
+    const blockedBody = (await blocked.json()) as { error?: { code?: string; message?: string } };
+    assert(blocked.status === 402, `tool schema over the cap should be 402, got ${blocked.status}`);
+    assert(blockedBody.error?.code === "budget_hard_limit", "tool schema 402 missing budget code");
+    assert(blockedBody.error?.message?.includes("preflight") === true, blockedBody.error?.message ?? "missing preflight message");
+    assert(Number(hits.schema) === 0, `over-cap tool schema reached upstream ${hits.schema} times`);
+
+    const legacy = await postChat(
+      base,
+      "schema",
+      JSON.stringify({
+        model: "gpt-4o",
+        max_tokens: 100,
+        messages,
+        functions: [{ name: "lookup", description: big, parameters: {} }],
+        hold: "schema",
+      }),
+    );
+    assert(legacy.status === 402, `legacy functions over the cap should be 402, got ${legacy.status}`);
+    await legacy.text();
+    assert(Number(hits.schema) === 0, "legacy functions reached upstream");
+
+    const formatted = await postChat(
+      base,
+      "schema",
+      JSON.stringify({
+        model: "gpt-4o",
+        max_tokens: 100,
+        messages,
+        response_format: { type: "json_schema", json_schema: { name: "out", schema: { description: big } } },
+        hold: "schema",
+      }),
+    );
+    assert(formatted.status === 402, `response_format over the cap should be 402, got ${formatted.status}`);
+    await formatted.text();
+
+    const instructed = await fetch(`${base}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-spendlight-project": "schema" },
+      body: JSON.stringify({ model: "gpt-4o", max_tokens: 100, input: "hi", instructions: big }),
+    });
+    assert(instructed.status === 402, `responses instructions over the cap should be 402, got ${instructed.status}`);
+    await instructed.text();
+
+    const suffixed = await fetch(`${base}/v1/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-spendlight-project": "schema" },
+      body: JSON.stringify({ model: "gpt-4o", max_tokens: 100, prompt: "hi", suffix: big }),
+    });
+    assert(suffixed.status === 402, `completion suffix over the cap should be 402, got ${suffixed.status}`);
+    await suffixed.text();
+
+    const unbounded = await postChat(
+      base,
+      "schema",
+      JSON.stringify({ model: "gpt-4o", messages, tools, hold: "schema" }),
+    );
+    assert(unbounded.status === 402, `tool schema above the cap should 402 without max_tokens, got ${unbounded.status}`);
+    await unbounded.text();
+    assert(Number(hits.schema) === 0, "unbounded tool schema reached upstream");
+
+    const allowed = await postChat(
+      base,
+      "schema",
+      JSON.stringify({
+        model: "gpt-4o",
+        max_tokens: 100,
+        small: true,
+        messages,
+        tools: [{ type: "function", function: { name: "ping", description: "adds", parameters: {} } }],
+        hold: "schema",
+      }),
+    );
+    assert(allowed.status === 200, `short tool schema should be proxied, got ${allowed.status}`);
+    await allowed.text();
+    assert(Number(hits.schema) === 1, `short tool schema reached upstream ${hits.schema} times`);
+
+    const raceTools = [
+      {
+        type: "function",
+        function: { name: "lookup", description: "x".repeat(20_000), parameters: { type: "object", properties: {} } },
+      },
+    ];
+    const one = preflightFromBody(
+      "gpt-4o",
+      { messages, tools: raceTools, max_tokens: 10 },
+      "/v1/chat/completions",
+      pricing,
+      DEFAULT_FALLBACK,
+    );
+    assert(one.costUsd < 0.02 && one.costUsd * 2 > 0.02, `race hold should fit once and not twice, got ${one.costUsd}`);
+    hits.schema = 0;
+    const raceBody = JSON.stringify({
+      model: "gpt-4o",
+      max_tokens: 10,
+      delay: true,
+      small: true,
+      messages,
+      tools: raceTools,
+      hold: "schema",
+    });
+    const [a, b] = await Promise.all([postChat(base, "schema", raceBody), postChat(base, "schema", raceBody)]);
+    const statuses = [a.status, b.status].sort((x, y) => x - y);
+    assert(statuses[0] === 200 && statuses[1] === 402, `tool schema race statuses ${statuses.join(",")}`);
+    assert(Number(hits.schema) === 1, `tool schema race reached upstream ${hits.schema} times`);
+    await Promise.all([a.text(), b.text()]);
+
+    const again = await postChat(
+      base,
+      "schema",
+      JSON.stringify({ model: "gpt-4o", max_tokens: 10, small: true, messages, hold: "schema" }),
+    );
+    assert(again.status === 200, `schema hold should release after settle, got ${again.status}`);
     await again.text();
   });
 }
