@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
 import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
-import { closeDb, insertRequest, openDb, type Db } from "./db.js";
+import { closeDb, insertRequest, insertReservation, openDb, settleReservation, spendFor, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
@@ -349,6 +349,7 @@ async function main(): Promise<void> {
     testReservationOutsideDay(dir);
     testReservationOutsideWeek(dir);
     testReservationOutsideMonth(dir);
+    testSettledSpendStaysInReservedWindow(dir);
     await testDayWindow(dir, mockUrl);
     await testWeekWindow(dir, mockUrl);
     await testMonthWindow(dir, mockUrl);
@@ -365,7 +366,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, reserved-window settle, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -930,6 +931,80 @@ function testMonthLedgerWindow(dir: string): void {
   assert(lifetime.status === "hard", `lifetime should be hard, got ${lifetime.status}`);
   assert(!lifetime.message?.includes("this month"), lifetime.message ?? "");
   closeDb(db);
+}
+
+/**
+ * A call that starts before a day, week, or month reset and finishes after it
+ * was reserved against the old window. The ledger must keep that start time.
+ * Stamping completion instead charges the new window, which never held the
+ * spend, and the next call can be admitted on top of it.
+ */
+function testSettledSpendStaysInReservedWindow(dir: string): void {
+  for (const period of ["day", "week", "month"] as const) {
+    const configPath = join(dir, `settle-${period}.json`);
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        dbPath: ":memory:",
+        budgets: {
+          period,
+          timezone: "America/New_York",
+          global: { softUsd: null, hardUsd: 1 },
+        },
+      }),
+    );
+    const config = loadConfig(configPath);
+    const db = openDb(":memory:");
+    const now = new Date();
+    const window = spendWindow(config, now);
+    assert(window, `${period}: expected a calendar window`);
+    const startedAt = new Date(Date.parse(window.startIso) - 60_000).toISOString();
+    insertReservation(db, "cross-window", "demo", 1);
+    db.prepare(`UPDATE reservations SET created_at = ? WHERE id = ?`).run(startedAt, "cross-window");
+
+    const row = settleReservation(db, "cross-window", {
+      project: "demo",
+      model: "gpt-4o-mini",
+      usage: { promptTokens: 100, completionTokens: 100, cachedTokens: 0, totalTokens: 200 },
+      costUsd: 0.75,
+      status: 200,
+      path: "/v1/chat/completions",
+    });
+    assert(
+      row.createdAt === startedAt,
+      `${period}: ledger stamped ${row.createdAt}, want reservation start ${startedAt}`,
+    );
+    const today = spendFor(db, "demo", window);
+    assert(today === 0, `${period}: new window charged ${today} for a call reserved before it opened`);
+    const prior = spendWindow(config, new Date(startedAt));
+    assert(
+      prior != null && prior.endIso === window.startIso,
+      `${period}: previous window should end at ${window.startIso}, got ${prior?.endIso}`,
+    );
+    const priorSpend = spendFor(db, "demo", prior);
+    assert(
+      Math.abs(priorSpend - 0.75) < 1e-9,
+      `${period}: reserved window spend ${priorSpend}, want 0.75`,
+    );
+
+    const next = admitMutating(
+      db,
+      config,
+      "demo",
+      {
+        usage: { promptTokens: 1, completionTokens: 1, cachedTokens: 0, totalTokens: 2 },
+        outputBounded: true,
+        costUsd: 0.75,
+        promptCostUsd: 0.25,
+      },
+      now,
+    );
+    assert(
+      next.allowed,
+      `${period}: new window should admit a call that fits its own cap, got ${next.decision.message}`,
+    );
+    closeDb(db);
+  }
 }
 
 function testReservationOutsideDay(dir: string): void {

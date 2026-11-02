@@ -439,6 +439,12 @@ export function releaseReservation(db: Db, reservationId: string | null): void {
   });
 }
 
+/**
+ * Replace the in-flight hold with the ledger row.
+ * The row keeps the reservation's start time, so a call that runs past a
+ * day, week, or month reset stays in the window that reserved the budget.
+ * A hold that was already dropped is stamped when the call finishes.
+ */
 export function settleReservation(
   db: Db,
   reservationId: string | null,
@@ -458,9 +464,17 @@ export function settleReservation(
 ): LedgerRow {
   if (!reservationId) return insertRequest(db, row);
   return withImmediate(db, () => {
+    const startedAt = reservationStartedAt(db, reservationId);
     deleteReservation(db, reservationId);
-    return insertRequest(db, row);
+    return insertRequest(db, { ...row, createdAt: startedAt ?? row.createdAt });
   });
+}
+
+function reservationStartedAt(db: Db, id: string): string | null {
+  const found = db.prepare(`SELECT created_at AS createdAt FROM reservations WHERE id = ?`).get(id) as
+    | { createdAt: string }
+    | undefined;
+  return found?.createdAt ?? null;
 }
 
 export function closeDb(db: Db): void {
