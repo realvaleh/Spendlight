@@ -3,9 +3,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
-import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
+import { DEFAULT_FALLBACK, DEFAULT_PRICING, DEFAULT_UPSTREAM_TIMEOUT_MS, loadConfig, normalizeUpstreamUrl } from "./config.js";
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
-import { closeDb, insertRequest, openDb, type Db } from "./db.js";
+import { closeDb, insertRequest, openDb, reservedSpend, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
@@ -159,6 +159,7 @@ async function main(): Promise<void> {
   delete process.env.SPENDLIGHT_HOST;
   delete process.env.SPENDLIGHT_DB;
   delete process.env.OPENAI_BASE_URL;
+  delete process.env.SPENDLIGHT_UPSTREAM_TIMEOUT_MS;
 
   const config = loadConfig(configPath);
   config.port = 0;
@@ -339,6 +340,8 @@ async function main(): Promise<void> {
     await testUnboundedRace(dir, mockUrl);
     await testBoundedRace(dir, mockUrl);
     await testStreamCutoff(dir, mockUrl);
+    await testUpstreamHangTimeout(dir);
+    testUpstreamTimeoutConfig(dir);
     testCalendarDayBounds();
     testCalendarWeekBounds();
     testCalendarMonthBounds();
@@ -365,11 +368,185 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, upstream hang timeout, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
     rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function testUpstreamHangTimeout(dir: string): Promise<void> {
+  const mock = createServer(async (req, res) => {
+    res.on("error", () => {});
+    req.on("error", () => {});
+    const raw = await readReq(req).catch(() => "");
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    } catch {
+      payload = {};
+    }
+    if (payload.hang === true) {
+      await new Promise<void>((resolve) => {
+        req.on("close", () => resolve());
+        res.on("close", () => resolve());
+      });
+      return;
+    }
+    const body = JSON.stringify({
+      id: "chatcmpl-after-hang",
+      object: "chat.completion",
+      created: 1_700_000_000,
+      model: "gpt-4o-mini",
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      usage: SMALL_USAGE,
+    });
+    if (!res.writableEnded) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(body);
+    }
+  });
+  await new Promise<void>((resolve) => mock.listen(0, "127.0.0.1", resolve));
+  const addr = mock.address();
+  assert(addr && typeof addr === "object", "hang mock failed to bind");
+  const mockUrl = `http://127.0.0.1:${addr.port}/v1`;
+  const timeoutMs = 1_000;
+  try {
+    await withApp(dir, "upstream-hang", mockUrl, { softUsd: null, hardUsd: 0.04 }, async (base, app) => {
+      try {
+        const started = Date.now();
+        const hung = postChat(
+          base,
+          "hang",
+          JSON.stringify({
+            model: "gpt-4o-mini",
+            max_tokens: 50_000,
+            hang: true,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        );
+        let held = 0;
+        for (let i = 0; i < 20; i++) {
+          held = reservedSpend(app.db, "hang");
+          if (held > 0) break;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert(held > 0.02, `silent upstream should hold a reservation, got ${held}`);
+
+        const blocked = await postChat(
+          base,
+          "hang",
+          JSON.stringify({
+            model: "gpt-4o-mini",
+            max_tokens: 50_000,
+            messages: [{ role: "user", content: "second" }],
+          }),
+        );
+        assert(blocked.status === 402, `in-flight hang should 402 a second call, got ${blocked.status}`);
+        await blocked.text();
+
+        const timed = await Promise.race([
+          hung,
+          new Promise<Response>((_, reject) => {
+            setTimeout(() => reject(new Error("hung upstream did not time out")), 5_000);
+          }),
+        ]);
+        const elapsed = Date.now() - started;
+        const text = await timed.text();
+        assert(timed.status === 504, `hang status ${timed.status}: ${text.slice(0, 240)}`);
+        assert(elapsed < 4_000, `hang took ${elapsed}ms; timeout did not fire`);
+        const body = JSON.parse(text) as { error?: { type?: string; code?: string; message?: string; param?: unknown } };
+        assert(body.error?.type === "spendlight_upstream_timeout", `timeout type ${body.error?.type}`);
+        assert(body.error?.code === "upstream_timeout", `timeout code ${body.error?.code}`);
+        assert(body.error?.param === null, "timeout error should include param null");
+        assert(body.error?.message?.includes(`${timeoutMs}ms`) === true, body.error?.message ?? "");
+        assert(body.error?.message?.toLowerCase().includes("reservation was released") === true, body.error?.message ?? "");
+
+        const left = reservedSpend(app.db);
+        assert(left === 0, `reservation still held after timeout (${left})`);
+
+        const again = await postChat(
+          base,
+          "hang",
+          JSON.stringify({
+            model: "gpt-4o-mini",
+            max_tokens: 50_000,
+            messages: [{ role: "user", content: "after" }],
+          }),
+        );
+        const againText = await again.text();
+        assert(
+          again.status === 200,
+          `budget should admit a call after the hold is released, got ${again.status}: ${againText.slice(0, 180)}`,
+        );
+        const summary = await summaryOf(base);
+        assert(summary.requests === 1, `timeout must not bill the hung call, logged ${summary.requests}`);
+        assert(summary.spendUsd > 0 && summary.spendUsd < 0.001, `follow-up spend ${summary.spendUsd}`);
+      } finally {
+        mock.closeAllConnections?.();
+      }
+    }, timeoutMs);
+  } finally {
+    mock.closeAllConnections?.();
+    await new Promise<void>((resolve) => mock.close(() => resolve()));
+  }
+}
+
+function testUpstreamTimeoutConfig(dir: string): void {
+  const path = join(dir, "timeout.json");
+  const barePath = join(dir, "timeout-bare.json");
+  writeFileSync(path, JSON.stringify({ upstream: { timeoutMs: 1500 }, budgets: { global: { hardUsd: 1 } } }));
+  writeFileSync(barePath, JSON.stringify({ budgets: { global: { hardUsd: 1 } } }));
+  const saved = process.env.SPENDLIGHT_UPSTREAM_TIMEOUT_MS;
+  try {
+    delete process.env.SPENDLIGHT_UPSTREAM_TIMEOUT_MS;
+    const bare = loadConfig(barePath);
+    assert(bare.upstreamTimeoutMs === DEFAULT_UPSTREAM_TIMEOUT_MS, `default timeout ${bare.upstreamTimeoutMs}`);
+    assert(DEFAULT_UPSTREAM_TIMEOUT_MS === 120_000, "documented default is 120000ms");
+
+    const fromFile = loadConfig(path);
+    assert(fromFile.upstreamTimeoutMs === 1500, `file timeout ${fromFile.upstreamTimeoutMs}`);
+
+    process.env.SPENDLIGHT_UPSTREAM_TIMEOUT_MS = "2500";
+    const fromEnv = loadConfig(path);
+    assert(fromEnv.upstreamTimeoutMs === 2500, `env timeout should override file, got ${fromEnv.upstreamTimeoutMs}`);
+
+    process.env.SPENDLIGHT_UPSTREAM_TIMEOUT_MS = "0";
+    const disabled = loadConfig(path);
+    assert(disabled.upstreamTimeoutMs === 0, "0 disables the upstream timer");
+
+    delete process.env.SPENDLIGHT_UPSTREAM_TIMEOUT_MS;
+    writeFileSync(path, JSON.stringify({ upstream: { timeoutMs: 0 } }));
+    assert(loadConfig(path).upstreamTimeoutMs === 0, "file timeout 0 disables the timer");
+
+    let threw = false;
+    try {
+      process.env.SPENDLIGHT_UPSTREAM_TIMEOUT_MS = "-5";
+      loadConfig(path);
+    } catch (err) {
+      threw = true;
+      const message = err instanceof Error ? err.message : String(err);
+      assert(message.includes("-5"), message);
+      assert(message.includes("SPENDLIGHT_UPSTREAM_TIMEOUT_MS"), message);
+    }
+    assert(threw, "negative upstream timeout must fail startup");
+
+    threw = false;
+    delete process.env.SPENDLIGHT_UPSTREAM_TIMEOUT_MS;
+    writeFileSync(path, JSON.stringify({ upstream: { timeoutMs: "soon" } }));
+    try {
+      loadConfig(path);
+    } catch (err) {
+      threw = true;
+      const message = err instanceof Error ? err.message : String(err);
+      assert(message.includes("soon"), message);
+      assert(message.includes("upstream.timeoutMs"), message);
+    }
+    assert(threw, "non-numeric upstream timeout must fail startup");
+  } finally {
+    if (saved == null) delete process.env.SPENDLIGHT_UPSTREAM_TIMEOUT_MS;
+    else process.env.SPENDLIGHT_UPSTREAM_TIMEOUT_MS = saved;
   }
 }
 
@@ -481,6 +658,7 @@ async function withApp(
   mockUrl: string,
   budgets: SmokeBudgets,
   fn: (base: string, app: App) => Promise<void>,
+  upstreamTimeoutMs?: number,
 ): Promise<void> {
   const dbPath = join(dir, `${name}.db`);
   const configPath = join(dir, `${name}.json`);
@@ -490,7 +668,10 @@ async function withApp(
       host: "127.0.0.1",
       port: 0,
       dbPath,
-      upstream: { baseUrl: mockUrl },
+      upstream: {
+        baseUrl: mockUrl,
+        ...(upstreamTimeoutMs != null ? { timeoutMs: upstreamTimeoutMs } : {}),
+      },
       budgets: {
         period: budgets.period,
         timezone: budgets.timezone,
