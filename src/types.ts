@@ -19,6 +19,11 @@ export type Config = {
   configPath: string | null;
   upstreamBaseUrl: string;
   upstreamApiKey: string | null;
+  /**
+   * How long to wait for upstream response headers before aborting the fetch
+   * and releasing any hard-budget reservation. `0` disables Spendlight's timer.
+   */
+  upstreamTimeoutMs: number;
   budgets: {
     global: BudgetLimit;
     projects: Record<string, BudgetLimit>;

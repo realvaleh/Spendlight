@@ -105,6 +105,20 @@ export async function proxyRequest(
     }
   };
 
+  const timeoutMs = config.upstreamTimeoutMs;
+  let timedOut = false;
+  const headerTimer =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          ac.abort();
+        }, timeoutMs)
+      : undefined;
+  headerTimer?.unref();
+  const stopHeaderTimer = () => {
+    if (headerTimer) clearTimeout(headerTimer);
+  };
+
   let upstream: Response;
   try {
     upstream = await fetch(upstreamUrl, {
@@ -114,7 +128,12 @@ export async function proxyRequest(
       signal: ac.signal,
     });
   } catch (err) {
+    stopHeaderTimer();
     release();
+    if (timedOut || isHeadersTimeout(err)) {
+      json(res, 504, upstreamTimeoutBody(timeoutMs, timedOut), {}, req);
+      return;
+    }
     const message = err instanceof Error ? err.message : String(err);
     json(
       res,
@@ -127,6 +146,8 @@ export async function proxyRequest(
     );
     return;
   }
+  // Headers arrived. A long stream or body is not cut off by this timer.
+  stopHeaderTimer();
 
   try {
     const outHeaders = filterResponseHeaders(upstream.headers, req);
@@ -318,6 +339,30 @@ function completionCharsFromEvent(event: string): number {
     chars += completionCharsFromSseData(trimmed.slice(5).trim());
   }
   return chars;
+}
+
+function upstreamTimeoutBody(timeoutMs: number, fromConfiguredTimer: boolean) {
+  const after = fromConfiguredTimer && timeoutMs > 0 ? ` after ${timeoutMs}ms` : "";
+  return {
+    error: {
+      message: `Spendlight upstream timed out${after} waiting for response headers. No tokens were used; the in-flight budget reservation was released.`,
+      type: "spendlight_upstream_timeout",
+      param: null,
+      code: "upstream_timeout",
+    },
+  };
+}
+
+function isHeadersTimeout(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const rec = current as { code?: unknown; name?: unknown; cause?: unknown };
+    if (rec.code === "UND_ERR_HEADERS_TIMEOUT" || rec.name === "HeadersTimeoutError") return true;
+    current = rec.cause;
+  }
+  return false;
 }
 
 function isMutating(method: string): boolean {

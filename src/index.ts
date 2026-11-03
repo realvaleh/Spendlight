@@ -23,6 +23,11 @@ console.log(`  receipts   ${url}/receipt.md  ${url}/receipt.svg  ${url}/badge.sv
 console.log(`  export     ${url}/api/export.csv  ${url}/api/export.json`);
 console.log(`  db         ${config.dbPath}`);
 console.log(`  upstream   ${config.upstreamBaseUrl}`);
+if (config.upstreamTimeoutMs > 0) {
+  console.log(`  timeout    ${config.upstreamTimeoutMs}ms`);
+} else {
+  console.log("  timeout    disabled");
+}
 if (config.budgets.period === "day" || config.budgets.period === "week" || config.budgets.period === "month") {
   console.log(`  budget     ${config.budgets.period} (${config.budgets.timezone})`);
 } else {
