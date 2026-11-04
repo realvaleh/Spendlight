@@ -29,11 +29,22 @@ export const DEFAULT_FALLBACK: ModelPrice = {
   cachedInputPerMillion: 0.5,
 };
 
+/**
+ * Max quiet time between upstream body chunks after response headers.
+ * Two minutes is long enough for a slow stream that still sends, and short
+ * of the 15-minute stale-reservation sweep. `0` disables the timer.
+ * This does not limit how long Spendlight waits for the headers themselves.
+ */
+export const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 120_000;
+
+/** `setTimeout` fires immediately above this, so a larger config is not a longer wait. */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
 type FileConfig = {
   host?: string;
   port?: number;
   dbPath?: string;
-  upstream?: { baseUrl?: string; apiKey?: string };
+  upstream?: { baseUrl?: string; apiKey?: string; idleTimeoutMs?: unknown };
   budgets?: {
     global?: Partial<BudgetLimit>;
     projects?: Record<string, Partial<BudgetLimit>>;
@@ -84,6 +95,28 @@ function parseTimeZone(raw: string | undefined, period: BudgetPeriod): string {
   const timeZone = raw.trim();
   assertIanaTimeZone(timeZone);
   return timeZone;
+}
+
+function parseTimeoutMs(raw: unknown, source: string): number {
+  const n = typeof raw === "number" ? raw : Number(typeof raw === "string" ? raw.trim() : raw);
+  if (!Number.isFinite(n) || n < 0 || n > MAX_TIMEOUT_MS) {
+    throw new Error(
+      `Invalid upstream idle timeout "${String(raw)}" (${source}). Expected a non-negative number of milliseconds up to ${MAX_TIMEOUT_MS}, or 0 to disable (upstream.idleTimeoutMs or SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS).`,
+    );
+  }
+  return n;
+}
+
+function upstreamIdleTimeoutFrom(fileValue: unknown): number {
+  let timeoutMs = DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
+  if (fileValue != null && fileValue !== "") {
+    timeoutMs = parseTimeoutMs(fileValue, "upstream.idleTimeoutMs");
+  }
+  const envTimeout = strEnv("SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS");
+  if (envTimeout != null) {
+    timeoutMs = parseTimeoutMs(envTimeout, "SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS");
+  }
+  return timeoutMs;
 }
 
 function parseBudget(raw: Partial<BudgetLimit> | undefined): BudgetLimit {
@@ -159,6 +192,7 @@ export function loadConfig(explicitPath?: string): Config {
         "https://api.openai.com/v1",
     ),
     upstreamApiKey: process.env.OPENAI_API_KEY ?? file.upstream?.apiKey ?? null,
+    upstreamIdleTimeoutMs: upstreamIdleTimeoutFrom(file.upstream?.idleTimeoutMs),
     budgets: { global, projects, period, timezone },
     pricing,
     fallbackPrice: {
@@ -179,6 +213,7 @@ Point any OpenAI client at http://HOST:PORT/v1 and keep (or omit) your API key.
 Env:
   OPENAI_API_KEY                 Upstream key (optional if clients send Authorization)
   OPENAI_BASE_URL                Upstream base, default https://api.openai.com/v1
+  SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS  Abort if the upstream body is idle after headers (default 120000, 0 disables)
   SPENDLIGHT_HOST                Bind address (default 127.0.0.1; Docker uses 0.0.0.0)
   SPENDLIGHT_PORT                Port (default 8787)
   SPENDLIGHT_DB                  SQLite path

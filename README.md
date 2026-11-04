@@ -221,6 +221,8 @@ curl ... -d '{"model":"gpt-4o-mini","spendlight_project":"demo","messages":[...]
 
 Mutating priced calls take a SQLite `BEGIN IMMEDIATE` reservation before upstream: the preflight estimate when `max_tokens` / `max_completion_tokens` is set, otherwise the remaining hard headroom. That hold counts toward the hard cap until the call settles to **actual** usage, so a concurrent request sees the in-flight hold. A single call can still finish above the cap when real usage exceeds the estimate; the ledger stores that actual cost. Streaming chats stop forwarding once a running token estimate reaches the reserved amount. A finished stream logs provider usage; a cut stream logs the partial estimate. Reservations older than 15 minutes are dropped so a crash cannot wedge the kill-switch.
 
+If response headers have already arrived and then no further body bytes show up for `upstream.idleTimeoutMs` (default **120000**, two minutes), Spendlight aborts that upstream request, releases the hold, and returns **504** with an OpenAI-shaped `spendlight_upstream_idle_timeout` error. No ledger row is written when nothing was forwarded. A stream that already started keeps the status line it sent and ends with that same error as an SSE frame; completion text already forwarded is logged as a partial estimate. Chunks that keep arriving inside the idle window reset the clock, so a slow stream is not cut off. Set the timeout to `0` to disable it. The 15-minute reservation sweep remains the backstop when the process crashes mid-call.
+
 Hard-limit responses look like OpenAI errors:
 
 ```json
@@ -325,6 +327,7 @@ Spendlight is a **localhost reverse proxy that can spend your API key**. Treat t
 | --- | --- | --- |
 | `OPENAI_API_KEY` | — | Upstream key if the client does not send `Authorization` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Upstream OpenAI-compatible base |
+| `SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS` | `120000` | Abort when the upstream body goes quiet after response headers, and release the hard-budget hold. `0` disables |
 | `SPENDLIGHT_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` inside Docker) |
 | `SPENDLIGHT_PORT` | `8787` | Listen port |
 | `SPENDLIGHT_DB` | `./data/spendlight.db` | SQLite path (`/data/spendlight.db` in Docker) |
