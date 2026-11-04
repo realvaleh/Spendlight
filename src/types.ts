@@ -19,6 +19,11 @@ export type Config = {
   configPath: string | null;
   upstreamBaseUrl: string;
   upstreamApiKey: string | null;
+  /**
+   * Quiet time allowed between upstream body chunks after response headers.
+   * Each chunk resets the clock. `0` disables the idle timer.
+   */
+  upstreamIdleTimeoutMs: number;
   budgets: {
     global: BudgetLimit;
     projects: Record<string, BudgetLimit>;

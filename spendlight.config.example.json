@@ -3,7 +3,8 @@
   "port": 8787,
   "dbPath": "./data/spendlight.db",
   "upstream": {
-    "baseUrl": "https://api.openai.com/v1"
+    "baseUrl": "https://api.openai.com/v1",
+    "idleTimeoutMs": 120000
   },
   "budgets": {
     "period": "day",

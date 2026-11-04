@@ -141,6 +141,9 @@ export async function proxyRequest(
 
     const contentType = upstream.headers.get("content-type") ?? "";
     const streamed = stream || contentType.includes("text/event-stream");
+    // Headers are in. This clock resets on every body chunk. It does not cap a
+    // stream that keeps sending, and 0 leaves the body read unbounded.
+    const idleMs = config.upstreamIdleTimeoutMs;
 
     if (streamed && upstream.body) {
       for (const key of Object.keys(outHeaders)) {
@@ -154,7 +157,27 @@ export async function proxyRequest(
         model,
         pricing: config.pricing,
         fallback: config.fallbackPrice,
+        idleTimeoutMs: idleMs,
       });
+      if (piped.idle) {
+        if (piped.usage.completionTokens > 0) {
+          logCompleted({
+            db,
+            config,
+            project,
+            model,
+            usage: piped.usage,
+            status: upstream.status,
+            path: url.pathname,
+            streamed: true,
+            upstreamId: piped.upstreamId,
+            error: "upstream body idle timeout",
+            reservationId,
+          });
+          settled = true;
+        }
+        return;
+      }
       if (priced || piped.usage.totalTokens > 0) {
         logCompleted({
           db,
@@ -174,7 +197,20 @@ export async function proxyRequest(
       return;
     }
 
-    const buf = Buffer.from(await upstream.arrayBuffer());
+    let buf: Buffer;
+    try {
+      buf = await readUpstreamBody(upstream.body, idleMs, () => ac.abort());
+    } catch (err) {
+      if (err instanceof BodyIdleTimeout) {
+        if (!res.headersSent) {
+          json(res, 504, upstreamIdleTimeoutBody(err.timeoutMs), {}, req);
+        } else if (!res.writableEnded) {
+          res.end();
+        }
+        return;
+      }
+      throw err;
+    }
     let usage = zeroUsage();
     let upstreamId: string | null = null;
     let loggedModel = model;
@@ -222,18 +258,99 @@ type PipeArgs = {
   model: string;
   pricing: Config["pricing"];
   fallback: Config["fallbackPrice"];
+  /** `0` disables the gap timer. A chunk resets it; silence after headers does not. */
+  idleTimeoutMs: number;
 };
+
+class BodyIdleTimeout extends Error {
+  readonly timeoutMs: number;
+  constructor(timeoutMs: number) {
+    super(`upstream body idle for ${timeoutMs}ms`);
+    this.name = "BodyIdleTimeout";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+type BodyRead = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>;
+
+type ReadNext = { kind: "data"; value: BodyRead } | { kind: "error"; err: unknown } | { kind: "idle" };
+
+/** Wait for the next body chunk. A positive `idleMs` rejects the wait, not a stream that keeps sending. */
+async function readNext(reader: ReadableStreamDefaultReader<Uint8Array>, idleMs: number): Promise<BodyRead> {
+  if (!(idleMs > 0)) return reader.read();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const pending: Promise<ReadNext> = reader.read().then(
+    (value) => ({ kind: "data", value }),
+    (err: unknown) => ({ kind: "error", err }),
+  );
+  try {
+    const result = await Promise.race([
+      pending,
+      new Promise<ReadNext>((resolve) => {
+        timer = setTimeout(() => resolve({ kind: "idle" }), idleMs);
+        timer.unref();
+      }),
+    ]);
+    if (result.kind === "idle") throw new BodyIdleTimeout(idleMs);
+    if (result.kind === "error") throw result.err;
+    return result.value;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function readUpstreamBody(body: ReadableStream<Uint8Array> | null, idleMs: number, onIdle: () => void): Promise<Buffer> {
+  if (!body) return Buffer.alloc(0);
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  try {
+    for (;;) {
+      let next: BodyRead;
+      try {
+        next = await readNext(reader, idleMs);
+      } catch (err) {
+        if (err instanceof BodyIdleTimeout) {
+          onIdle();
+          void reader.cancel().catch(() => {});
+        }
+        throw err;
+      }
+      if (next.done) break;
+      if (next.value?.byteLength) chunks.push(Buffer.from(next.value));
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Cancelled, or the lock was already released.
+    }
+  }
+  return Buffer.concat(chunks);
+}
+
+function upstreamIdleTimeoutBody(timeoutMs: number) {
+  const after = timeoutMs > 0 ? ` for ${timeoutMs}ms` : "";
+  return {
+    error: {
+      message: `Spendlight upstream sent response headers then went idle${after} with no further body bytes. The in-flight budget reservation was released.`,
+      type: "spendlight_upstream_idle_timeout",
+      param: null,
+      code: "upstream_idle_timeout",
+    },
+  };
+}
 
 async function pipeSse(
   body: ReadableStream<Uint8Array>,
   res: ServerResponse,
   args: PipeArgs,
-): Promise<{ usage: Usage; upstreamId: string | null; stopped: boolean }> {
+): Promise<{ usage: Usage; upstreamId: string | null; stopped: boolean; idle: boolean }> {
   const reader = body.getReader();
   let pending = Buffer.alloc(0);
   let completionChars = 0;
   let forwarded = "";
   let stopped = false;
+  let idleTimedOut = false;
   const promptTokens = args.preflight?.usage.promptTokens ?? 0;
 
   const runningCost = (chars: number) =>
@@ -251,7 +368,17 @@ async function pipeSse(
 
   try {
     while (!stopped) {
-      const { done, value } = await reader.read();
+      let next: BodyRead;
+      try {
+        next = await readNext(reader, args.idleTimeoutMs);
+      } catch (err) {
+        if (!(err instanceof BodyIdleTimeout)) throw err;
+        idleTimedOut = true;
+        args.ac.abort();
+        void reader.cancel().catch(() => {});
+        break;
+      }
+      const { done, value } = next;
       if (done) break;
       pending = Buffer.concat([pending, Buffer.from(value)]);
       while (!stopped) {
@@ -281,6 +408,9 @@ async function pipeSse(
       }
       const frame = `data: ${JSON.stringify(budgetErrorBody("Spendlight hard budget reached while streaming; forwarding stopped."))}\n\n`;
       if (!res.writableEnded) res.write(frame);
+    } else if (idleTimedOut) {
+      const frame = `data: ${JSON.stringify(upstreamIdleTimeoutBody(args.idleTimeoutMs))}\n\n`;
+      if (!res.writableEnded) res.write(frame);
     } else if (pending.length && !res.writableEnded) {
       forwarded += pending.toString("utf8");
       res.write(pending);
@@ -294,11 +424,12 @@ async function pipeSse(
     cachedTokens: 0,
     totalTokens: promptTokens + roughTokens(completionChars),
   };
-  const official = !stopped ? extractUsageFromSse(forwarded) : null;
+  const official = !stopped && !idleTimedOut ? extractUsageFromSse(forwarded) : null;
   return {
     usage: official ?? counted,
     upstreamId: extractSseId(forwarded),
     stopped,
+    idle: idleTimedOut,
   };
 }
 

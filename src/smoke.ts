@@ -3,9 +3,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
-import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
+import { DEFAULT_FALLBACK, DEFAULT_PRICING, DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS, loadConfig, normalizeUpstreamUrl } from "./config.js";
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
-import { closeDb, insertRequest, openDb, type Db } from "./db.js";
+import { closeDb, insertRequest, openDb, reservedSpend, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
@@ -159,6 +159,7 @@ async function main(): Promise<void> {
   delete process.env.SPENDLIGHT_HOST;
   delete process.env.SPENDLIGHT_DB;
   delete process.env.OPENAI_BASE_URL;
+  delete process.env.SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS;
 
   const config = loadConfig(configPath);
   config.port = 0;
@@ -339,6 +340,8 @@ async function main(): Promise<void> {
     await testUnboundedRace(dir, mockUrl);
     await testBoundedRace(dir, mockUrl);
     await testStreamCutoff(dir, mockUrl);
+    await testUpstreamBodyIdle(dir);
+    testUpstreamIdleConfig(dir);
     testCalendarDayBounds();
     testCalendarWeekBounds();
     testCalendarMonthBounds();
@@ -365,7 +368,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, body idle timeout, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -467,6 +470,376 @@ async function testStreamCutoff(dir: string, mockUrl: string): Promise<void> {
   });
 }
 
+const BODY_IDLE_MS = 800;
+const SLOW_CHUNK_GAP_MS = 200;
+
+async function testUpstreamBodyIdle(dir: string): Promise<void> {
+  let onBodyHeaders: (() => void) | undefined;
+  let onStreamChunk: (() => void) | undefined;
+  const mock = createServer(async (req, res) => {
+    res.on("error", () => {});
+    req.on("error", () => {});
+    const raw = await readReq(req).catch(() => "");
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    } catch {
+      payload = {};
+    }
+    if (payload.stall === "body") {
+      if (!res.headersSent) res.writeHead(200, { "content-type": "application/json" });
+      res.flushHeaders();
+      const note = onBodyHeaders;
+      onBodyHeaders = undefined;
+      note?.();
+      await hangUntilClose(req, res);
+      return;
+    }
+    if (payload.stall === "stream") {
+      if (!res.headersSent) {
+        res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" });
+      }
+      res.flushHeaders();
+      if (!res.writableEnded) {
+        res.write(sseData({ choices: [{ index: 0, delta: { content: "Hello" } }] }));
+      }
+      const note = onStreamChunk;
+      onStreamChunk = undefined;
+      note?.();
+      await hangUntilClose(req, res);
+      return;
+    }
+    if (payload.stall === "slow") {
+      try {
+        res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" });
+        res.flushHeaders();
+        for (let i = 0; i < 5; i++) {
+          await delay(SLOW_CHUNK_GAP_MS);
+          if (res.destroyed || res.writableEnded) return;
+          const content = i === 4 ? "SLOW_STREAM_OK" : "x";
+          res.write(sseData({ id: "chatcmpl-slow", choices: [{ index: 0, delta: { content } }] }));
+        }
+        await delay(SLOW_CHUNK_GAP_MS);
+        if (res.destroyed || res.writableEnded) return;
+        res.write(
+          sseData({
+            id: "chatcmpl-slow",
+            choices: [],
+            usage: { prompt_tokens: 10, completion_tokens: 6, total_tokens: 16 },
+          }),
+        );
+        res.write("data: [DONE]\n\n");
+        if (!res.writableEnded) res.end();
+      } catch {
+        // The proxy closes the upstream if the idle timer fires.
+      }
+      return;
+    }
+    const body = JSON.stringify({
+      id: "chatcmpl-after-idle",
+      object: "chat.completion",
+      created: 1_700_000_000,
+      model: "gpt-4o-mini",
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      usage: SMALL_USAGE,
+    });
+    if (!res.writableEnded) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(body);
+    }
+  });
+  await new Promise<void>((resolve) => mock.listen(0, "127.0.0.1", resolve));
+  const addr = mock.address();
+  assert(addr && typeof addr === "object", "body-idle mock failed to bind");
+  const mockUrl = `http://127.0.0.1:${addr.port}/v1`;
+  const chat = (extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      model: "gpt-4o-mini",
+      max_tokens: 50_000,
+      messages: [{ role: "user", content: "hi" }],
+      ...extra,
+    });
+
+  try {
+    await withApp(dir, "body-idle-off", mockUrl, { softUsd: null, hardUsd: 0.04 }, async (base, app) => {
+      try {
+        const seen = new Promise<void>((resolve) => {
+          onBodyHeaders = resolve;
+        });
+        const hung = postChat(base, "idle", chat({ stall: "body" }));
+        void hung.catch(() => {});
+        await waitFor(seen, "disabled idle timer: upstream never sent headers");
+        await delay(400);
+        let state = "pending";
+        void hung.then(
+          () => {
+            state = "done";
+          },
+          () => {
+            state = "error";
+          },
+        );
+        await delay(30);
+        assert(state === "pending", `idle timeout 0 aborted a stalled body (${state})`);
+        const held = reservedSpend(app.db, "idle");
+        assert(held > 0.02, `disabled idle timer should keep the hold, got ${held}`);
+      } finally {
+        mock.closeAllConnections?.();
+      }
+    }, 0);
+
+    await withApp(dir, "body-idle-stall", mockUrl, { softUsd: null, hardUsd: 0.04 }, async (base, app) => {
+      try {
+        const seen = new Promise<void>((resolve) => {
+          onBodyHeaders = resolve;
+        });
+        const started = Date.now();
+        const hung = postChat(base, "idle", chat({ stall: "body" }));
+        await waitFor(seen, "body stall: upstream never sent headers");
+        const held = reservedSpend(app.db, "idle");
+        assert(held > 0.02, `body stall after headers should hold a reservation, got ${held}`);
+
+        const blocked = await postChat(base, "idle", chat());
+        assert(blocked.status === 402, `in-flight body stall should 402 a second call, got ${blocked.status}`);
+        const blockedJson = (await blocked.json()) as { error?: { code?: string } };
+        assert(blockedJson.error?.code === "budget_hard_limit", "body stall 402 missing budget code");
+
+        const limit = failAfter(5_000, "stalled upstream body did not time out");
+        const timed = await Promise.race([hung, limit.promise]);
+        limit.cancel();
+        const elapsed = Date.now() - started;
+        const text = await timed.text();
+        assert(timed.status === 504, `body stall status ${timed.status}: ${text.slice(0, 240)}`);
+        assert(elapsed >= 500, `body stall returned in ${elapsed}ms; idle timeout did not wait`);
+        assert(elapsed < 4_000, `body stall took ${elapsed}ms; idle timeout did not fire`);
+        const body = JSON.parse(text) as {
+          error?: { type?: string; code?: string; message?: string; param?: unknown };
+        };
+        assert(body.error?.type === "spendlight_upstream_idle_timeout", `idle type ${body.error?.type}`);
+        assert(body.error?.code === "upstream_idle_timeout", `idle code ${body.error?.code}`);
+        assert(body.error?.param === null, "idle error should include param null");
+        assert(body.error?.message?.includes(`${BODY_IDLE_MS}ms`) === true, body.error?.message ?? "");
+        assert(
+          body.error?.message?.toLowerCase().includes("reservation was released") === true,
+          body.error?.message ?? "",
+        );
+
+        const left = reservedSpend(app.db);
+        assert(left === 0, `reservation still held after body idle timeout (${left})`);
+        const quiet = await summaryOf(base);
+        assert(quiet.requests === 0, `idle timeout must not bill a body with no tokens, logged ${quiet.requests}`);
+
+        const again = await postChat(base, "idle", chat());
+        const againText = await again.text();
+        assert(
+          again.status === 200,
+          `budget should admit a call after the hold is released, got ${again.status}: ${againText.slice(0, 180)}`,
+        );
+        const summary = await summaryOf(base);
+        assert(summary.requests === 1, `follow-up should be the only ledger row, got ${summary.requests}`);
+        assert(summary.spendUsd > 0 && summary.spendUsd < 0.001, `follow-up spend ${summary.spendUsd}`);
+      } finally {
+        mock.closeAllConnections?.();
+      }
+    }, BODY_IDLE_MS);
+
+    await withApp(dir, "body-idle-stream", mockUrl, { softUsd: null, hardUsd: 0.04 }, async (base, app) => {
+      try {
+        const seen = new Promise<void>((resolve) => {
+          onStreamChunk = resolve;
+        });
+        const started = Date.now();
+        const hung = postChat(base, "mid", chat({ stall: "stream", stream: true }));
+        await waitFor(seen, "stream stall: upstream never sent a chunk");
+        const held = reservedSpend(app.db, "mid");
+        assert(held > 0.02, `stream stall after a chunk should still hold a reservation, got ${held}`);
+        const blocked = await postChat(base, "mid", chat());
+        assert(blocked.status === 402, `in-flight stream stall should 402 a second call, got ${blocked.status}`);
+        await blocked.text();
+
+        const limit = failAfter(5_000, "mid-stream stall did not time out");
+        let timed: Response | undefined;
+        let text = "";
+        let elapsed = 0;
+        try {
+          timed = await Promise.race([hung, limit.promise]);
+          text = await Promise.race([timed.text(), limit.promise]);
+          elapsed = Date.now() - started;
+        } finally {
+          limit.cancel();
+        }
+        assert(timed != null, "stream stall produced no response");
+        assert(
+          timed.status === 200,
+          `stream stall keeps the status already sent, got ${timed.status}: ${text.slice(0, 240)}`,
+        );
+        assert(text.includes("Hello"), "stream stall dropped the chunk that arrived before the gap");
+        assert(elapsed >= 500 && elapsed < 4_000, `stream stall elapsed ${elapsed}ms`);
+        const error = sseError(text);
+        assert(error?.type === "spendlight_upstream_idle_timeout", `stream idle type ${error?.type}`);
+        assert(error?.code === "upstream_idle_timeout", `stream idle code ${error?.code}`);
+        assert(error?.param === null, "stream idle error should include param null");
+        assert(error?.message?.includes(`${BODY_IDLE_MS}ms`) === true, error?.message ?? "");
+        const left = reservedSpend(app.db);
+        assert(left === 0, `reservation still held after stream idle timeout (${left})`);
+        const summary = await summaryOf(base);
+        assert(summary.requests === 1, `partial stream should log forwarded tokens, got ${summary.requests}`);
+        assert(summary.recent[0]?.error?.includes("idle") === true, `stream ledger error ${summary.recent[0]?.error}`);
+        assert(summary.spendUsd > 0 && summary.spendUsd < 0.001, `partial stream spend ${summary.spendUsd}`);
+
+        const again = await postChat(base, "mid", chat());
+        const againText = await again.text();
+        assert(
+          again.status === 200,
+          `stream idle should release the hold, got ${again.status}: ${againText.slice(0, 180)}`,
+        );
+      } finally {
+        mock.closeAllConnections?.();
+      }
+    }, BODY_IDLE_MS);
+
+    await withApp(dir, "body-idle-slow", mockUrl, { softUsd: null, hardUsd: 0.04 }, async (base, app) => {
+      try {
+        const started = Date.now();
+        const res = await postChat(base, "slow", chat({ stall: "slow", stream: true }));
+        const text = await res.text();
+        const elapsed = Date.now() - started;
+        assert(res.status === 200, `slow stream status ${res.status}: ${text.slice(0, 240)}`);
+        assert(text.includes("SLOW_STREAM_OK"), "slow stream was cut off before the later chunks");
+        assert(text.includes("[DONE]"), "slow stream did not finish");
+        assert(!text.includes("upstream_idle_timeout"), "slow stream was aborted for idle");
+        assert(
+          elapsed > BODY_IDLE_MS,
+          `slow stream finished in ${elapsed}ms, under the idle window; gaps were not what mattered`,
+        );
+        const left = reservedSpend(app.db);
+        assert(left === 0, `slow stream left a reservation (${left})`);
+        const summary = await summaryOf(base);
+        assert(summary.requests === 1, `slow stream logged ${summary.requests}`);
+        assert(summary.recent[0]?.error == null, `slow stream ledger error ${summary.recent[0]?.error}`);
+        assert(summary.spendUsd > 0 && summary.spendUsd < 0.001, `slow stream spend ${summary.spendUsd}`);
+      } finally {
+        mock.closeAllConnections?.();
+      }
+    }, BODY_IDLE_MS);
+  } finally {
+    mock.closeAllConnections?.();
+    await new Promise<void>((resolve) => mock.close(() => resolve()));
+  }
+}
+
+function testUpstreamIdleConfig(dir: string): void {
+  const path = join(dir, "idle.json");
+  const barePath = join(dir, "idle-bare.json");
+  writeFileSync(path, JSON.stringify({ upstream: { idleTimeoutMs: 1500 }, budgets: { global: { hardUsd: 1 } } }));
+  writeFileSync(barePath, JSON.stringify({ budgets: { global: { hardUsd: 1 } } }));
+  const saved = process.env.SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS;
+  try {
+    delete process.env.SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS;
+    const bare = loadConfig(barePath);
+    assert(bare.upstreamIdleTimeoutMs === DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS, `default idle ${bare.upstreamIdleTimeoutMs}`);
+    assert(DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS === 120_000, "documented body idle default is 120000ms");
+
+    const fromFile = loadConfig(path);
+    assert(fromFile.upstreamIdleTimeoutMs === 1500, `file idle ${fromFile.upstreamIdleTimeoutMs}`);
+
+    process.env.SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS = "2500";
+    const fromEnv = loadConfig(path);
+    assert(fromEnv.upstreamIdleTimeoutMs === 2500, `env idle should override file, got ${fromEnv.upstreamIdleTimeoutMs}`);
+
+    process.env.SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS = "0";
+    const disabled = loadConfig(path);
+    assert(disabled.upstreamIdleTimeoutMs === 0, "0 disables the body idle timer");
+
+    delete process.env.SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS;
+    writeFileSync(path, JSON.stringify({ upstream: { idleTimeoutMs: 0 } }));
+    assert(loadConfig(path).upstreamIdleTimeoutMs === 0, "file idle 0 disables the timer");
+
+    let threw = false;
+    try {
+      process.env.SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS = "-5";
+      loadConfig(path);
+    } catch (err) {
+      threw = true;
+      const message = err instanceof Error ? err.message : String(err);
+      assert(message.includes("-5"), message);
+      assert(message.includes("SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS"), message);
+    }
+    assert(threw, "negative body idle timeout must fail startup");
+
+    threw = false;
+    delete process.env.SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS;
+    writeFileSync(path, JSON.stringify({ upstream: { idleTimeoutMs: "soon" } }));
+    try {
+      loadConfig(path);
+    } catch (err) {
+      threw = true;
+      const message = err instanceof Error ? err.message : String(err);
+      assert(message.includes("soon"), message);
+      assert(message.includes("upstream.idleTimeoutMs"), message);
+    }
+    assert(threw, "non-numeric body idle timeout must fail startup");
+  } finally {
+    if (saved == null) delete process.env.SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS;
+    else process.env.SPENDLIGHT_UPSTREAM_IDLE_TIMEOUT_MS = saved;
+  }
+}
+
+function sseData(payload: unknown): string {
+  return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+function hangUntilClose(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => resolve();
+    req.on("close", done);
+    res.on("close", done);
+  });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function failAfter(ms: number, message: string): { promise: Promise<never>; cancel: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const promise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  promise.catch(() => {});
+  return {
+    promise,
+    cancel() {
+      if (timer) clearTimeout(timer);
+    },
+  };
+}
+
+async function waitFor(gate: Promise<void>, label: string): Promise<void> {
+  const limit = failAfter(5_000, label);
+  try {
+    await Promise.race([gate, limit.promise]);
+  } finally {
+    limit.cancel();
+  }
+}
+
+function sseError(text: string): { type?: string; code?: string; message?: string; param?: unknown } | undefined {
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === "[DONE]") continue;
+    try {
+      const parsed = JSON.parse(data) as { error?: { type?: string; code?: string; message?: string; param?: unknown } };
+      if (parsed.error) return parsed.error;
+    } catch {
+      // ignore partial frames
+    }
+  }
+  return undefined;
+}
+
 type SmokeBudgets = {
   softUsd: number | null;
   hardUsd: number | null;
@@ -481,6 +854,7 @@ async function withApp(
   mockUrl: string,
   budgets: SmokeBudgets,
   fn: (base: string, app: App) => Promise<void>,
+  idleTimeoutMs?: number,
 ): Promise<void> {
   const dbPath = join(dir, `${name}.db`);
   const configPath = join(dir, `${name}.json`);
@@ -490,7 +864,10 @@ async function withApp(
       host: "127.0.0.1",
       port: 0,
       dbPath,
-      upstream: { baseUrl: mockUrl },
+      upstream: {
+        baseUrl: mockUrl,
+        ...(idleTimeoutMs != null ? { idleTimeoutMs } : {}),
+      },
       budgets: {
         period: budgets.period,
         timezone: budgets.timezone,
