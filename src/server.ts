@@ -1,6 +1,15 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Config, LedgerRow, Summary } from "./types.js";
-import { closeDb, listRequests, loadSummaryParts, openDb, spendMatching, type CreatedRange, type Db } from "./db.js";
+import {
+  closeDb,
+  listActiveReservations,
+  listRequests,
+  loadSummaryParts,
+  openDb,
+  spendMatching,
+  type CreatedRange,
+  type Db,
+} from "./db.js";
 import { evaluateBudget, spendWindow } from "./budget.js";
 import { dashboardHtml, FAVICON_SVG } from "./ui.js";
 import { badgeSvg, receiptMarkdown, receiptSvg } from "./receipts.js";
@@ -140,6 +149,7 @@ export function buildSummary(
     scopeSince: range?.sinceIso ?? null,
     scopeUntil: range?.untilIso ?? null,
     scopeWindowSpend,
+    reservations: listActiveReservations(db, now.getTime()),
     budget,
   };
 }

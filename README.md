@@ -219,7 +219,7 @@ curl "http://127.0.0.1:8787/v1/chat/completions?project=demo" ...
 curl ... -d '{"model":"gpt-4o-mini","spendlight_project":"demo","messages":[...]}'
 ```
 
-Mutating priced calls take a SQLite `BEGIN IMMEDIATE` reservation before upstream: the preflight estimate when `max_tokens` / `max_completion_tokens` is set, otherwise the remaining hard headroom. That hold counts toward the hard cap until the call settles to **actual** usage, so a concurrent request sees the in-flight hold. A single call can still finish above the cap when real usage exceeds the estimate; the ledger stores that actual cost. Streaming chats stop forwarding once a running token estimate reaches the reserved amount. A finished stream logs provider usage; a cut stream logs the partial estimate. Reservations older than 15 minutes are dropped so a crash cannot wedge the kill-switch.
+Mutating priced calls take a SQLite `BEGIN IMMEDIATE` reservation before upstream: the preflight estimate when `max_tokens` / `max_completion_tokens` is set, otherwise the remaining hard headroom. That hold counts toward the hard cap until the call settles to **actual** usage, so a concurrent request sees the in-flight hold. A single call can still finish above the cap when real usage exceeds the estimate; the ledger stores that actual cost. Streaming chats stop forwarding once a running token estimate reaches the reserved amount. A finished stream logs provider usage; a cut stream logs the partial estimate. Reservations older than 15 minutes are dropped on the next admission so a crash cannot wedge the kill-switch. Until a hold settles, it is listed on `/api/summary` as `reservations` and on the dashboard **Budget holds** card (id, project, model, reserved amount, start time, age, and `held` or `stale`). A hold older than 15 minutes that the sweep has not dropped yet is `stale`. That list is read-only and is not a ledger slice.
 
 Hard-limit responses look like OpenAI errors:
 
@@ -239,7 +239,7 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 
 | URL | What |
 | --- | --- |
-| `/` | Dashboard (spend, budgets, spend by day, project and model pairs, most expensive requests, recent requests) |
+| `/` | Dashboard (spend, budgets, budget holds, spend by day, project and model pairs, most expensive requests, recent requests) |
 | `/receipt.md` | Markdown receipt (`?project=`, `?model=`, optional `?since=` / `?until=` / `?window=current`) |
 | `/receipt.svg` | Paper-style SVG receipt (same scope parameters as the markdown receipt) |
 | `/badge.svg` | Shields-style badge for a local README (`?project=` or `?model=`; time parameters are ignored) |
@@ -290,6 +290,8 @@ Quiet days inside the covered span are included, with `spendUsd: 0` and `request
 `/api/summary` also adds `byProjectModel`: one object per project and model pair inside those same filters, highest spend first. Each object is `{ "project": "<tag>", "model": "<id>", "spendUsd": <number>, "requests": <number>, "tokens": <number> }`. Equal spend is ordered by project tag, then model id. A project-scoped summary lists only that tag's models, and a model-scoped summary lists only the projects that used it. The array is empty when nothing matches. `byProject` and `byModel` are unchanged. The dashboard **By project and model** card lists the pairs and links each one to its Markdown receipt, SVG receipt, CSV, and JSON via `project=<tag>&model=<id>`.
 
 `/api/summary` also adds `topRequests`: up to ten ledger rows inside those same filters, highest `costUsd` first. Each object is a request row, the same shape as `recent` (`id`, `createdAt`, `project`, `model`, token counts, `costUsd`, `status`, `error`, `upstreamId`, `path`, `streamed`). Equal cost is ordered by `createdAt` descending, then `id` ascending. Fewer than ten matches returns every match, and a miss is `[]`. Failed and streamed rows stay in the ranking. `recent` is still the latest requests, newest first. The dashboard **Most expensive** card lists this ranking, with a bar under each cost.
+
+`/api/summary` also adds `reservations`: every hard-budget hold that has not settled, oldest first. Each object is `{ "id", "project", "model", "reservedUsd", "startedAt", "ageSeconds", "status" }`. `id` is the reservation, not a ledger row. `startedAt` is when the hold was taken. `ageSeconds` is whole seconds since then and is never negative. `status` is `held` while the row is inside the 15-minute crash sweep, and `stale` once the next admission would drop it. An empty set is `[]`. `project`, `model`, `since`, `until`, and `window` do not filter this list — a date or project slice of the ledger must not hide a hold that is still blocking the cap. Receipts, the badge, and CSV/JSON export stay on settled rows and omit these holds. Reading the list does not release one. The dashboard **Budget holds** card renders the same list and escapes project, model, and id.
 
 ```bash
 curl -s "http://127.0.0.1:8787/api/export.csv?since=2026-10-01&until=2026-10-05" -o october-week.csv

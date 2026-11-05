@@ -53,6 +53,8 @@ function num(v: unknown): number | undefined {
 const CHARS_PER_TOKEN = 4;
 
 export type Preflight = {
+  /** Model id this estimate was priced as. `unknown` when the request omitted one. */
+  model: string;
   usage: Usage;
   /** True when output is capped (max_tokens / embeddings). False holds the remaining hard headroom. */
   outputBounded: boolean;
@@ -118,6 +120,7 @@ export function preflightFromBody(
   };
   const promptUsage: Usage = { ...usage, completionTokens: 0, totalTokens: promptTokens };
   return {
+    model: model || "unknown",
     usage,
     outputBounded,
     costUsd: estimateCostUsd(model, usage, pricing, fallback).costUsd,
