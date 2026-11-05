@@ -79,6 +79,15 @@ export function dashboardHtml(): string {
     code { font-family: var(--mono); font-size: 12px; background: var(--paper-2); padding: 1px 5px; border-radius: 4px; }
     .events { list-style: none; padding: 0; margin: 0; }
     .events li { font-size: 13px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+    .hold { padding: 12px 0; border-bottom: 1px solid var(--line); }
+    .hold:last-child { border-bottom: 0; padding-bottom: 0; }
+    .hold-top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+    .hold-top code { font-size: 12px; word-break: break-all; }
+    .hold-meta { color: var(--muted); font-size: 13px; margin-top: 4px; line-height: 1.45; }
+    .hold-meta code { font-size: 12px; }
+    .hold-held, .hold-stale { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; flex: none; }
+    .hold-held { color: var(--gold); }
+    .hold-stale { color: var(--red); }
     @media (max-width: 820px) {
       .hero, .grid, .stats { grid-template-columns: 1fr; }
       header { flex-direction: column; }
@@ -123,6 +132,14 @@ export function dashboardHtml(): string {
         </div>
       </article>
     </section>
+
+    <article class="card" style="margin-bottom:18px">
+      <div class="row-head">
+        <div class="k">Budget holds</div>
+        <div class="sub" id="holds-sub">in flight</div>
+      </div>
+      <div id="reservations" class="empty">No budget holds right now.</div>
+    </article>
 
     <section class="grid">
       <article class="card">
@@ -272,6 +289,20 @@ export function dashboardHtml(): string {
       $("meter-bar").style.width = (hard ? pct : 0) + "%";
       $("spend-k").textContent = (s.budget.period === "day" || s.budget.period === "week" || s.budget.period === "month") ? "Estimated spend · lifetime" : "Estimated spend";
       $("budget-copy").textContent = budgetCopy(s);
+      const holds = s.reservations || [];
+      const staleN = holds.filter(h => h.status === "stale").length;
+      $("holds-sub").textContent = holds.length
+        ? (staleN ? staleN + " past 15m · oldest first" : "oldest first")
+        : "none in flight";
+      const holdRows = holds.map(h =>
+        '<div class="hold"><div class="hold-top"><code>' + esc(h.id) + '</code>' +
+        '<span class="hold-' + (h.status === "stale" ? "stale" : "held") + '">' + esc(h.status) + '</span></div>' +
+        '<div class="hold-meta">' + esc(h.project) + ' · <code>' + esc(h.model) + '</code> · ' +
+        fmtMoney(h.reservedUsd) + ' reserved · ' + esc(fmtAge(h.ageSeconds)) + ' old · started ' +
+        esc(new Date(h.startedAt).toLocaleString()) + '</div></div>'
+      ).join("");
+      $("reservations").className = "";
+      $("reservations").innerHTML = holdRows || '<div class="empty">No budget holds right now.</div>';
       const zone = (s.budget && s.budget.timezone) || "UTC";
       const fortnight = lastFortnight(s);
       const fortnightSpend = fortnight.reduce((sum, d) => sum + Number(d.spendUsd || 0), 0);
@@ -351,6 +382,16 @@ export function dashboardHtml(): string {
       $("events").innerHTML = s.events.length
         ? s.events.map(e => "<li><strong>" + esc(e.type) + "</strong> · " + esc(e.project) + " · " + esc(e.message) + "</li>").join("")
         : '<li class="empty" style="border:0;padding-left:0">None yet.</li>';
+    }
+    function fmtAge(seconds) {
+      const s = Math.max(0, Math.floor(Number(seconds) || 0));
+      if (s < 60) return s + "s";
+      const m = Math.floor(s / 60);
+      const rem = s % 60;
+      if (m < 60) return rem ? m + "m " + rem + "s" : m + "m";
+      const h = Math.floor(m / 60);
+      const min = m % 60;
+      return min ? h + "h " + min + "m" : h + "h";
     }
     function projectLinks(name) {
       const q = encodeURIComponent(name);

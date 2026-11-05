@@ -2,12 +2,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
 import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
-import { closeDb, insertRequest, openDb, type Db } from "./db.js";
-import { createApp, listen, type App } from "./server.js";
-import { estimateCostUsd } from "./pricing.js";
+import { closeDb, insertRequest, listActiveReservations, openDb, RESERVATION_TTL_MS, type Db } from "./db.js";
+import { createApp, buildSummary, listen, type App } from "./server.js";
+import { estimateCostUsd, preflightFromBody } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
@@ -209,11 +210,13 @@ async function main(): Promise<void> {
       requests: number;
       recent: { project: string; model: string; costUsd: number }[];
       budget: { status: string };
+      reservations: unknown[];
     };
     assert(summary.requests === 1, `expected 1 logged request, got ${summary.requests}`);
     assert(Math.abs(summary.spendUsd - 0.045) < 1e-6, `logged spend ${summary.spendUsd}`);
     assert(summary.recent[0]?.project === "demo", "project not logged");
     assert(summary.recent[0]?.model === "gpt-4o-mini", "model not logged");
+    assert(Array.isArray(summary.reservations) && summary.reservations.length === 0, "settled call should leave no hold");
 
     const csvRes = await fetch(`${base}/api/export.csv`);
     assert(csvRes.status === 200, `csv export status ${csvRes.status}`);
@@ -332,6 +335,13 @@ async function main(): Promise<void> {
     assert(dash.includes("highest cost first"), "dashboard should order expensive requests by cost");
     assert(dash.includes('id="top-requests"'), "dashboard missing most-expensive mount");
     assert(dash.includes("s.topRequests"), "dashboard should render topRequests");
+    assert(dash.includes("Budget holds"), "dashboard missing budget-holds card");
+    assert(dash.includes('id="reservations"'), "dashboard missing budget-holds mount");
+    assert(dash.includes("s.reservations"), "dashboard should render reservations");
+    assert(dash.includes("esc(h.id)"), "dashboard should escape hold ids");
+    assert(dash.includes("esc(h.project)"), "dashboard should escape hold projects");
+    assert(dash.includes("esc(h.model)"), "dashboard should escape hold models");
+    assert(dash.includes("No budget holds right now."), "dashboard missing empty holds copy");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -364,8 +374,10 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    testActiveReservations(dir);
+    await testLiveReservation(dir);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, budget holds");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2255,6 +2267,166 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
   );
 }
 
+function testActiveReservations(dir: string): void {
+  const legacyPath = join(dir, "legacy-reservations.db");
+  const legacy = new DatabaseSync(legacyPath);
+  legacy.exec(`
+    CREATE TABLE reservations (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      project TEXT NOT NULL,
+      cost_usd REAL NOT NULL
+    );
+  `);
+  const now = Date.parse("2026-11-05T12:00:00.000Z");
+  const staleAt = new Date(now - RESERVATION_TTL_MS - 1500).toISOString();
+  const boundaryAt = new Date(now - RESERVATION_TTL_MS).toISOString();
+  const freshAt = new Date(now - 30_000).toISOString();
+  const futureAt = new Date(now + 5_000).toISOString();
+  legacy
+    .prepare(`INSERT INTO reservations (id, created_at, project, cost_usd) VALUES (?, ?, ?, ?)`)
+    .run("stale-hold", staleAt, "demo", 1.25);
+  legacy.close();
+
+  const db = openDb(legacyPath);
+  const insert = db.prepare(
+    `INSERT INTO reservations (id, created_at, project, cost_usd, model) VALUES (?, ?, ?, ?, ?)`,
+  );
+  insert.run("m-hold", boundaryAt, "other", 0.5, "gpt-4o");
+  insert.run("a-hold", boundaryAt, "other", 0.25, "gpt-4o-mini");
+  insert.run("fresh-hold", freshAt, "demo", 0.03, "  ");
+  insert.run("future-hold", futureAt, "demo", 0.01, "<gpt-4o-mini>");
+
+  const listed = listActiveReservations(db, now);
+  assert(listed.map((row) => row.id).join(",") === "stale-hold,a-hold,m-hold,fresh-hold,future-hold", listed.map((row) => row.id).join(","));
+
+  const stale = listed[0];
+  assert(stale?.status === "stale", `stale status ${stale?.status}`);
+  assert(stale?.model === "unknown", `legacy model ${stale?.model}`);
+  assert(stale?.project === "demo", `stale project ${stale?.project}`);
+  assert(stale?.reservedUsd === 1.25, `stale amount ${stale?.reservedUsd}`);
+  assert(stale?.startedAt === staleAt, `stale start ${stale?.startedAt}`);
+  assert(stale?.ageSeconds === Math.floor((RESERVATION_TTL_MS + 1500) / 1000), `stale age ${stale?.ageSeconds}`);
+
+  const boundary = listed.find((row) => row.id === "a-hold");
+  assert(boundary?.status === "held", "a hold exactly 15 minutes old is not swept yet");
+  assert(boundary?.model === "gpt-4o-mini", `boundary model ${boundary?.model}`);
+  assert(boundary?.ageSeconds === RESERVATION_TTL_MS / 1000, `boundary age ${boundary?.ageSeconds}`);
+  assert(listed.find((row) => row.id === "m-hold")?.status === "held", "tie at the sweep boundary stays held");
+
+  const fresh = listed.find((row) => row.id === "fresh-hold");
+  assert(fresh?.status === "held" && fresh.model === "unknown" && fresh.ageSeconds === 30, `fresh ${fresh?.status} ${fresh?.model} ${fresh?.ageSeconds}`);
+  const future = listed.find((row) => row.id === "future-hold");
+  assert(future?.status === "held" && future.ageSeconds === 0 && future.model === "<gpt-4o-mini>", `future ${future?.status} ${future?.ageSeconds} ${future?.model}`);
+
+  const configPath = join(dir, "holds-summary.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      dbPath: legacyPath,
+      budgets: { global: { softUsd: 1, hardUsd: 5 } },
+    }),
+  );
+  const summary = buildSummary(db, loadConfig(configPath), "nope", "no-model", {
+    sinceIso: "2020-01-01T00:00:00.000Z",
+    untilIso: "2020-01-02T00:00:00.000Z",
+  });
+  assert(summary.requests === 0, "time slice should not invent ledger rows");
+  assert(summary.reservations.length === listed.length, "summary filters must not hide live holds");
+  assert(summary.reservations[0]?.id === "stale-hold", "summary should keep oldest-first order");
+  assertSummaryFields(summary, "holds");
+  closeDb(db);
+
+  const again = openDb(legacyPath);
+  assert(listActiveReservations(again, now).length === listed.length, "opening the ledger twice should keep the model column");
+  closeDb(again);
+}
+
+async function testLiveReservation(dir: string): Promise<void> {
+  let releaseGate: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  const mock = createServer(async (req, res) => {
+    res.on("error", () => {});
+    await readReq(req);
+    await gate;
+    if (res.writableEnded) return;
+    const body = JSON.stringify({
+      id: "chatcmpl-hold",
+      model: "gpt-4o-mini",
+      choices: [{ message: { role: "assistant", content: "ok" } }],
+      usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+    });
+    res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) });
+    res.end(body);
+  });
+  await new Promise<void>((resolve) => mock.listen(0, "127.0.0.1", resolve));
+  const addr = mock.address();
+  assert(addr && typeof addr === "object", "hold mock failed to bind");
+  const mockUrl = `http://127.0.0.1:${addr.port}/v1`;
+  const payload = {
+    model: "gpt-4o-mini",
+    max_tokens: 100,
+    messages: [{ role: "user", content: "hi" }],
+  };
+  try {
+    await withApp(dir, "live-holds", mockUrl, { softUsd: 1, hardUsd: 5 }, async (base) => {
+      const pending = postChat(base, "demo", JSON.stringify(payload));
+      const seen = await waitForHold(base);
+      const pre = preflightFromBody(payload.model, payload, "/v1/chat/completions", DEFAULT_PRICING, DEFAULT_FALLBACK);
+      assert(seen.reservations.length === 1, `expected one hold, got ${seen.reservations.length}`);
+      const hold = seen.reservations[0];
+      assert(hold?.project === "demo", `hold project ${hold?.project}`);
+      assert(hold?.model === "gpt-4o-mini", `hold model ${hold?.model}`);
+      assert(hold?.status === "held", `hold status ${hold?.status}`);
+      assert(hold != null && hold.ageSeconds >= 0 && hold.ageSeconds < 30, `hold age ${hold?.ageSeconds}`);
+      assert(hold != null && Math.abs(hold.reservedUsd - pre.costUsd) < 1e-8, `reserved ${hold?.reservedUsd} preflight ${pre.costUsd}`);
+      assert(typeof hold?.id === "string" && hold.id.length > 0, "hold missing id");
+      assert(hold != null && !Number.isNaN(Date.parse(hold.startedAt)), `hold start ${hold?.startedAt}`);
+      assert(!JSON.stringify(seen).includes("sk-smoke"), "summary must not echo the API key");
+
+      const scoped = (await fetch(
+        `${base}/api/summary?project=other&model=gpt-4o&since=2020-01-01&until=2020-01-02`,
+      ).then((r) => r.json())) as { requests: number; reservations: { id: string }[] };
+      assert(scoped.requests === 0, "scoped ledger should stay empty while the call is in flight");
+      assert(scoped.reservations.length === 1 && scoped.reservations[0]?.id === hold?.id, "a project and time slice must still list the hold");
+
+      const receipt = await fetch(`${base}/receipt.md`).then((r) => r.text());
+      assert(hold != null && !receipt.includes(hold.id), "receipt should stay on settled spend");
+      const exported = await fetch(`${base}/api/export.json`).then((r) => r.text());
+      assert(hold != null && !exported.includes(hold.id), "export should stay on settled spend");
+
+      releaseGate();
+      const done = await pending;
+      assert(done.status === 200, `held call status ${done.status}`);
+      const after = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+        requests: number;
+        reservations: unknown[];
+      };
+      assert(after.reservations.length === 0, "settled call should release the hold");
+      assert(after.requests === 1, `settled call should log one row, got ${after.requests}`);
+    });
+  } finally {
+    releaseGate();
+    await new Promise<void>((resolve) => mock.close(() => resolve()));
+  }
+}
+
+async function waitForHold(base: string): Promise<{ reservations: { id: string; project: string; model: string; reservedUsd: number; startedAt: string; ageSeconds: number; status: string }[] }> {
+  const deadline = Date.now() + 2000;
+  let last: { reservations?: unknown } = {};
+  while (Date.now() < deadline) {
+    last = (await fetch(`${base}/api/summary`).then((r) => r.json())) as { reservations?: unknown };
+    const reservations = last.reservations;
+    if (Array.isArray(reservations) && reservations.length > 0) {
+      return last as { reservations: { id: string; project: string; model: string; reservedUsd: number; startedAt: string; ageSeconds: number; status: string }[] };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  fail(`hold did not appear: ${JSON.stringify(last.reservations)}`);
+}
+
 type DailyRow = { day: string; spendUsd: number; requests: number };
 
 type PairRow = { project: string; model: string; spendUsd: number; requests: number; tokens: number };
@@ -2301,6 +2473,7 @@ const SUMMARY_FIELDS = [
   "daily",
   "recent",
   "topRequests",
+  "reservations",
   "events",
 ] as const;
 
@@ -2329,8 +2502,14 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
     const limit = budget[side] as Record<string, unknown>;
     assert(limit && "softUsd" in limit && "hardUsd" in limit, `${label} ${side} missing soft/hard`);
   }
-  for (const key of ["byProject", "byModel", "byProjectModel", "daily", "recent", "topRequests", "events"] as const) {
+  for (const key of ["byProject", "byModel", "byProjectModel", "daily", "recent", "topRequests", "reservations", "events"] as const) {
     assert(Array.isArray(summary[key]), `${label} ${key} is not an array`);
+  }
+  const holds = summary.reservations as Record<string, unknown>[];
+  if (holds[0]) {
+    for (const key of ["id", "project", "model", "reservedUsd", "startedAt", "ageSeconds", "status"]) {
+      assert(key in holds[0], `${label} reservations missing ${key}`);
+    }
   }
   const projects = summary.byProject as Record<string, unknown>[];
   if (projects[0]) {

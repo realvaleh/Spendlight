@@ -162,7 +162,7 @@ export function admitMutating(
     }
 
     const reservationId = randomUUID();
-    insertReservation(db, reservationId, project, reserveUsd);
+    insertReservation(db, reservationId, project, reserveUsd, preflight.model);
     return { allowed: true, decision: committed, reservationId, reserveUsd };
   });
 }

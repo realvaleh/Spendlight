@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { calendarDayKey, shiftCalendarDay } from "./day.js";
-import type { LedgerRow, Usage } from "./types.js";
+import type { ActiveReservation, LedgerRow, Usage } from "./types.js";
 
 export type Db = DatabaseSync;
 
@@ -45,10 +45,20 @@ export function openDb(dbPath: string): Db {
       id TEXT PRIMARY KEY,
       created_at TEXT NOT NULL,
       project TEXT NOT NULL,
-      cost_usd REAL NOT NULL
+      cost_usd REAL NOT NULL,
+      model TEXT NOT NULL DEFAULT 'unknown'
     );
   `);
+  ensureReservationModel(db);
   return db;
+}
+
+/** Ledgers created before the model column still open. New holds record the priced model. */
+function ensureReservationModel(db: Db): void {
+  const cols = db.prepare(`PRAGMA table_info(reservations)`).all() as { name: string }[];
+  if (!cols.some((col) => col.name === "model")) {
+    db.exec(`ALTER TABLE reservations ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'`);
+  }
 }
 
 /** Drop in-flight holds left behind by a crashed process so they cannot wedge the kill-switch. */
@@ -112,13 +122,47 @@ export function reservedSpend(db: Db, project?: string, window?: SpendWindow | n
   return Number(row.s) || 0;
 }
 
-export function insertReservation(db: Db, id: string, project: string, costUsd: number): void {
-  db.prepare(`INSERT INTO reservations (id, created_at, project, cost_usd) VALUES (?, ?, ?, ?)`).run(
+export function insertReservation(db: Db, id: string, project: string, costUsd: number, model = "unknown"): void {
+  const stored = model.trim() ? model : "unknown";
+  db.prepare(`INSERT INTO reservations (id, created_at, project, cost_usd, model) VALUES (?, ?, ?, ?, ?)`).run(
     id,
     new Date().toISOString(),
     project,
     roundUsd(costUsd),
+    stored,
   );
+}
+
+/**
+ * In-flight hard-budget holds, oldest first.
+ * `stale` matches the crash sweep: the next admission deletes rows with
+ * `created_at` strictly older than {@link RESERVATION_TTL_MS}. This read
+ * does not delete them, so an operator can see a hold the sweep has not
+ * reached yet. A missing or future timestamp stays `held` with age 0.
+ */
+export function listActiveReservations(db: Db, now = Date.now()): ActiveReservation[] {
+  const rows = db
+    .prepare(
+      `SELECT id, created_at AS startedAt, project, COALESCE(model, 'unknown') AS model, cost_usd AS reservedUsd
+       FROM reservations ORDER BY created_at ASC, id ASC`,
+    )
+    .all() as { id: string; startedAt: string; project: string; model: string; reservedUsd: number }[];
+  const cutoff = now - RESERVATION_TTL_MS;
+  return rows.map((row) => {
+    const startedMs = Date.parse(row.startedAt);
+    const known = Number.isFinite(startedMs);
+    const ageSeconds = known ? Math.max(0, Math.floor((now - startedMs) / 1000)) : 0;
+    const model = row.model.trim() ? row.model : "unknown";
+    return {
+      id: row.id,
+      project: row.project,
+      model,
+      reservedUsd: roundUsd(Number(row.reservedUsd) || 0),
+      startedAt: row.startedAt,
+      ageSeconds,
+      status: known && startedMs < cutoff ? "stale" : "held",
+    };
+  });
 }
 
 export function deleteReservation(db: Db, id: string): void {

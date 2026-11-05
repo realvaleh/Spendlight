@@ -72,6 +72,22 @@ export type BudgetDecision = {
   windowEnd: string | null;
 };
 
+/** In-flight hard-budget hold. `stale` is old enough for the next admission to drop it. */
+export type ReservationStatus = "held" | "stale";
+
+export type ActiveReservation = {
+  /** Reservation id. This is the in-flight hold, not a settled ledger row. */
+  id: string;
+  project: string;
+  model: string;
+  reservedUsd: number;
+  /** ISO timestamp when the hold was taken. */
+  startedAt: string;
+  /** Whole seconds since `startedAt`. Never negative. */
+  ageSeconds: number;
+  status: ReservationStatus;
+};
+
 export type Summary = {
   generatedAt: string;
   /**
@@ -131,5 +147,13 @@ export type Summary = {
    * streamed rows stay in the ranking. `recent` stays newest-first.
    */
   topRequests: LedgerRow[];
+  /**
+   * Hard-budget holds that have not settled yet, oldest first.
+   * This is live state, not a ledger slice: `project`, `model`, `since`,
+   * `until`, and `window` do not filter it. Empty when nothing is held.
+   * `status` is `held` inside the 15-minute crash sweep, and `stale` once
+   * the next admission would drop the row. Reading this does not release a hold.
+   */
+  reservations: ActiveReservation[];
   events: { createdAt: string; type: string; project: string; message: string }[];
 };
