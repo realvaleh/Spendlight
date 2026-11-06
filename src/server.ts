@@ -1,6 +1,16 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Config, LedgerRow, Summary } from "./types.js";
-import { closeDb, listRequests, loadSummaryParts, openDb, spendMatching, type CreatedRange, type Db } from "./db.js";
+import {
+  closeDb,
+  listRequests,
+  listReservations,
+  loadSummaryParts,
+  openDb,
+  spendMatching,
+  tryReleaseReservation,
+  type CreatedRange,
+  type Db,
+} from "./db.js";
 import { evaluateBudget, spendWindow } from "./budget.js";
 import { dashboardHtml, FAVICON_SVG } from "./ui.js";
 import { badgeSvg, receiptMarkdown, receiptSvg } from "./receipts.js";
@@ -82,6 +92,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
     if (!parsed) return;
     return sendJson(res, 200, summaryFor(db, config, url, parsed.range), req);
   }
+  if (url.pathname === "/api/reservations" || url.pathname.startsWith("/api/reservations/")) {
+    return handleReservation(req, res, db, url);
+  }
   if (req.method === "GET" && (url.pathname === "/api/export.csv" || url.pathname === "/api/export.json")) {
     const parsed = exportRangeOr400(url, config, res, req);
     if (!parsed) return;
@@ -146,6 +159,41 @@ export function buildSummary(
 
 function summaryFor(db: Db, config: Config, url: URL, range?: CreatedRange | null): Summary {
   return buildSummary(db, config, queryProject(url), queryModel(url), range);
+}
+
+/** List holds, or release exactly one. Never deletes the whole table and never writes spend. */
+function handleReservation(req: IncomingMessage, res: ServerResponse, db: Db, url: URL): void {
+  if (req.method === "GET" && url.pathname === "/api/reservations") {
+    sendJson(res, 200, listReservations(db), req);
+    return;
+  }
+  if (req.method === "DELETE" && url.pathname.startsWith("/api/reservations/")) {
+    const id = reservationIdFromPath(url.pathname);
+    const released = id ? tryReleaseReservation(db, id) : null;
+    if (!released) {
+      sendJson(res, 404, { error: { message: "Reservation not found", type: "invalid_request_error" } }, req);
+      return;
+    }
+    sendJson(res, 200, { released: true, ...released }, req);
+    return;
+  }
+  sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } }, req);
+}
+
+/** One path segment. `%2F` may be part of the id; a literal extra slash is not. */
+function reservationIdFromPath(pathname: string): string | null {
+  const prefix = "/api/reservations/";
+  if (!pathname.startsWith(prefix)) return null;
+  const raw = pathname.slice(prefix.length);
+  if (!raw || raw.includes("/")) return null;
+  let id: string;
+  try {
+    id = decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+  if (!id || id.length > 512) return null;
+  return id;
 }
 
 /** Writes a 400 and returns undefined when `since`, `until`, or `window` is invalid. */

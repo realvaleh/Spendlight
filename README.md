@@ -247,6 +247,15 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 | `/api/export.csv` | Spend ledger as CSV (same scope parameters as the receipts) |
 | `/api/export.json` | Same filtered ledger rows as the CSV, as a JSON array |
 | `/health` | Liveness |
+| `GET /api/reservations` | Active hard-budget holds, oldest first: id, project, reserved USD, and start time |
+| `DELETE /api/reservations/<id>` | Release that hold so it no longer counts toward the hard cap. 404 if it is already gone. Does not write a ledger row |
+
+`GET /api/reservations` and `DELETE /api/reservations/<id>` are how an operator clears a hold that is still blocking the hard cap after a hung or crashed call, without waiting for the 15-minute sweep on the next admission. The dashboard **Budget holds** card lists those holds and releases one. Releasing deletes that reservation only. It does not settle a spend row for a call that never finished. If the call is still running and later completes, Spendlight logs that actual usage when it settles. Releasing an unknown or already-released id returns 404 and leaves every other hold and the ledger untouched.
+
+```bash
+curl -s http://127.0.0.1:8787/api/reservations
+curl -s -X DELETE http://127.0.0.1:8787/api/reservations/RESERVATION_ID
+```
 
 Sample receipt (checked in):
 
@@ -313,7 +322,7 @@ Streaming chat completions: Spendlight sets `stream_options.include_usage` so a 
 
 Spendlight is a **localhost reverse proxy that can spend your API key**. Treat the bind address like a secret.
 
-- **Bind localhost.** Default `SPENDLIGHT_HOST=127.0.0.1`. Docker Compose publishes `127.0.0.1:8787`. Do not put this on `0.0.0.0` / the public internet. The dashboard, receipts, badge, `/api/summary`, `/api/export.csv`, and `/api/export.json` have **no auth**.
+- **Bind localhost.** Default `SPENDLIGHT_HOST=127.0.0.1`. Docker Compose publishes `127.0.0.1:8787`. Do not put this on `0.0.0.0` / the public internet. The dashboard, receipts, badge, `/api/summary`, `/api/export.csv`, `/api/export.json`, `/api/reservations`, and `DELETE /api/reservations/<id>` have **no auth**.
 - **API keys.** If `OPENAI_API_KEY` is set, any client that can reach the proxy and omits `Authorization` uses your key. If the client sends `Authorization`, that value is forwarded instead. Keys are not written to the ledger or stdout. Prefer the env var over `upstream.apiKey` in JSON (do not commit keys).
 - **Trust model.** Anyone who can talk to the port is trusted: they can complete, retag projects, and read spend. Project tags are labels, not ACLs. CORS is allowed only from `http(s)://127.0.0.1`, `localhost`, and `::1` so a random website cannot drive the proxy from the browser.
 - **Upstream URL.** `OPENAI_BASE_URL` is operator-controlled (http/https only). Clients cannot pick a different host. Do not point it at arbitrary internal URLs.

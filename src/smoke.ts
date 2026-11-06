@@ -332,6 +332,18 @@ async function main(): Promise<void> {
     assert(dash.includes("highest cost first"), "dashboard should order expensive requests by cost");
     assert(dash.includes('id="top-requests"'), "dashboard missing most-expensive mount");
     assert(dash.includes("s.topRequests"), "dashboard should render topRequests");
+    assert(dash.includes("Budget holds"), "dashboard missing budget-holds card");
+    assert(dash.includes('id="budget-holds"'), "dashboard missing budget-holds mount");
+    assert(dash.includes("/api/reservations"), "dashboard should load holds");
+    assert(dash.includes("data-release-id"), "dashboard missing release control");
+    assert(dash.includes('esc(h.id)'), "dashboard should escape hold ids");
+    assert(dash.includes("esc(h.project)"), "dashboard should escape hold projects");
+    assert(dash.includes("No budget holds right now."), "dashboard missing empty holds copy");
+    assert(dash.includes('(busy ? "Releasing…" : "Release")'), "dashboard missing release button");
+    assert(
+      dash.includes('fetch("/api/reservations/" + encodeURIComponent(id), { method: "DELETE" })'),
+      "dashboard should release one hold by id",
+    );
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -364,8 +376,9 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testReleaseReservation(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, reservation release");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -930,6 +943,129 @@ function testMonthLedgerWindow(dir: string): void {
   assert(lifetime.status === "hard", `lifetime should be hard, got ${lifetime.status}`);
   assert(!lifetime.message?.includes("this month"), lifetime.message ?? "");
   closeDb(db);
+}
+
+type HoldRow = { id: string; project: string; reservedUsd: number; startedAt: string };
+
+async function reservationsOf(base: string): Promise<HoldRow[]> {
+  const res = await fetch(`${base}/api/reservations`);
+  assert(res.status === 200, `list reservations status ${res.status}`);
+  const body = (await res.json()) as unknown;
+  assert(Array.isArray(body), "reservations list should be an array");
+  return body as HoldRow[];
+}
+
+async function testReleaseReservation(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "release-hold", mockUrl, { softUsd: null, hardUsd: 1 }, async (base, app) => {
+    const keepId = "keep-1";
+    const slashId = "keep/me";
+    const stuckId = "stuck-<hold>&1";
+    const now = Date.now();
+    const keepAt = new Date(now - 3000).toISOString();
+    const slashAt = new Date(now - 2000).toISOString();
+    const stuckAt = new Date(now - 1000).toISOString();
+    const insert = app.db.prepare(
+      `INSERT INTO reservations (id, created_at, project, cost_usd) VALUES (?, ?, ?, ?)`,
+    );
+    insert.run(keepId, keepAt, "demo", 0.25);
+    insert.run(slashId, slashAt, "<img src=x onerror=alert(1)>", 0.25);
+    insert.run(stuckId, stuckAt, "ops", 0.5);
+
+    const listed = await reservationsOf(base);
+    assert(
+      listed.map((row) => row.id).join("|") === [keepId, slashId, stuckId].join("|"),
+      `hold order ${listed.map((row) => row.id).join("|")}`,
+    );
+    assert(listed[1]?.project === "<img src=x onerror=alert(1)>", "list should return the raw project");
+    assert(listed[2]?.reservedUsd === 0.5 && listed[2]?.startedAt === stuckAt, "stuck hold fields");
+
+    const missing = await fetch(`${base}/api/reservations/${encodeURIComponent("no-such-hold")}`, { method: "DELETE" });
+    assert(missing.status === 404, `missing hold status ${missing.status}`);
+    const missingBody = (await missing.json()) as { error?: { message?: string; type?: string } };
+    assert(missingBody.error?.message === "Reservation not found", `missing hold body ${JSON.stringify(missingBody)}`);
+    assert(missingBody.error?.type === "invalid_request_error", "missing hold should stay an invalid request");
+    assert((await reservationsOf(base)).length === 3, "a 404 release must not drop other holds");
+
+    const collection = await fetch(`${base}/api/reservations`, { method: "DELETE" });
+    assert(collection.status === 404, `collection delete status ${collection.status}`);
+    assert((await reservationsOf(base)).length === 3, "DELETE on the collection must not drop holds");
+
+    const literalSlash = await fetch(`${base}/api/reservations/keep/me`, { method: "DELETE" });
+    assert(literalSlash.status === 404, `slash path status ${literalSlash.status}`);
+    assert(
+      (await reservationsOf(base)).some((row) => row.id === slashId),
+      "an extra path segment must not release the hold",
+    );
+
+    const badEncoding = await fetch(`${base}/api/reservations/%E0%A4%A`, { method: "DELETE" });
+    assert(badEncoding.status === 404, `bad encoding status ${badEncoding.status}`);
+    assert((await reservationsOf(base)).length === 3, "a bad id must not drop holds");
+
+    const blocked = await postChat(
+      base,
+      "probe",
+      JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "hi" }] }),
+    );
+    assert(blocked.status === 402, `held cap should reject, got ${blocked.status}`);
+    const blockedBody = (await blocked.json()) as { error?: { code?: string } };
+    assert(blockedBody.error?.code === "budget_hard_limit", "held cap 402 missing budget code");
+    let summary = await summaryOf(base);
+    assert(summary.requests === 0 && summary.spendUsd === 0, `block should not settle, requests ${summary.requests} spend ${summary.spendUsd}`);
+
+    const released = await fetch(`${base}/api/reservations/${encodeURIComponent(stuckId)}`, { method: "DELETE" });
+    assert(released.status === 200, `release status ${released.status}`);
+    const releasedBody = (await released.json()) as Record<string, unknown>;
+    assert(releasedBody.released === true, "release body missing released");
+    assert(releasedBody.id === stuckId, `released id ${String(releasedBody.id)}`);
+    assert(releasedBody.project === "ops", `released project ${String(releasedBody.project)}`);
+    assert(releasedBody.reservedUsd === 0.5, `released amount ${String(releasedBody.reservedUsd)}`);
+    assert(releasedBody.startedAt === stuckAt, `released start ${String(releasedBody.startedAt)}`);
+    assert(!("promptTokens" in releasedBody) && !("costUsd" in releasedBody), "release must not look like a settled row");
+
+    const second = await fetch(`${base}/api/reservations/${encodeURIComponent(stuckId)}`, { method: "DELETE" });
+    assert(second.status === 404, `second release status ${second.status}`);
+    const after = await reservationsOf(base);
+    assert(
+      after.map((row) => row.id).join("|") === [keepId, slashId].join("|"),
+      `holds after release ${after.map((row) => row.id).join("|")}`,
+    );
+    summary = await summaryOf(base);
+    assert(
+      summary.requests === 0 && summary.spendUsd === 0,
+      `release must not write spend, requests ${summary.requests} spend ${summary.spendUsd}`,
+    );
+    const exported = await fetch(`${base}/api/export.json`).then((r) => r.text());
+    assert(exported === "[]", `export after release should stay empty, got ${exported}`);
+    const receipt = await fetch(`${base}/receipt.md`).then((r) => r.text());
+    assert(!receipt.includes(stuckId), "receipt should not mention a released hold");
+
+    const allowed = await postChat(
+      base,
+      "probe",
+      JSON.stringify({ model: "gpt-4o-mini", small: true, messages: [{ role: "user", content: "hi" }] }),
+    );
+    const allowedText = await allowed.text();
+    assert(allowed.status === 200, `released hold should free the cap, got ${allowed.status}: ${allowedText.slice(0, 180)}`);
+    summary = await summaryOf(base);
+    assert(summary.requests === 1, `admitted call logged ${summary.requests} rows`);
+    assert(summary.spendUsd > 0 && summary.spendUsd < 0.01, `admitted spend should be the call, not the hold: ${summary.spendUsd}`);
+    const rows = (await fetch(`${base}/api/export.json`).then((r) => r.json())) as { id: string; costUsd: number }[];
+    assert(rows.length === 1, `export rows ${rows.length}`);
+    assert(rows[0]?.id !== stuckId && rows[0]?.id !== keepId && rows[0]?.id !== slashId, "ledger id must not be a reservation id");
+    const still = await reservationsOf(base);
+    assert(
+      still.map((row) => row.id).join("|") === [keepId, slashId].join("|"),
+      "the admitted call must not drop the other holds",
+    );
+
+    const slash = await fetch(`${base}/api/reservations/${encodeURIComponent(slashId)}`, { method: "DELETE" });
+    assert(slash.status === 200, `encoded slash release status ${slash.status}`);
+    const slashBody = (await slash.json()) as { id?: string; reservedUsd?: number };
+    assert(slashBody.id === slashId && slashBody.reservedUsd === 0.25, `slash release ${JSON.stringify(slashBody)}`);
+    assert((await reservationsOf(base)).map((row) => row.id).join("|") === keepId, "keeper should remain");
+    summary = await summaryOf(base);
+    assert(summary.requests === 1, `releasing another hold changed the ledger to ${summary.requests} rows`);
+  });
 }
 
 function testReservationOutsideDay(dir: string): void {

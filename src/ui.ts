@@ -70,9 +70,11 @@ export function dashboardHtml(): string {
     .spark polygon { fill: rgba(184,134,42,.12); }
     .row-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
     .links { display: flex; gap: 10px; flex-wrap: wrap; }
-    a.btn { color: var(--ink); text-decoration: none; font-size: 12px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; background: #fff8ea; }
-    a.btn.mini { font-size: 11px; padding: 3px 8px; }
-    a.btn:hover { border-color: var(--ink); }
+    a.btn, button.btn { color: var(--ink); text-decoration: none; font-size: 12px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; background: #fff8ea; font-family: inherit; cursor: pointer; }
+    a.btn.mini, button.btn.mini { font-size: 11px; padding: 3px 8px; }
+    a.btn:hover, button.btn:hover { border-color: var(--ink); }
+    button.btn:disabled { opacity: .55; cursor: default; }
+    button.btn.release { color: var(--red); }
     .proj-links { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
     footer { margin-top: 22px; color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
     .empty { padding: 28px 8px; color: var(--muted); font-family: var(--serif); font-style: italic; }
@@ -83,6 +85,12 @@ export function dashboardHtml(): string {
       .hero, .grid, .stats { grid-template-columns: 1fr; }
       header { flex-direction: column; }
     }
+    .release-hold { padding: 12px 0; border-bottom: 1px solid var(--line); }
+    .release-hold:last-child { border-bottom: 0; padding-bottom: 0; }
+    .release-hold-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .release-hold-top code { font-size: 12px; word-break: break-all; }
+    .release-hold-meta { color: var(--muted); font-size: 13px; margin-top: 4px; line-height: 1.45; }
+    button.btn.release { flex: none; }
   </style>
 </head>
 <body>
@@ -123,6 +131,14 @@ export function dashboardHtml(): string {
         </div>
       </article>
     </section>
+
+    <article class="card" style="margin-bottom:18px">
+      <div class="row-head">
+        <div class="k">Budget holds</div>
+        <div class="sub" id="budget-holds-sub">in flight</div>
+      </div>
+      <div id="budget-holds" class="empty">No budget holds right now.</div>
+    </article>
 
     <section class="grid">
       <article class="card">
@@ -254,8 +270,10 @@ export function dashboardHtml(): string {
         '<a class="btn mini" href="/api/export.json?' + q + '">JSON</a>' +
         '</div>';
     }
+    const releasing = new Set();
     async function tick() {
       const s = await fetch("/api/summary").then(r => r.json());
+      const holds = await fetch("/api/reservations").then(r => r.json()).catch(() => []);
       $("spend").textContent = fmtMoney(s.spendUsd);
       $("requests").textContent = fmtInt(s.requests);
       $("tokens").textContent = fmtInt(s.tokens);
@@ -351,6 +369,46 @@ export function dashboardHtml(): string {
       $("events").innerHTML = s.events.length
         ? s.events.map(e => "<li><strong>" + esc(e.type) + "</strong> · " + esc(e.project) + " · " + esc(e.message) + "</li>").join("")
         : '<li class="empty" style="border:0;padding-left:0">None yet.</li>';
+      renderHolds(holds);
+    }
+    function renderHolds(holds) {
+      const list = Array.isArray(holds) ? holds : [];
+      $("budget-holds-sub").textContent = list.length
+        ? "oldest first · release does not record spend"
+        : "none in flight";
+      const rows = list.map(h => {
+        const busy = releasing.has(h.id);
+        return '<div class="release-hold"><div class="release-hold-top"><code>' + esc(h.id) + '</code>' +
+          '<button type="button" class="btn mini release" data-release-id="' + esc(h.id) + '"' +
+          (busy ? " disabled" : "") + ">" + (busy ? "Releasing…" : "Release") + "</button></div>" +
+          '<div class="release-hold-meta">' + esc(h.project) + " · " + fmtMoney(Number(h.reservedUsd) || 0) +
+          " reserved · started " + esc(h.startedAt ? new Date(h.startedAt).toLocaleString() : "") + "</div></div>";
+      }).join("");
+      $("budget-holds").className = "";
+      $("budget-holds").innerHTML = rows || '<div class="empty">No budget holds right now.</div>';
+    }
+    async function releaseHold(ev) {
+      const btn = ev.target && ev.target.closest ? ev.target.closest("[data-release-id]") : null;
+      if (!btn || btn.disabled) return;
+      const id = btn.getAttribute("data-release-id");
+      if (!id || releasing.has(id)) return;
+      releasing.add(id);
+      btn.disabled = true;
+      btn.textContent = "Releasing…";
+      let ok = false;
+      try {
+        const res = await fetch("/api/reservations/" + encodeURIComponent(id), { method: "DELETE" });
+        ok = res.ok || res.status === 404;
+      } catch {
+        ok = false;
+      }
+      releasing.delete(id);
+      if (ok) {
+        await tick();
+        return;
+      }
+      btn.disabled = false;
+      btn.textContent = "Release failed";
     }
     function projectLinks(name) {
       const q = encodeURIComponent(name);
@@ -394,6 +452,7 @@ export function dashboardHtml(): string {
       if (hard == null) return head + "no global hard budget" + softBit + ".";
       return head + "hard budget " + fmtMoney(spend) + " / " + fmtMoney(hard) + softBit;
     }
+    $("budget-holds").addEventListener("click", (ev) => { void releaseHold(ev); });
     tick();
     setInterval(tick, 3000);
   </script>
