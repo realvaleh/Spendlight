@@ -30,6 +30,15 @@ export type Config = {
   fallbackPrice: ModelPrice;
 };
 
+/** One in-flight hard-budget hold. This is not a settled ledger row. */
+export type ReservationHold = {
+  id: string;
+  project: string;
+  reservedUsd: number;
+  /** ISO timestamp when the hold was taken. */
+  startedAt: string;
+};
+
 export type LedgerRow = {
   id: string;
   createdAt: string;

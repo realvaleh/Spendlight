@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { calendarDayKey, shiftCalendarDay } from "./day.js";
-import type { LedgerRow, Usage } from "./types.js";
+import type { LedgerRow, ReservationHold, Usage } from "./types.js";
 
 export type Db = DatabaseSync;
 
@@ -123,6 +123,46 @@ export function insertReservation(db: Db, id: string, project: string, costUsd: 
 
 export function deleteReservation(db: Db, id: string): void {
   db.prepare(`DELETE FROM reservations WHERE id = ?`).run(id);
+}
+
+/** In-flight holds, oldest first. This read does not release or sweep them. */
+export function listReservations(db: Db): ReservationHold[] {
+  const rows = db
+    .prepare(
+      `SELECT id, created_at AS startedAt, project, cost_usd AS reservedUsd
+       FROM reservations ORDER BY created_at ASC, id ASC`,
+    )
+    .all() as { id: string; startedAt: string; project: string; reservedUsd: number }[];
+  return rows.map((row) => ({
+    id: row.id,
+    project: row.project,
+    reservedUsd: roundUsd(Number(row.reservedUsd) || 0),
+    startedAt: row.startedAt,
+  }));
+}
+
+/**
+ * Drop one in-flight hold. Returns the row that was removed, or null when
+ * that id is already gone. Does not insert a ledger row.
+ */
+export function tryReleaseReservation(db: Db, id: string): ReservationHold | null {
+  if (!id) return null;
+  return withImmediate(db, () => {
+    const row = db
+      .prepare(
+        `SELECT id, created_at AS startedAt, project, cost_usd AS reservedUsd FROM reservations WHERE id = ?`,
+      )
+      .get(id) as { id: string; startedAt: string; project: string; reservedUsd: number } | undefined;
+    if (!row) return null;
+    const result = db.prepare(`DELETE FROM reservations WHERE id = ?`).run(id);
+    if (Number(result.changes) < 1) return null;
+    return {
+      id: row.id,
+      project: row.project,
+      reservedUsd: roundUsd(Number(row.reservedUsd) || 0),
+      startedAt: row.startedAt,
+    };
+  });
 }
 
 export function spendFor(db: Db, project?: string, window?: SpendWindow | null): number {
