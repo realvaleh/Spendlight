@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import { calendarDayKey, shiftCalendarDay } from "./day.js";
+import { calendarDayKey, calendarHourKey, nextCalendarHourKey, shiftCalendarDay } from "./day.js";
 import type { LedgerRow, Usage } from "./types.js";
 
 export type Db = DatabaseSync;
@@ -306,6 +306,7 @@ export function loadSummaryParts(
   byModel: { model: string; spendUsd: number; requests: number; tokens: number }[];
   byProjectModel: { project: string; model: string; spendUsd: number; requests: number; tokens: number }[];
   daily: { day: string; spendUsd: number; requests: number }[];
+  hourly: { hour: string; spendUsd: number; requests: number }[];
   recent: LedgerRow[];
   topRequests: LedgerRow[];
   events: { createdAt: string; type: string; project: string; message: string }[];
@@ -360,6 +361,7 @@ export function loadSummaryParts(
       tokens: Number(r.tokens),
     })),
     daily: dailySeries(stamps, timeZone, range, now),
+    hourly: hourlySeries(stamps, timeZone, range, now),
     recent: listRecent(db, 40, project, model, range),
     topRequests: topRequests.map(normalizeRow),
     events,
@@ -413,6 +415,61 @@ function dailySeries(
     });
   }
   return out;
+}
+
+/**
+ * One row per local hour in the covered span, oldest first.
+ * Quiet hours inside that span are included as zeros. An unset `since` starts
+ * at the earliest matching request; an unset `until` runs through the current
+ * hour in `timeZone` (or the latest request, when that is later).
+ * A repeated DST hour is one row. A spring-forward gap is not a row.
+ */
+function hourlySeries(
+  rows: { createdAt: string; costUsd: number }[],
+  timeZone: string,
+  range: CreatedRange | null | undefined,
+  now: Date,
+): { hour: string; spendUsd: number; requests: number }[] {
+  const buckets = new Map<string, { spendUsd: number; requests: number }>();
+  let earliest: string | null = null;
+  let latest: string | null = null;
+  for (const row of rows) {
+    const hour = calendarHourKey(timeZone, new Date(row.createdAt));
+    const bucket = buckets.get(hour) ?? { spendUsd: 0, requests: 0 };
+    bucket.spendUsd += Number(row.costUsd) || 0;
+    bucket.requests += 1;
+    buckets.set(hour, bucket);
+    if (!earliest || hour < earliest) earliest = hour;
+    if (!latest || hour > latest) latest = hour;
+  }
+
+  const start = range?.sinceIso ? calendarHourKey(timeZone, new Date(range.sinceIso)) : earliest;
+  let end: string | null;
+  if (range?.untilIso) {
+    end = calendarHourKey(timeZone, new Date(Date.parse(range.untilIso) - 1));
+  } else if (!latest) {
+    end = range?.sinceIso ? calendarHourKey(timeZone, now) : null;
+  } else {
+    const current = calendarHourKey(timeZone, now);
+    end = latest > current ? latest : current;
+  }
+  if (!start || !end || start > end) return [];
+
+  const out: { hour: string; spendUsd: number; requests: number }[] = [];
+  let hour = start;
+  for (let i = 0; i < 24 * 366 * 80; i++) {
+    const bucket = buckets.get(hour);
+    out.push({
+      hour,
+      spendUsd: roundUsd(bucket?.spendUsd ?? 0),
+      requests: bucket?.requests ?? 0,
+    });
+    if (hour === end) return out;
+    const next = nextCalendarHourKey(timeZone, hour);
+    if (next <= hour || next > end) return out;
+    hour = next;
+  }
+  throw new Error(`Hourly span from ${start} to ${end} in ${timeZone} is too long.`);
 }
 
 function normalizeRow(row: LedgerRow): LedgerRow {

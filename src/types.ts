@@ -122,6 +122,18 @@ export type Summary = {
    * set, otherwise the later of today in that timezone and the latest request.
    */
   daily: { day: string; spendUsd: number; requests: number }[];
+  /**
+   * Spend by local hour in the budget timezone (`UTC` when unset).
+   * `hour` is `YYYY-MM-DDTHH:00:00`. Every local hour in the covered span is
+   * present, including hours with no matching requests (`spendUsd: 0`,
+   * `requests: 0`). The span starts on the local hour of `scopeSince` when
+   * set, otherwise the local hour of the earliest in-scope request (empty
+   * when both are absent). It ends on the last local hour touched by the
+   * half-open `scopeUntil` when set, otherwise the later of the current hour
+   * in that timezone and the latest request. A repeated DST hour is one row.
+   * A spring-forward gap is omitted.
+   */
+  hourly: { hour: string; spendUsd: number; requests: number }[];
   recent: LedgerRow[];
   /**
    * The ten highest-cost requests inside the same project, model, and time

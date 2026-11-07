@@ -153,6 +153,14 @@ export function dashboardHtml(): string {
 
     <article class="card" style="margin-bottom:18px">
       <div class="row-head">
+        <div class="k">Spend by hour</div>
+        <div class="sub" id="hourly-sub">last 24 hours</div>
+      </div>
+      <div id="by-hour" class="empty">No hours yet.</div>
+    </article>
+
+    <article class="card" style="margin-bottom:18px">
+      <div class="row-head">
         <div class="k">Most expensive</div>
         <div class="sub">highest cost first</div>
       </div>
@@ -231,6 +239,100 @@ export function dashboardHtml(): string {
       const dd = String(utc.getUTCDate()).padStart(2, "0");
       return utc.getUTCFullYear() + "-" + mm + "-" + dd;
     }
+    function zonedClock(date, timeZone) {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: timeZone || "UTC",
+        hourCycle: "h23",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+      }).formatToParts(date);
+      const map = {};
+      for (const p of parts) if (p.type !== "literal") map[p.type] = p.value;
+      return {
+        year: Number(map.year),
+        month: Number(map.month),
+        day: Number(map.day),
+        hour: Number(map.hour) % 24,
+        minute: Number(map.minute),
+        second: Number(map.second)
+      };
+    }
+    function hourKeyFromParts(p) {
+      const mm = String(p.month).padStart(2, "0");
+      const dd = String(p.day).padStart(2, "0");
+      const hh = String(p.hour).padStart(2, "0");
+      return p.year + "-" + mm + "-" + dd + "T" + hh + ":00:00";
+    }
+    function hourKeyInZone(date, timeZone) {
+      return hourKeyFromParts(zonedClock(date, timeZone));
+    }
+    function zoneOffsetMs(timeZone, date) {
+      const p = zonedClock(date, timeZone);
+      const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+      return asUtc - date.getTime();
+    }
+    function utcFromCivilHour(timeZone, year, month, day, hour) {
+      const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, 0, 0));
+      const offset = zoneOffsetMs(timeZone, utcGuess);
+      let instant = new Date(utcGuess.getTime() - offset);
+      const corrected = zoneOffsetMs(timeZone, instant);
+      if (corrected !== offset) instant = new Date(utcGuess.getTime() - corrected);
+      const parts = zonedClock(instant, timeZone);
+      if (parts.year !== year || parts.month !== month || parts.day !== day || parts.hour !== hour) return null;
+      return instant;
+    }
+    function parseHourKey(hour) {
+      const m = /^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):00:00$/.exec(hour);
+      if (!m) return null;
+      return { year: Number(m[1]), month: Number(m[2]), day: Number(m[3]), hour: Number(m[4]) };
+    }
+    function addCivilHour(p) {
+      if (p.hour < 23) return { year: p.year, month: p.month, day: p.day, hour: p.hour + 1 };
+      const utc = new Date(Date.UTC(p.year, p.month - 1, p.day + 1));
+      return { year: utc.getUTCFullYear(), month: utc.getUTCMonth() + 1, day: utc.getUTCDate(), hour: 0 };
+    }
+    function nextHourKey(hour, timeZone) {
+      const start = parseHourKey(hour);
+      if (!start) return hour;
+      const origin = utcFromCivilHour(timeZone, start.year, start.month, start.day, start.hour);
+      if (!origin) return hour;
+      let civil = start;
+      for (let i = 0; i < 48; i++) {
+        civil = addCivilHour(civil);
+        const resolved = utcFromCivilHour(timeZone, civil.year, civil.month, civil.day, civil.hour);
+        if (resolved && resolved.getTime() > origin.getTime()) return hourKeyFromParts(civil);
+      }
+      return hour;
+    }
+    function lastHours(s) {
+      const zone = (s.budget && s.budget.timezone) || "UTC";
+      const endKey = hourKeyInZone(new Date(s.generatedAt), zone);
+      const endParts = parseHourKey(endKey);
+      const endInstant = (endParts && utcFromCivilHour(zone, endParts.year, endParts.month, endParts.day, endParts.hour)) || new Date(s.generatedAt);
+      const byHour = {};
+      for (const h of s.hourly || []) byHour[h.hour] = h;
+      const keys = [];
+      let cursor = endInstant;
+      for (let step = 0; keys.length < 24 && step < 48; step++) {
+        const key = hourKeyInZone(cursor, zone);
+        if (keys[0] !== key) keys.unshift(key);
+        cursor = new Date(cursor.getTime() - 3600000);
+      }
+      return {
+        zone: zone,
+        endKey: endKey,
+        rows: keys.map(hour => {
+          const found = byHour[hour];
+          return found
+            ? { hour: hour, spendUsd: found.spendUsd, requests: found.requests }
+            : { hour: hour, spendUsd: 0, requests: 0 };
+        })
+      };
+    }
     function lastFortnight(s) {
       const zone = (s.budget && s.budget.timezone) || "UTC";
       const end = ymdInZone(new Date(s.generatedAt), zone);
@@ -248,6 +350,14 @@ export function dashboardHtml(): string {
     }
     function dayLinks(day) {
       const q = "since=" + encodeURIComponent(day) + "&until=" + encodeURIComponent(addYmd(day, 1));
+      return '<div class="proj-links">' +
+        '<a class="btn mini" href="/receipt.md?' + q + '">Markdown</a>' +
+        '<a class="btn mini" href="/api/export.csv?' + q + '">CSV</a>' +
+        '<a class="btn mini" href="/api/export.json?' + q + '">JSON</a>' +
+        '</div>';
+    }
+    function hourLinks(hour, timeZone) {
+      const q = "since=" + encodeURIComponent(hour) + "&until=" + encodeURIComponent(nextHourKey(hour, timeZone));
       return '<div class="proj-links">' +
         '<a class="btn mini" href="/receipt.md?' + q + '">Markdown</a>' +
         '<a class="btn mini" href="/api/export.csv?' + q + '">CSV</a>' +
@@ -292,6 +402,24 @@ export function dashboardHtml(): string {
       );
       $("by-day").className = "";
       $("by-day").innerHTML = dailyRows || '<div class="empty">No days yet.</div>';
+      const hours = lastHours(s);
+      const hourSpend = hours.rows.reduce((sum, h) => sum + Number(h.spendUsd || 0), 0);
+      $("hourly-sub").textContent = hourSpend
+        ? "last 24 hours · " + hours.zone
+        : "last 24 hours · " + hours.zone + " · no spend";
+      const maxH = Math.max(...hours.rows.map(h => h.spendUsd), 1e-9);
+      const hourlyRows = table(
+        [{label:"Hour"},{label:"Spend",num:true},{label:"Reqs",num:true},{label:"That hour"}],
+        hours.rows.map(h => [
+          '<span class="' + (h.hour === hours.endKey ? "day-today" : "") + '">' + esc(h.hour.replace("T", " ").slice(0, 16)) + "</span>",
+          (h.spendUsd ? fmtMoney(h.spendUsd) : "$0.00") + '<div class="bar"><i style="width:' + (h.spendUsd / maxH * 100) + "%;background:" + (h.hour === hours.endKey ? "var(--gold)" : "var(--ink)") + '"></i></div>',
+          fmtInt(h.requests),
+          hourLinks(h.hour, hours.zone)
+        ]),
+        "compact"
+      );
+      $("by-hour").className = "";
+      $("by-hour").innerHTML = hourlyRows || '<div class="empty">No hours yet.</div>';
       spark(fortnight);
       const maxP = Math.max(...s.byProject.map(p => p.spendUsd), 1e-9);
       const proj = table(
