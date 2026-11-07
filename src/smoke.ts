@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
 import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
-import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
+import { calendarDayBounds, calendarDayKey, calendarHourKey, calendarMonthBounds, calendarWeekBounds, nextCalendarHourKey, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
+import { dashboardHtml } from "./ui.js";
 import { estimateCostUsd } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
@@ -311,6 +312,16 @@ async function main(): Promise<void> {
     assert(dash.includes("Spend by day"), "dashboard missing spend-by-day");
     assert(dash.includes("last 14 days"), "dashboard should label the daily window");
     assert(dash.includes("function dayLinks"), "dashboard missing per-day receipt links");
+    assert(dash.includes("Spend by hour"), "dashboard missing spend-by-hour");
+    assert(dash.includes("last 24 hours"), "dashboard should label the hourly window");
+    assert(dash.includes('id="by-hour"'), "dashboard missing hourly mount");
+    assert(dash.includes("function hourLinks"), "dashboard missing per-hour receipt links");
+    assert(dash.includes("function lastHours"), "dashboard should fill the last 24 hours");
+    assert(dash.includes("s.hourly"), "dashboard should read summary.hourly");
+    assert(
+      dash.includes("encodeURIComponent(nextHourKey(hour, timeZone))"),
+      "dashboard hour links should set the next local hour",
+    );
     assert(dash.includes('href="/receipt.md?'), "dashboard day links should include the markdown receipt");
     assert(dash.includes('href="/api/export.csv?'), "dashboard day links should include csv");
     assert(dash.includes('href="/api/export.json?'), "dashboard day links should include json");
@@ -362,10 +373,11 @@ async function main(): Promise<void> {
     await testTimeScope(dir, mockUrl);
     await testJsonExport(dir, mockUrl);
     await testDailyDst(dir, mockUrl);
+    await testHourly(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, hourly breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2299,6 +2311,7 @@ const SUMMARY_FIELDS = [
   "byModel",
   "byProjectModel",
   "daily",
+  "hourly",
   "recent",
   "topRequests",
   "events",
@@ -2329,7 +2342,7 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
     const limit = budget[side] as Record<string, unknown>;
     assert(limit && "softUsd" in limit && "hardUsd" in limit, `${label} ${side} missing soft/hard`);
   }
-  for (const key of ["byProject", "byModel", "byProjectModel", "daily", "recent", "topRequests", "events"] as const) {
+  for (const key of ["byProject", "byModel", "byProjectModel", "daily", "hourly", "recent", "topRequests", "events"] as const) {
     assert(Array.isArray(summary[key]), `${label} ${key} is not an array`);
   }
   const projects = summary.byProject as Record<string, unknown>[];
@@ -2353,6 +2366,10 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
   const daily = summary.daily as Record<string, unknown>[];
   if (daily[0]) {
     for (const key of ["day", "spendUsd", "requests"]) assert(key in daily[0], `${label} daily missing ${key}`);
+  }
+  const hourly = summary.hourly as Record<string, unknown>[];
+  if (hourly[0]) {
+    for (const key of ["hour", "spendUsd", "requests"]) assert(key in hourly[0], `${label} hourly missing ${key}`);
   }
   const recent = summary.recent as Record<string, unknown>[];
   const requestKeys = [
@@ -2528,6 +2545,276 @@ async function testDailyDst(dir: string, mockUrl: string): Promise<void> {
     ], "fall-back midnight span");
     assert(Math.abs(fall.budget.globalSpend - 126) < 1e-6, "fall slice changed kill-switch spend");
   });
+}
+
+type HourlyRow = { hour: string; spendUsd: number; requests: number };
+
+type HourlySummary = {
+  generatedAt: string;
+  spendUsd: number;
+  requests: number;
+  scopeSince: string | null;
+  scopeUntil: string | null;
+  hourly: HourlyRow[];
+  budget: { globalSpend: number; timezone: string };
+};
+
+function assertHourly(hourly: HourlyRow[], expected: HourlyRow[], label: string): void {
+  assert(
+    hourly.length === expected.length,
+    `${label} hours [${hourly.map((h) => h.hour).join(",")}] expected [${expected.map((h) => h.hour).join(",")}]`,
+  );
+  for (let i = 0; i < expected.length; i++) {
+    const got = hourly[i];
+    const want = expected[i]!;
+    assert(got?.hour === want.hour, `${label} hour ${i} ${got?.hour} !== ${want.hour}`);
+    assert(Math.abs((got?.spendUsd ?? NaN) - want.spendUsd) < 1e-6, `${label} ${want.hour} spend ${got?.spendUsd}`);
+    assert(got?.requests === want.requests, `${label} ${want.hour} requests ${got?.requests}`);
+  }
+}
+
+function sumHourly(hourly: HourlyRow[]): number {
+  return hourly.reduce((sum, row) => sum + row.spendUsd, 0);
+}
+
+function dashboardHourFns(): {
+  nextHourKey: (hour: string, timeZone: string) => string;
+  lastHours: (summary: {
+    generatedAt: string;
+    budget?: { timezone?: string };
+    hourly?: HourlyRow[];
+  }) => { zone: string; endKey: string; rows: HourlyRow[] };
+} {
+  const html = dashboardHtml();
+  const start = html.indexOf("function zonedClock(");
+  const end = html.indexOf("function lastFortnight(");
+  assert(start > 0 && end > start, "dashboard hour helpers missing");
+  const loaded = new Function(`${html.slice(start, end)}\nreturn { nextHourKey, lastHours };`) as () => {
+    nextHourKey: (hour: string, timeZone: string) => string;
+    lastHours: (summary: {
+      generatedAt: string;
+      budget?: { timezone?: string };
+      hourly?: HourlyRow[];
+    }) => { zone: string; endKey: string; rows: HourlyRow[] };
+  };
+  return loaded();
+}
+
+async function testHourly(dir: string, mockUrl: string): Promise<void> {
+  const ui = dashboardHourFns();
+  assert(ui.nextHourKey("2026-10-03T23:00:00", "UTC") === "2026-10-04T00:00:00", "utc hour should roll to the next day");
+  assert(
+    ui.nextHourKey("2026-10-03T12:00:00", "UTC") === nextCalendarHourKey("UTC", "2026-10-03T12:00:00"),
+    "dashboard next hour drifted from the summary",
+  );
+  assert(
+    ui.nextHourKey("2026-03-08T01:00:00", "America/New_York") === "2026-03-08T03:00:00",
+    "dashboard should skip the spring-forward gap",
+  );
+  assert(
+    nextCalendarHourKey("America/New_York", "2026-03-08T01:00:00") === "2026-03-08T03:00:00",
+    "spring-forward next hour",
+  );
+  assert(
+    ui.nextHourKey("2026-11-01T01:00:00", "America/New_York") === "2026-11-01T02:00:00",
+    "dashboard fall-back link should cover both 1am occurrences",
+  );
+  assert(
+    nextCalendarHourKey("America/New_York", "2026-11-01T01:00:00") === "2026-11-01T02:00:00",
+    "fall-back next hour",
+  );
+
+  const utcWindow = ui.lastHours({
+    generatedAt: "2026-10-03T15:30:00.000Z",
+    budget: { timezone: "UTC" },
+    hourly: [
+      { hour: "2026-10-03T14:00:00", spendUsd: 4, requests: 1 },
+      { hour: "2026-10-03T15:00:00", spendUsd: 8, requests: 1 },
+    ],
+  });
+  assert(utcWindow.rows.length === 24, `utc dashboard hours ${utcWindow.rows.length}`);
+  assert(utcWindow.endKey === "2026-10-03T15:00:00", utcWindow.endKey);
+  assert(utcWindow.rows[0]?.hour === "2026-10-02T16:00:00", utcWindow.rows[0]?.hour ?? "missing first hour");
+  assert(utcWindow.rows.at(-1)?.hour === "2026-10-03T15:00:00" && utcWindow.rows.at(-1)?.spendUsd === 8, "current hour spend");
+  assert(utcWindow.rows.at(-2)?.hour === "2026-10-03T14:00:00" && utcWindow.rows.at(-2)?.spendUsd === 4, "previous hour spend");
+  assert(utcWindow.rows.at(-3)?.hour === "2026-10-03T13:00:00" && utcWindow.rows.at(-3)?.spendUsd === 0, "quiet hour was dropped");
+
+  const springWindow = ui.lastHours({
+    generatedAt: "2026-03-08T07:30:00.000Z",
+    budget: { timezone: "America/New_York" },
+    hourly: [
+      { hour: "2026-03-08T01:00:00", spendUsd: 1, requests: 1 },
+      { hour: "2026-03-08T03:00:00", spendUsd: 2, requests: 1 },
+    ],
+  });
+  assert(springWindow.rows.length === 24, `spring dashboard hours ${springWindow.rows.length}`);
+  assert(springWindow.endKey === "2026-03-08T03:00:00", springWindow.endKey);
+  assert(springWindow.rows.at(-2)?.hour === "2026-03-08T01:00:00", springWindow.rows.at(-2)?.hour ?? "missing spring previous hour");
+  assert(!springWindow.rows.some((row) => row.hour.endsWith("T02:00:00") && row.hour.startsWith("2026-03-08")), "spring dashboard listed the skipped hour");
+
+  const fallWindow = ui.lastHours({
+    generatedAt: "2026-11-01T07:30:00.000Z",
+    budget: { timezone: "America/New_York" },
+    hourly: [
+      { hour: "2026-11-01T01:00:00", spendUsd: 3, requests: 2 },
+      { hour: "2026-11-01T02:00:00", spendUsd: 4, requests: 1 },
+    ],
+  });
+  assert(fallWindow.rows.length === 24, `fall dashboard hours ${fallWindow.rows.length}`);
+  assert(fallWindow.rows.at(-1)?.hour === "2026-11-01T02:00:00" && fallWindow.rows.at(-1)?.spendUsd === 4, "fall current hour");
+  assert(fallWindow.rows.at(-2)?.hour === "2026-11-01T01:00:00" && fallWindow.rows.at(-2)?.spendUsd === 3, "fall repeated hour");
+  assert(fallWindow.rows.filter((row) => row.hour === "2026-11-01T01:00:00").length === 1, "fall dashboard duplicated 1am");
+
+  await withApp(dir, "hourly-empty", mockUrl, { softUsd: null, hardUsd: 100 }, async (base) => {
+    const empty = (await fetch(`${base}/api/summary`).then((r) => r.json())) as HourlySummary;
+    assertSummaryFields(empty as unknown as Record<string, unknown>, "hourly empty");
+    assert(empty.hourly.length === 0, "empty ledger should have no hours");
+  });
+
+  await withApp(dir, "hourly-utc", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
+    seedSpend(app.db, "2026-10-03T12:00:00.000Z", 1, "demo", "gpt-4o-mini");
+    seedSpend(app.db, "2026-10-03T12:30:00.000Z", 2, "demo", "gpt-4o");
+    seedSpend(app.db, "2026-10-03T14:00:00.000Z", 4, "other", "gpt-4o-mini");
+    seedSpend(app.db, "2026-10-03T15:00:00.000Z", 8, "demo", "gpt-4o-mini");
+
+    const all = (await fetch(`${base}/api/summary`).then((r) => r.json())) as HourlySummary;
+    assertSummaryFields(all as unknown as Record<string, unknown>, "hourly unscoped");
+    assert(all.hourly[0]?.hour === "2026-10-03T12:00:00", `unscoped hourly start ${all.hourly[0]?.hour}`);
+    assert(
+      all.hourly.at(-1)?.hour === calendarHourKey("UTC", new Date(all.generatedAt)),
+      `unscoped hourly end ${all.hourly.at(-1)?.hour}`,
+    );
+    assert(Math.abs(sumHourly(all.hourly) - all.spendUsd) < 1e-6, "unscoped hourly spend drifted from the ledger");
+    assertHourly(
+      all.hourly.filter((row) => row.hour >= "2026-10-03T12:00:00" && row.hour < "2026-10-03T16:00:00"),
+      [
+        { hour: "2026-10-03T12:00:00", spendUsd: 3, requests: 2 },
+        { hour: "2026-10-03T13:00:00", spendUsd: 0, requests: 0 },
+        { hour: "2026-10-03T14:00:00", spendUsd: 4, requests: 1 },
+        { hour: "2026-10-03T15:00:00", spendUsd: 8, requests: 1 },
+      ],
+      "utc unscoped slice",
+    );
+
+    const ranged = (await fetch(`${base}/api/summary?since=2026-10-03T12:00:00Z&until=2026-10-03T16:00:00Z`).then((r) => r.json())) as HourlySummary;
+    assertHourly(ranged.hourly, [
+      { hour: "2026-10-03T12:00:00", spendUsd: 3, requests: 2 },
+      { hour: "2026-10-03T13:00:00", spendUsd: 0, requests: 0 },
+      { hour: "2026-10-03T14:00:00", spendUsd: 4, requests: 1 },
+      { hour: "2026-10-03T15:00:00", spendUsd: 8, requests: 1 },
+    ], "utc ranged");
+    assert(Math.abs(sumHourly(ranged.hourly) - ranged.spendUsd) < 1e-6, "ranged hourly spend drifted");
+    assert(Math.abs(ranged.budget.globalSpend - 15) < 1e-6, "hourly range changed kill-switch spend");
+
+    const partial = (await fetch(`${base}/api/summary?since=2026-10-03T12:15:00Z&until=2026-10-03T14:00:00Z`).then((r) => r.json())) as HourlySummary;
+    assertHourly(partial.hourly, [
+      { hour: "2026-10-03T12:00:00", spendUsd: 2, requests: 1 },
+      { hour: "2026-10-03T13:00:00", spendUsd: 0, requests: 0 },
+    ], "utc partial hour");
+    assert(Math.abs(partial.spendUsd - 2) < 1e-6, `partial hour spend ${partial.spendUsd}`);
+
+    const filtered = (await fetch(`${base}/api/summary?project=demo&model=gpt-4o-mini&since=2026-10-03T12:00:00Z&until=2026-10-03T16:00:00Z`).then((r) => r.json())) as HourlySummary;
+    assertHourly(filtered.hourly, [
+      { hour: "2026-10-03T12:00:00", spendUsd: 1, requests: 1 },
+      { hour: "2026-10-03T13:00:00", spendUsd: 0, requests: 0 },
+      { hour: "2026-10-03T14:00:00", spendUsd: 0, requests: 0 },
+      { hour: "2026-10-03T15:00:00", spendUsd: 8, requests: 1 },
+    ], "utc project+model");
+    assert(Math.abs(filtered.spendUsd - 9) < 1e-6, `filtered hourly spend ${filtered.spendUsd}`);
+    assert(Math.abs(filtered.budget.globalSpend - 15) < 1e-6, "hourly project filter changed kill-switch spend");
+
+    const hourUntil = nextCalendarHourKey("UTC", "2026-10-03T12:00:00");
+    const md = await fetch(`${base}/receipt.md?since=2026-10-03T12:00:00&until=${hourUntil}`).then((r) => r.text());
+    assert(md.includes("| Total spend | $3.00 |"), md);
+    assert(!md.includes("2026-10-03T14:00:00.000Z"), "hour receipt included the next hour");
+    const csv = csvLines(await fetch(`${base}/api/export.csv?since=2026-10-03T12:00:00&until=${hourUntil}`).then((r) => r.text()));
+    assert(csv.length === 3, `hour csv rows ${csv.length}`);
+    const json = await fetchLedgerJson(`${base}/api/export.json?since=2026-10-03T12:00:00&until=${hourUntil}`);
+    assert(json.rows.length === 2 && json.rows.every((row) => row.timestamp.startsWith("2026-10-03T12:")), "hour json slice");
+    const quiet = csvLines(await fetch(`${base}/api/export.csv?since=2026-10-03T13:00:00&until=2026-10-03T14:00:00`).then((r) => r.text()));
+    assert(quiet.length === 1, "quiet hour csv should stay header-only");
+  });
+
+  await withApp(dir, "hourly-ny", mockUrl, { softUsd: null, hardUsd: 100, timezone: "America/New_York" }, async (base, app) => {
+    seedSpend(app.db, "2026-10-04T03:30:00.000Z", 1, "demo");
+    seedSpend(app.db, "2026-10-04T04:15:00.000Z", 2, "demo");
+    const span = (await fetch(`${base}/api/summary?since=2026-10-03T23:00:00&until=2026-10-04T02:00:00`).then((r) => r.json())) as HourlySummary;
+    assert(span.scopeSince === "2026-10-04T03:00:00.000Z", span.scopeSince ?? "missing ny hour since");
+    assert(span.scopeUntil === "2026-10-04T06:00:00.000Z", span.scopeUntil ?? "missing ny hour until");
+    assert(span.budget.timezone === "America/New_York", span.budget.timezone);
+    assertHourly(span.hourly, [
+      { hour: "2026-10-03T23:00:00", spendUsd: 1, requests: 1 },
+      { hour: "2026-10-04T00:00:00", spendUsd: 2, requests: 1 },
+      { hour: "2026-10-04T01:00:00", spendUsd: 0, requests: 0 },
+    ], "ny local hours");
+    assert(Math.abs(sumHourly(span.hourly) - span.spendUsd) < 1e-6, "ny hourly spend drifted");
+    assert(Math.abs(span.budget.globalSpend - 3) < 1e-6, "ny hourly slice changed kill-switch spend");
+  });
+
+  await withApp(dir, "hourly-dst", mockUrl, { softUsd: null, hardUsd: 100, timezone: "America/New_York" }, async (base, app) => {
+    seedSpend(app.db, "2026-03-08T06:30:00.000Z", 1, "demo");
+    seedSpend(app.db, "2026-03-08T07:30:00.000Z", 2, "demo");
+    seedSpend(app.db, "2026-11-01T05:30:00.000Z", 1, "demo");
+    seedSpend(app.db, "2026-11-01T06:30:00.000Z", 2, "demo");
+    seedSpend(app.db, "2026-11-01T07:30:00.000Z", 4, "demo");
+
+    const spring = (await fetch(`${base}/api/summary?since=2026-03-08T00:00:00&until=2026-03-08T04:00:00`).then((r) => r.json())) as HourlySummary;
+    assertHourly(spring.hourly, [
+      { hour: "2026-03-08T00:00:00", spendUsd: 0, requests: 0 },
+      { hour: "2026-03-08T01:00:00", spendUsd: 1, requests: 1 },
+      { hour: "2026-03-08T03:00:00", spendUsd: 2, requests: 1 },
+    ], "spring-forward hours");
+    assert(!spring.hourly.some((row) => row.hour === "2026-03-08T02:00:00"), "spring-forward listed the skipped hour");
+    assert(Math.abs(sumHourly(spring.hourly) - spring.spendUsd) < 1e-6, "spring hourly spend drifted");
+    const springMd = await fetch(`${base}/receipt.md?since=2026-03-08T01:00:00&until=2026-03-08T03:00:00`).then((r) => r.text());
+    assert(springMd.includes("| Total spend | $1.00 |"), springMd);
+    assert(!springMd.includes("2026-03-08T07:30:00.000Z"), "spring hour link included 3am");
+
+    const fall = (await fetch(`${base}/api/summary?since=2026-11-01T00:00:00&until=2026-11-01T03:00:00`).then((r) => r.json())) as HourlySummary;
+    assertHourly(fall.hourly, [
+      { hour: "2026-11-01T00:00:00", spendUsd: 0, requests: 0 },
+      { hour: "2026-11-01T01:00:00", spendUsd: 3, requests: 2 },
+      { hour: "2026-11-01T02:00:00", spendUsd: 4, requests: 1 },
+    ], "fall-back hours");
+    assert(fall.hourly.filter((row) => row.hour === "2026-11-01T01:00:00").length === 1, "fall-back duplicated 1am");
+    assert(Math.abs(sumHourly(fall.hourly) - fall.spendUsd) < 1e-6, "fall hourly spend drifted");
+    const fallMd = await fetch(`${base}/receipt.md?since=2026-11-01T01:00:00&until=2026-11-01T02:00:00`).then((r) => r.text());
+    assert(fallMd.includes("| Total spend | $3.00 |"), fallMd);
+    const fallJson = await fetchLedgerJson(`${base}/api/export.json?since=2026-11-01T01:00:00&until=2026-11-01T02:00:00`);
+    assert(fallJson.rows.length === 2, `fall hour json rows ${fallJson.rows.length}`);
+    assert(Math.abs(fall.budget.globalSpend - 10) < 1e-6, "dst hourly slice changed kill-switch spend");
+  });
+
+  await withApp(
+    dir,
+    "hourly-window",
+    mockUrl,
+    { softUsd: null, hardUsd: 50, period: "day", timezone: "America/New_York" },
+    async (base, app) => {
+      const window = spendWindow(app.config);
+      assert(window, "hourly day window");
+      const yesterday = new Date(Date.parse(window.startIso) - 1000).toISOString();
+      seedSpend(app.db, yesterday, 9, "demo");
+      seedSpend(app.db, window.startIso, 1, "demo");
+      const current = (await fetch(`${base}/api/summary?window=current`).then((r) => r.json())) as HourlySummary;
+      const startHour = calendarHourKey("America/New_York", new Date(window.startIso));
+      const endHour = calendarHourKey("America/New_York", new Date(Date.parse(window.endIso) - 1));
+      assert(current.hourly[0]?.hour === startHour, `window hourly start ${current.hourly[0]?.hour} !== ${startHour}`);
+      assert(current.hourly.at(-1)?.hour === endHour, `window hourly end ${current.hourly.at(-1)?.hour} !== ${endHour}`);
+      assert(!current.hourly.some((row) => row.hour === calendarHourKey("America/New_York", new Date(yesterday))), "window hourly included yesterday");
+      const open = current.hourly.find((row) => row.hour === startHour);
+      assert(open?.spendUsd === 1 && open.requests === 1, `window first hour ${open?.spendUsd}`);
+      assert(Math.abs(sumHourly(current.hourly) - current.spendUsd) < 1e-6, "window hourly spend drifted");
+      assert(Math.abs(current.budget.globalSpend - 1) < 1e-6, "window hourly filter changed the day budget");
+      if (current.hourly.length > 1) {
+        assert(current.hourly.some((row) => row.requests === 0), "window hourly dropped a quiet hour");
+      }
+      const miss = (await fetch(`${base}/api/summary?model=gpt-4o&window=current`).then((r) => r.json())) as HourlySummary;
+      assert(miss.requests === 0, `window model miss requests ${miss.requests}`);
+      assert(miss.hourly.length === current.hourly.length, "window model miss changed the hour span");
+      assert(miss.hourly.every((row) => row.spendUsd === 0 && row.requests === 0), "window model miss kept spend");
+    },
+  );
 }
 
 async function testTopRequests(dir: string, mockUrl: string): Promise<void> {

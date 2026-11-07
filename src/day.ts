@@ -65,6 +65,57 @@ export function calendarDayKey(timeZone: string, date: Date): string {
   return formatYmd(zonedParts(timeZone, date));
 }
 
+const HOUR_KEY = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):00:00$/;
+
+/**
+ * `YYYY-MM-DDTHH:00:00` civil hour of `date` in `timeZone`.
+ * A repeated DST hour shares one key. A skipped spring-forward hour is never produced,
+ * because no instant has that local label.
+ */
+export function calendarHourKey(timeZone: string, date: Date): string {
+  const parts = zonedParts(timeZone, date);
+  return `${formatYmd(parts)}T${pad2(parts.hour)}:00:00`;
+}
+
+/**
+ * The following distinct civil hour in `timeZone`.
+ * A spring-forward gap is skipped. A repeated fall-back hour is one key, so the
+ * next key is the hour after both occurrences.
+ */
+export function nextCalendarHourKey(timeZone: string, hour: string): string {
+  const civil = parseHourKey(hour);
+  const origin = utcFromCivilTime(timeZone, { ...civil, minute: 0, second: 0 }).getTime();
+  let cursor = civil;
+  for (let i = 0; i < 48; i++) {
+    cursor = addCivilHour(cursor);
+    try {
+      const resolved = utcFromCivilTime(timeZone, { ...cursor, minute: 0, second: 0 });
+      if (resolved.getTime() > origin) return calendarHourKey(timeZone, resolved);
+    } catch (err) {
+      if (!(err instanceof SkippedLocalTimeError)) throw err;
+    }
+  }
+  throw new Error(`Could not find the next local hour after ${hour} in ${timeZone}.`);
+}
+
+function parseHourKey(hour: string): Ymd & { hour: number } {
+  const match = HOUR_KEY.exec(hour);
+  if (!match) throw new Error(`Invalid calendar hour "${hour}".`);
+  const parsed = {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3]),
+    hour: Number(match[4]),
+  };
+  if (parsed.hour > 23) throw new Error(`Invalid calendar hour "${hour}".`);
+  return parsed;
+}
+
+function addCivilHour(civil: Ymd & { hour: number }): Ymd & { hour: number } {
+  if (civil.hour < 23) return { ...civil, hour: civil.hour + 1 };
+  return { ...addCalendarDays(civil, 1), hour: 0 };
+}
+
 /** Shift a `YYYY-MM-DD` key by whole calendar days. The step does not depend on DST length. */
 export function shiftCalendarDay(day: string, delta: number): string {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
