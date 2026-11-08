@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
 import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
-import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
+import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, calendarWeekKey, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
@@ -311,6 +311,15 @@ async function main(): Promise<void> {
     assert(dash.includes("Spend by day"), "dashboard missing spend-by-day");
     assert(dash.includes("last 14 days"), "dashboard should label the daily window");
     assert(dash.includes("function dayLinks"), "dashboard missing per-day receipt links");
+    assert(dash.includes("Spend by week"), "dashboard missing spend-by-week");
+    assert(dash.includes("last 8 weeks"), "dashboard should label the weekly window");
+    assert(dash.includes('id="by-week"'), "dashboard missing spend-by-week mount");
+    assert(dash.includes("s.weekly"), "dashboard should render weekly");
+    assert(dash.includes("function weekLinks"), "dashboard missing per-week receipt links");
+    assert(
+      dash.includes('"since=" + encodeURIComponent(week) + "&until=" + encodeURIComponent(addYmd(week, 7))'),
+      "dashboard week links should run from local Monday through the next Monday",
+    );
     assert(dash.includes('href="/receipt.md?'), "dashboard day links should include the markdown receipt");
     assert(dash.includes('href="/api/export.csv?'), "dashboard day links should include csv");
     assert(dash.includes('href="/api/export.json?'), "dashboard day links should include json");
@@ -362,10 +371,11 @@ async function main(): Promise<void> {
     await testTimeScope(dir, mockUrl);
     await testJsonExport(dir, mockUrl);
     await testDailyDst(dir, mockUrl);
+    await testWeeklySeries(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, weekly breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -617,6 +627,26 @@ function testCalendarWeekBounds(): void {
   const utc = calendarWeekBounds("UTC", new Date("2026-09-30T15:00:00.000Z"));
   assert(utc.start.toISOString() === "2026-09-28T00:00:00.000Z", `utc week start ${utc.start.toISOString()}`);
   assert(utc.end.toISOString() === "2026-10-05T00:00:00.000Z", `utc week end ${utc.end.toISOString()}`);
+
+  assert(calendarWeekKey("UTC", new Date("2026-10-03T12:00:00.000Z")) === "2026-09-28", "utc saturday week");
+  assert(calendarWeekKey("UTC", new Date("2026-10-05T00:00:00.000Z")) === "2026-10-05", "utc monday week");
+  assert(calendarWeekKey("UTC", new Date("2026-01-01T00:00:00.000Z")) === "2025-12-29", "utc year-boundary week");
+  assert(
+    calendarWeekKey("America/New_York", new Date("2026-10-05T03:59:59.000Z")) === "2026-09-28",
+    "ny sunday night stays on the previous week",
+  );
+  assert(
+    calendarWeekKey("America/New_York", new Date("2026-10-05T04:00:00.000Z")) === "2026-10-05",
+    "ny monday midnight starts the new week",
+  );
+  assert(
+    calendarWeekKey("America/New_York", new Date("2026-11-02T04:30:00.000Z")) === "2026-10-26",
+    "ny fall-back sunday stays on the previous week",
+  );
+  assert(
+    calendarWeekKey("America/New_York", new Date("2026-11-02T05:00:00.000Z")) === "2026-11-02",
+    "ny monday after fall-back starts the new week",
+  );
 }
 
 function testCalendarMonthBounds(): void {
@@ -2257,6 +2287,8 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
 
 type DailyRow = { day: string; spendUsd: number; requests: number };
 
+type WeeklyRow = { week: string; spendUsd: number; requests: number };
+
 type PairRow = { project: string; model: string; spendUsd: number; requests: number; tokens: number };
 
 type TopRow = {
@@ -2277,7 +2309,10 @@ type DailySummary = {
   requests: number;
   scopeProject: string | null;
   scopeModel: string | null;
+  scopeSince: string | null;
+  scopeUntil: string | null;
   daily: DailyRow[];
+  weekly: WeeklyRow[];
   byProject: { project: string }[];
   byModel: { model: string }[];
   byProjectModel: PairRow[];
@@ -2299,6 +2334,7 @@ const SUMMARY_FIELDS = [
   "byModel",
   "byProjectModel",
   "daily",
+  "weekly",
   "recent",
   "topRequests",
   "events",
@@ -2329,7 +2365,7 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
     const limit = budget[side] as Record<string, unknown>;
     assert(limit && "softUsd" in limit && "hardUsd" in limit, `${label} ${side} missing soft/hard`);
   }
-  for (const key of ["byProject", "byModel", "byProjectModel", "daily", "recent", "topRequests", "events"] as const) {
+  for (const key of ["byProject", "byModel", "byProjectModel", "daily", "weekly", "recent", "topRequests", "events"] as const) {
     assert(Array.isArray(summary[key]), `${label} ${key} is not an array`);
   }
   const projects = summary.byProject as Record<string, unknown>[];
@@ -2353,6 +2389,10 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
   const daily = summary.daily as Record<string, unknown>[];
   if (daily[0]) {
     for (const key of ["day", "spendUsd", "requests"]) assert(key in daily[0], `${label} daily missing ${key}`);
+  }
+  const weekly = summary.weekly as Record<string, unknown>[];
+  if (weekly[0]) {
+    for (const key of ["week", "spendUsd", "requests"]) assert(key in weekly[0], `${label} weekly missing ${key}`);
   }
   const recent = summary.recent as Record<string, unknown>[];
   const requestKeys = [
@@ -2409,6 +2449,31 @@ function sumDaily(daily: DailyRow[]): number {
   return daily.reduce((sum, row) => sum + row.spendUsd, 0);
 }
 
+function assertWeekly(weekly: WeeklyRow[], expected: WeeklyRow[], label: string): void {
+  assert(
+    weekly.length === expected.length,
+    `${label} weeks [${weekly.map((w) => w.week).join(",")}] expected [${expected.map((w) => w.week).join(",")}]`,
+  );
+  for (let i = 0; i < expected.length; i++) {
+    const got = weekly[i];
+    const want = expected[i]!;
+    assert(got?.week === want.week, `${label} week ${i} ${got?.week} !== ${want.week}`);
+    assert(Math.abs((got?.spendUsd ?? NaN) - want.spendUsd) < 1e-6, `${label} ${want.week} spend ${got?.spendUsd}`);
+    assert(got?.requests === want.requests, `${label} ${want.week} requests ${got?.requests}`);
+  }
+}
+
+function assertContiguousWeeks(weekly: WeeklyRow[], label: string): void {
+  for (let i = 1; i < weekly.length; i++) {
+    const prev = weekly[i - 1]!.week;
+    assert(weekly[i]!.week === shiftCalendarDay(prev, 7), `${label} gap after ${prev} (${weekly[i]!.week})`);
+  }
+}
+
+function sumWeekly(weekly: WeeklyRow[]): number {
+  return weekly.reduce((sum, row) => sum + row.spendUsd, 0);
+}
+
 function assertPairs(pairs: PairRow[], expected: PairRow[], label: string): void {
   assert(
     pairs.length === expected.length,
@@ -2440,6 +2505,187 @@ function assertTop(rows: TopRow[], expected: { id: string; costUsd: number }[], 
     assert(got?.id === want.id, `${label} #${i} ${got?.id} !== ${want.id}`);
     assert(Math.abs((got?.costUsd ?? NaN) - want.costUsd) < 1e-6, `${label} ${want.id} cost ${got?.costUsd}`);
   }
+}
+
+async function testWeeklySeries(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "weekly-empty", mockUrl, { softUsd: null, hardUsd: 100 }, async (base) => {
+    const empty = (await fetch(`${base}/api/summary`).then((r) => r.json())) as DailySummary;
+    assertSummaryFields(empty, "empty weekly");
+    assert(empty.requests === 0, "empty ledger should have no requests");
+    assert(empty.weekly.length === 0, `empty ledger weekly should be empty, got ${empty.weekly.length}`);
+    assert(empty.daily.length === 0, "empty weekly test disturbed daily");
+
+    const quiet = (await fetch(`${base}/api/summary?since=2026-10-01&until=2026-10-20`).then((r) => r.json())) as DailySummary;
+    assertWeekly(quiet.weekly, [
+      { week: "2026-09-28", spendUsd: 0, requests: 0 },
+      { week: "2026-10-05", spendUsd: 0, requests: 0 },
+      { week: "2026-10-12", spendUsd: 0, requests: 0 },
+      { week: "2026-10-19", spendUsd: 0, requests: 0 },
+    ], "empty ledger spanned weeks");
+    assert(quiet.requests === 0 && Math.abs(quiet.spendUsd) < 1e-6, "quiet weekly span invented spend");
+    assert(Math.abs(quiet.budget.globalSpend) < 1e-6, "quiet weekly span changed the kill-switch");
+  });
+
+  await withApp(dir, "weekly", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
+    seedSpend(app.db, "2026-09-20T12:00:00.000Z", 1, "demo", "gpt-4o-mini");
+    seedSpend(app.db, "2026-10-03T12:00:00.000Z", 2, "demo", "gpt-4o-mini");
+    seedSpend(app.db, "2026-10-04T12:00:00.000Z", 8, "other", "gpt-4o");
+    seedSpend(app.db, "2026-10-20T12:00:00.000Z", 4, "demo", "gpt-4o");
+
+    const all = (await fetch(`${base}/api/summary`).then((r) => r.json())) as DailySummary;
+    assertSummaryFields(all, "weekly");
+    assert(all.weekly[0]?.week === "2026-09-14", `unscoped weekly should start at the first spend week, got ${all.weekly[0]?.week}`);
+    const current = calendarWeekKey("UTC", new Date(all.generatedAt));
+    const end = current > "2026-10-19" ? current : "2026-10-19";
+    assert(all.weekly.at(-1)?.week === end, `unscoped weekly end ${all.weekly.at(-1)?.week} !== ${end}`);
+    assertContiguousWeeks(all.weekly, "unscoped utc");
+    const byWeek = new Map(all.weekly.map((row) => [row.week, row]));
+    assert(byWeek.get("2026-09-14")?.spendUsd === 1 && byWeek.get("2026-09-14")?.requests === 1, "sep 20 request missed its week");
+    assert(byWeek.get("2026-09-21")?.spendUsd === 0 && byWeek.get("2026-09-21")?.requests === 0, "gap week was not zero-filled");
+    assert(byWeek.get("2026-09-28")?.spendUsd === 10 && byWeek.get("2026-09-28")?.requests === 2, "oct 3 and oct 4 should share a week");
+    assert(byWeek.get("2026-10-05")?.requests === 0, "week after the saturday spend should be quiet");
+    assert(byWeek.get("2026-10-19")?.spendUsd === 4 && byWeek.get("2026-10-19")?.requests === 1, "oct 20 request missed its week");
+    assert(Math.abs(sumWeekly(all.weekly) - all.spendUsd) < 1e-6, "unscoped weekly spend drifted from the ledger");
+    assert(Math.abs(all.spendUsd - 15) < 1e-6, `unscoped weekly total ${all.spendUsd}`);
+
+    const ranged = (await fetch(`${base}/api/summary?since=2026-09-21&until=2026-10-26`).then((r) => r.json())) as DailySummary;
+    assertWeekly(ranged.weekly, [
+      { week: "2026-09-21", spendUsd: 0, requests: 0 },
+      { week: "2026-09-28", spendUsd: 10, requests: 2 },
+      { week: "2026-10-05", spendUsd: 0, requests: 0 },
+      { week: "2026-10-12", spendUsd: 0, requests: 0 },
+      { week: "2026-10-19", spendUsd: 4, requests: 1 },
+    ], "utc ranged");
+    assert(Math.abs(sumWeekly(ranged.weekly) - ranged.spendUsd) < 1e-6, "ranged weekly spend drifted");
+    assert(Math.abs(ranged.budget.globalSpend - 15) < 1e-6, "weekly range changed kill-switch spend");
+    assert(ranged.weekly.at(-1)?.week === "2026-10-19", "until on a Monday should not include that new week");
+
+    const project = (await fetch(`${base}/api/summary?project=demo&since=2026-09-21&until=2026-10-26`).then((r) => r.json())) as DailySummary;
+    assert(project.scopeProject === "demo", "weekly project filter dropped the scope");
+    assertWeekly(project.weekly, [
+      { week: "2026-09-21", spendUsd: 0, requests: 0 },
+      { week: "2026-09-28", spendUsd: 2, requests: 1 },
+      { week: "2026-10-05", spendUsd: 0, requests: 0 },
+      { week: "2026-10-12", spendUsd: 0, requests: 0 },
+      { week: "2026-10-19", spendUsd: 4, requests: 1 },
+    ], "project filter");
+    assert(project.byProject.length === 1 && project.byProject[0]?.project === "demo", "weekly project filter leaked projects");
+
+    const model = (await fetch(`${base}/api/summary?model=gpt-4o&since=2026-09-21&until=2026-10-26`).then((r) => r.json())) as DailySummary;
+    assert(model.scopeModel === "gpt-4o", "weekly model filter dropped the scope");
+    assertWeekly(model.weekly, [
+      { week: "2026-09-21", spendUsd: 0, requests: 0 },
+      { week: "2026-09-28", spendUsd: 8, requests: 1 },
+      { week: "2026-10-05", spendUsd: 0, requests: 0 },
+      { week: "2026-10-12", spendUsd: 0, requests: 0 },
+      { week: "2026-10-19", spendUsd: 4, requests: 1 },
+    ], "model filter");
+    assert(model.byModel.length === 1 && model.byModel[0]?.model === "gpt-4o", "weekly model filter leaked models");
+
+    const both = (await fetch(`${base}/api/summary?project=demo&model=gpt-4o-mini&since=2026-09-21&until=2026-10-26`).then((r) => r.json())) as DailySummary;
+    assertWeekly(both.weekly, [
+      { week: "2026-09-21", spendUsd: 0, requests: 0 },
+      { week: "2026-09-28", spendUsd: 2, requests: 1 },
+      { week: "2026-10-05", spendUsd: 0, requests: 0 },
+      { week: "2026-10-12", spendUsd: 0, requests: 0 },
+      { week: "2026-10-19", spendUsd: 0, requests: 0 },
+    ], "project+model");
+    assert(Math.abs(both.spendUsd - 2) < 1e-6, `combined weekly total ${both.spendUsd}`);
+    assert(Math.abs(both.budget.globalSpend - 15) < 1e-6, "combined weekly filters changed kill-switch spend");
+
+    const miss = (await fetch(`${base}/api/summary?model=missing&since=2026-09-21&until=2026-10-26`).then((r) => r.json())) as DailySummary;
+    assert(miss.requests === 0, "unknown model should match nothing");
+    assertWeekly(miss.weekly, [
+      { week: "2026-09-21", spendUsd: 0, requests: 0 },
+      { week: "2026-09-28", spendUsd: 0, requests: 0 },
+      { week: "2026-10-05", spendUsd: 0, requests: 0 },
+      { week: "2026-10-12", spendUsd: 0, requests: 0 },
+      { week: "2026-10-19", spendUsd: 0, requests: 0 },
+    ], "model miss still fills the span");
+
+    const partial = (await fetch(`${base}/api/summary?since=2026-10-04&until=2026-10-05`).then((r) => r.json())) as DailySummary;
+    assertWeekly(partial.weekly, [{ week: "2026-09-28", spendUsd: 8, requests: 1 }], "partial week");
+    assert(Math.abs(partial.spendUsd - 8) < 1e-6, `partial week spend ${partial.spendUsd}`);
+
+    const week = "2026-09-28";
+    const next = shiftCalendarDay(week, 7);
+    const dash = await fetch(`${base}/`).then((r) => r.text());
+    assert(dash.includes("function weekLinks"), "weekly dashboard missing week links");
+    assert(
+      dash.includes('"since=" + encodeURIComponent(week) + "&until=" + encodeURIComponent(addYmd(week, 7))'),
+      "week links should scope since to the Monday and until to the next Monday",
+    );
+    const csvRes = await fetch(`${base}/api/export.csv?since=${week}&until=${next}`);
+    assert(csvRes.status === 200, `week csv ${csvRes.status}`);
+    assert(
+      (csvRes.headers.get("content-disposition") ?? "").includes(`spendlight-${week}_${next}.csv`),
+      csvRes.headers.get("content-disposition") ?? "week csv filename",
+    );
+    const csv = csvLines(await csvRes.text());
+    assert(csv.length === 3, `week csv rows ${csv.length}`);
+    assert(csv.some((line) => line.startsWith("2026-10-03T12:00:00.000Z,demo,gpt-4o-mini,")), "week csv dropped the saturday row");
+    assert(csv.some((line) => line.startsWith("2026-10-04T12:00:00.000Z,other,gpt-4o,")), "week csv dropped the sunday row");
+    assert(!csv.some((line) => line.startsWith("2026-09-20T")), "week csv included the previous week");
+    assert(!csv.some((line) => line.startsWith("2026-10-20T")), "week csv included the next week");
+    const json = await fetchLedgerJson(`${base}/api/export.json?since=${week}&until=${next}`);
+    assert(json.rows.length === 2, `week json rows ${json.rows.length}`);
+    const jsonSpend = json.rows.reduce((sum, row) => sum + row.costUsd, 0);
+    assert(Math.abs(jsonSpend - 10) < 1e-6, `week json spend ${jsonSpend}`);
+    const md = await fetch(`${base}/receipt.md?since=${week}&until=${next}`).then((r) => r.text());
+    assert(md.includes(`Covered **${week} inclusive to ${next} exclusive (UTC)**`), md);
+    assert(md.includes("| Total spend | $10.00 |"), md);
+    assert(!md.includes("2026-09-20T12:00:00.000Z"), "week receipt listed the previous week");
+    assert(!md.includes("2026-10-20T12:00:00.000Z"), "week receipt listed the next week");
+  });
+
+  await withApp(
+    dir,
+    "weekly-ny",
+    mockUrl,
+    { softUsd: null, hardUsd: 100, timezone: "America/New_York" },
+    async (base, app) => {
+      seedSpend(app.db, "2026-10-05T03:59:59.000Z", 1, "demo", "gpt-4o-mini");
+      seedSpend(app.db, "2026-10-05T04:00:00.000Z", 2, "demo", "gpt-4o");
+      seedSpend(app.db, "2026-11-02T04:30:00.000Z", 4, "other", "gpt-4o-mini");
+      seedSpend(app.db, "2026-11-02T05:00:00.000Z", 8, "demo", "gpt-4o");
+
+      const span = (await fetch(`${base}/api/summary?since=2026-09-28&until=2026-11-09`).then((r) => r.json())) as DailySummary;
+      assertWeekly(span.weekly, [
+        { week: "2026-09-28", spendUsd: 1, requests: 1 },
+        { week: "2026-10-05", spendUsd: 2, requests: 1 },
+        { week: "2026-10-12", spendUsd: 0, requests: 0 },
+        { week: "2026-10-19", spendUsd: 0, requests: 0 },
+        { week: "2026-10-26", spendUsd: 4, requests: 1 },
+        { week: "2026-11-02", spendUsd: 8, requests: 1 },
+      ], "ny local weeks");
+      assert(span.scopeSince === "2026-09-28T04:00:00.000Z", span.scopeSince ?? "missing ny since");
+      assert(span.scopeUntil === "2026-11-09T05:00:00.000Z", span.scopeUntil ?? "missing ny until");
+      assert(Math.abs(span.budget.globalSpend - 15) < 1e-6, "ny weekly slice changed kill-switch spend");
+
+      const closed = (await fetch(`${base}/api/summary?since=2026-09-28&until=2026-10-05`).then((r) => r.json())) as DailySummary;
+      assertWeekly(closed.weekly, [{ week: "2026-09-28", spendUsd: 1, requests: 1 }], "ny monday until");
+      assert(closed.scopeUntil === "2026-10-05T04:00:00.000Z", closed.scopeUntil ?? "ny monday until instant");
+
+      const filtered = (await fetch(`${base}/api/summary?project=demo&model=gpt-4o&since=2026-09-28&until=2026-11-09`).then((r) => r.json())) as DailySummary;
+      assertWeekly(filtered.weekly, [
+        { week: "2026-09-28", spendUsd: 0, requests: 0 },
+        { week: "2026-10-05", spendUsd: 2, requests: 1 },
+        { week: "2026-10-12", spendUsd: 0, requests: 0 },
+        { week: "2026-10-19", spendUsd: 0, requests: 0 },
+        { week: "2026-10-26", spendUsd: 0, requests: 0 },
+        { week: "2026-11-02", spendUsd: 8, requests: 1 },
+      ], "ny project+model");
+      assert(Math.abs(filtered.spendUsd - 10) < 1e-6, `ny filtered weekly total ${filtered.spendUsd}`);
+
+      const weekCsv = csvLines(await fetch(`${base}/api/export.csv?since=2026-10-26&until=2026-11-02`).then((r) => r.text()));
+      assert(weekCsv.length === 2, `ny fall week csv rows ${weekCsv.length}`);
+      assert(weekCsv[1]?.startsWith("2026-11-02T04:30:00.000Z,other,gpt-4o-mini,"), weekCsv[1] ?? "ny fall week row");
+      const weekMd = await fetch(`${base}/receipt.md?since=2026-10-26&until=2026-11-02`).then((r) => r.text());
+      assert(weekMd.includes("Covered **2026-10-26 inclusive to 2026-11-02 exclusive (America/New_York)**"), weekMd);
+      assert(weekMd.includes("| Total spend | $4.00 |"), weekMd);
+      assert(!weekMd.includes("2026-11-02T05:00:00.000Z"), "ny week receipt included the next Monday");
+    },
+  );
 }
 
 async function testProjectModelPairs(dir: string, mockUrl: string): Promise<void> {

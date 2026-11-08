@@ -65,6 +65,16 @@ export function calendarDayKey(timeZone: string, date: Date): string {
   return formatYmd(zonedParts(timeZone, date));
 }
 
+/**
+ * Local Monday `YYYY-MM-DD` of the ISO week containing `date` in `timeZone`.
+ * Weeks run Monday 00:00 through the next Monday 00:00. A DST change inside
+ * the week does not split the key.
+ */
+export function calendarWeekKey(timeZone: string, date: Date): string {
+  const today = calendarDate(timeZone, date);
+  return formatYmd(addCalendarDays(today, 1 - isoWeekday(today)));
+}
+
 /** Shift a `YYYY-MM-DD` key by whole calendar days. The step does not depend on DST length. */
 export function shiftCalendarDay(day: string, delta: number): string {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);

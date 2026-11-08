@@ -153,6 +153,14 @@ export function dashboardHtml(): string {
 
     <article class="card" style="margin-bottom:18px">
       <div class="row-head">
+        <div class="k">Spend by week</div>
+        <div class="sub" id="weekly-sub">last 8 weeks</div>
+      </div>
+      <div id="by-week" class="empty">No weeks yet.</div>
+    </article>
+
+    <article class="card" style="margin-bottom:18px">
+      <div class="row-head">
         <div class="k">Most expensive</div>
         <div class="sub">highest cost first</div>
       </div>
@@ -254,6 +262,36 @@ export function dashboardHtml(): string {
         '<a class="btn mini" href="/api/export.json?' + q + '">JSON</a>' +
         '</div>';
     }
+    function mondayOf(day) {
+      const bits = day.split("-").map(Number);
+      const utc = new Date(Date.UTC(bits[0], bits[1] - 1, bits[2]));
+      const sunday0 = utc.getUTCDay();
+      const iso = sunday0 === 0 ? 7 : sunday0;
+      return addYmd(day, 1 - iso);
+    }
+    function lastEightWeeks(s) {
+      const zone = (s.budget && s.budget.timezone) || "UTC";
+      const end = mondayOf(ymdInZone(new Date(s.generatedAt), zone));
+      const byWeek = {};
+      for (const w of s.weekly || []) byWeek[w.week] = w;
+      const rows = [];
+      for (let i = 7; i >= 0; i--) {
+        const week = addYmd(end, -i * 7);
+        const found = byWeek[week];
+        rows.push(found
+          ? { week: week, spendUsd: found.spendUsd, requests: found.requests }
+          : { week: week, spendUsd: 0, requests: 0 });
+      }
+      return rows;
+    }
+    function weekLinks(week) {
+      const q = "since=" + encodeURIComponent(week) + "&until=" + encodeURIComponent(addYmd(week, 7));
+      return '<div class="proj-links">' +
+        '<a class="btn mini" href="/receipt.md?' + q + '">Markdown</a>' +
+        '<a class="btn mini" href="/api/export.csv?' + q + '">CSV</a>' +
+        '<a class="btn mini" href="/api/export.json?' + q + '">JSON</a>' +
+        '</div>';
+    }
     async function tick() {
       const s = await fetch("/api/summary").then(r => r.json());
       $("spend").textContent = fmtMoney(s.spendUsd);
@@ -292,6 +330,25 @@ export function dashboardHtml(): string {
       );
       $("by-day").className = "";
       $("by-day").innerHTML = dailyRows || '<div class="empty">No days yet.</div>';
+      const eight = lastEightWeeks(s);
+      const weekSpend = eight.reduce((sum, w) => sum + Number(w.spendUsd || 0), 0);
+      const thisWeek = eight[eight.length - 1].week;
+      $("weekly-sub").textContent = weekSpend
+        ? "last 8 weeks · " + zone
+        : "last 8 weeks · " + zone + " · no spend";
+      const maxW = Math.max(...eight.map(w => w.spendUsd), 1e-9);
+      const weeklyRows = table(
+        [{label:"Week"},{label:"Spend",num:true},{label:"Reqs",num:true},{label:"That week"}],
+        eight.map(w => [
+          '<span class="' + (w.week === thisWeek ? "day-today" : "") + '">' + esc(w.week) + "</span>",
+          (w.spendUsd ? fmtMoney(w.spendUsd) : "$0.00") + '<div class="bar"><i style="width:' + (w.spendUsd / maxW * 100) + "%;background:" + (w.week === thisWeek ? "var(--gold)" : "var(--ink)") + '"></i></div>',
+          fmtInt(w.requests),
+          weekLinks(w.week)
+        ]),
+        "compact"
+      );
+      $("by-week").className = "";
+      $("by-week").innerHTML = weeklyRows || '<div class="empty">No weeks yet.</div>';
       spark(fortnight);
       const maxP = Math.max(...s.byProject.map(p => p.spendUsd), 1e-9);
       const proj = table(
