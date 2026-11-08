@@ -122,6 +122,17 @@ export type Summary = {
    * set, otherwise the later of today in that timezone and the latest request.
    */
   daily: { day: string; spendUsd: number; requests: number }[];
+  /**
+   * Spend by ISO calendar week in the budget timezone (`UTC` when unset).
+   * `week` is that week's local Monday as `YYYY-MM-DD` (Monday 00:00 through
+   * the next Monday 00:00). Every local week in the covered span is present,
+   * including weeks with no matching requests (`spendUsd: 0`, `requests: 0`).
+   * The span starts on the local week of `scopeSince` when set, otherwise the
+   * local week of the earliest in-scope request (empty when both are absent).
+   * It ends on the last local week touched by the half-open `scopeUntil` when
+   * set, otherwise the later of the current local week and the latest request.
+   */
+  weekly: { week: string; spendUsd: number; requests: number }[];
   recent: LedgerRow[];
   /**
    * The ten highest-cost requests inside the same project, model, and time

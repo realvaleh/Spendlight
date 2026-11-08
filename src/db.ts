@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import { calendarDayKey, shiftCalendarDay } from "./day.js";
+import { calendarDayKey, calendarWeekKey, shiftCalendarDay } from "./day.js";
 import type { LedgerRow, Usage } from "./types.js";
 
 export type Db = DatabaseSync;
@@ -306,6 +306,7 @@ export function loadSummaryParts(
   byModel: { model: string; spendUsd: number; requests: number; tokens: number }[];
   byProjectModel: { project: string; model: string; spendUsd: number; requests: number; tokens: number }[];
   daily: { day: string; spendUsd: number; requests: number }[];
+  weekly: { week: string; spendUsd: number; requests: number }[];
   recent: LedgerRow[];
   topRequests: LedgerRow[];
   events: { createdAt: string; type: string; project: string; message: string }[];
@@ -360,6 +361,7 @@ export function loadSummaryParts(
       tokens: Number(r.tokens),
     })),
     daily: dailySeries(stamps, timeZone, range, now),
+    weekly: weeklySeries(stamps, timeZone, range, now),
     recent: listRecent(db, 40, project, model, range),
     topRequests: topRequests.map(normalizeRow),
     events,
@@ -408,6 +410,56 @@ function dailySeries(
     const bucket = buckets.get(day);
     out.push({
       day,
+      spendUsd: roundUsd(bucket?.spendUsd ?? 0),
+      requests: bucket?.requests ?? 0,
+    });
+  }
+  return out;
+}
+
+/**
+ * One row per local ISO week in the covered span, oldest first.
+ * `week` is the local Monday (`YYYY-MM-DD`). Quiet weeks inside that span
+ * are included as zeros. An unset `since` starts at the earliest matching
+ * request; an unset `until` runs through the current local week (or the
+ * latest request, when that is later).
+ */
+function weeklySeries(
+  rows: { createdAt: string; costUsd: number }[],
+  timeZone: string,
+  range: CreatedRange | null | undefined,
+  now: Date,
+): { week: string; spendUsd: number; requests: number }[] {
+  const buckets = new Map<string, { spendUsd: number; requests: number }>();
+  let earliest: string | null = null;
+  let latest: string | null = null;
+  for (const row of rows) {
+    const week = calendarWeekKey(timeZone, new Date(row.createdAt));
+    const bucket = buckets.get(week) ?? { spendUsd: 0, requests: 0 };
+    bucket.spendUsd += Number(row.costUsd) || 0;
+    bucket.requests += 1;
+    buckets.set(week, bucket);
+    if (!earliest || week < earliest) earliest = week;
+    if (!latest || week > latest) latest = week;
+  }
+
+  const start = range?.sinceIso ? calendarWeekKey(timeZone, new Date(range.sinceIso)) : earliest;
+  let end: string | null;
+  if (range?.untilIso) {
+    end = calendarWeekKey(timeZone, new Date(Date.parse(range.untilIso) - 1));
+  } else if (!latest) {
+    end = range?.sinceIso ? calendarWeekKey(timeZone, now) : null;
+  } else {
+    const current = calendarWeekKey(timeZone, now);
+    end = latest > current ? latest : current;
+  }
+  if (!start || !end || start > end) return [];
+
+  const out: { week: string; spendUsd: number; requests: number }[] = [];
+  for (let week = start; week <= end; week = shiftCalendarDay(week, 7)) {
+    const bucket = buckets.get(week);
+    out.push({
+      week,
       spendUsd: roundUsd(bucket?.spendUsd ?? 0),
       requests: bucket?.requests ?? 0,
     });
