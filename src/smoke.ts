@@ -9,6 +9,8 @@ import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
+import { parseExportRange } from "./range.js";
+import type { Config } from "./types.js";
 
 const MOCK_USAGE = {
   prompt_tokens: 100_000,
@@ -74,6 +76,7 @@ async function main(): Promise<void> {
   assert(normalizeModelId("gpt-4o-mini\r\nX") === "gpt-4o-miniX", "model query strips CR/LF without collapsing");
   assert(normalizeModelId("") === "", "blank model query stays blank");
   assert(normalizeModelId("no-such-model") === "no-such-model", "unknown model ids are not rewritten to default");
+  testPlusOffsetQuery();
   assert(
     joinUpstream("https://api.openai.com/v1", "/v1//evil.example/x") ===
       "https://api.openai.com/v1/evil.example/x",
@@ -365,7 +368,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, plus offsets, daily breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -556,6 +559,75 @@ function seedSpend(db: Db, createdAt: string, costUsd: number, project: string, 
     status: 200,
     path: "/v1/chat/completions",
   });
+}
+
+function rangeConfig(timezone: string): Config {
+  return {
+    budgets: {
+      timezone,
+      period: "lifetime",
+      global: { softUsd: null, hardUsd: null },
+      projects: {},
+    },
+  } as Config;
+}
+
+function testPlusOffsetQuery(): void {
+  const utc = rangeConfig("UTC");
+  const plus = parseExportRange(
+    new URL("http://127.0.0.1:8787/api/summary?since=2026-10-03T15:00:00+00:00&until=2026-10-05T00:00:00+00:00"),
+    utc,
+  );
+  assert(plus.ok && plus.range, "unencoded +00:00 should parse");
+  if (!plus.ok || !plus.range) return;
+  assert(plus.range.sinceIso === "2026-10-03T15:00:00.000Z", `+00:00 since ${plus.range.sinceIso}`);
+  assert(plus.range.untilIso === "2026-10-05T00:00:00.000Z", `+00:00 until ${plus.range.untilIso}`);
+  assert(plus.range.slug === "2026-10-03T150000_2026-10-05", `+00:00 slug ${plus.range.slug}`);
+
+  const zulu = parseExportRange(
+    new URL("http://127.0.0.1:8787/api/summary?since=2026-10-03T15:00:00Z&until=2026-10-05T00:00:00Z"),
+    utc,
+  );
+  assert(zulu.ok && zulu.range?.sinceIso === plus.range.sinceIso && zulu.range?.untilIso === plus.range.untilIso, "+00:00 should match Z");
+
+  const encoded = parseExportRange(
+    new URL("http://127.0.0.1:8787/api/summary?since=2026-10-03T15:00:00%2B00:00"),
+    utc,
+  );
+  assert(encoded.ok && encoded.range?.sinceIso === "2026-10-03T15:00:00.000Z", `%2B since ${encoded.ok ? encoded.range?.sinceIso : "error"}`);
+
+  const spaced = parseExportRange(
+    new URL("http://127.0.0.1:8787/api/summary?since=2026-10-03T15:00:00%2000:00"),
+    utc,
+  );
+  assert(spaced.ok && spaced.range?.sinceIso === "2026-10-03T15:00:00.000Z", "a space before HH:MM is a decoded plus");
+
+  const shifted = parseExportRange(
+    new URL("http://127.0.0.1:8787/api/summary?since=2026-10-03T15:00:00.123+05:30"),
+    utc,
+  );
+  assert(shifted.ok && shifted.range?.sinceIso === "2026-10-03T09:30:00.123Z", `+05:30 since ${shifted.ok ? shifted.range?.sinceIso : "error"}`);
+
+  const compact = parseExportRange(new URL("http://127.0.0.1:8787/api/summary?until=2026-10-03T15:00+0530"), utc);
+  assert(compact.ok && compact.range?.untilIso === "2026-10-03T09:30:00.000Z", `compact +0530 ${compact.ok ? compact.range?.untilIso : "error"}`);
+
+  const ny = rangeConfig("America/New_York");
+  const absolute = parseExportRange(new URL("http://127.0.0.1:8787/receipt.md?since=2026-10-04T00:00:00+00:00"), ny);
+  assert(
+    absolute.ok && absolute.range?.sinceIso === "2026-10-04T00:00:00.000Z",
+    `plus offset must stay absolute in a zoned budget, got ${absolute.ok ? absolute.range?.sinceIso : "error"}`,
+  );
+  const negative = parseExportRange(new URL("http://127.0.0.1:8787/receipt.md?since=2026-10-04T00:00:00-04:00"), ny);
+  assert(negative.ok && negative.range?.sinceIso === "2026-10-04T04:00:00.000Z", `negative offset ${negative.ok ? negative.range?.sinceIso : "error"}`);
+
+  const civilSpace = parseExportRange(new URL("http://127.0.0.1:8787/api/export.csv?since=2026-10-03%2015:00:00"), utc);
+  assert(!civilSpace.ok, "a space instead of T is not an offset");
+  const badOffset = parseExportRange(new URL("http://127.0.0.1:8787/api/export.csv?since=2026-10-03T15:00:00+99:99"), utc);
+  assert(!badOffset.ok, "+99:99 should stay a 400");
+  if (!badOffset.ok) {
+    assert(badOffset.error.error.param === "since", `bad offset param ${badOffset.error.error.param}`);
+    assert(badOffset.error.error.message.includes("could not be parsed"), badOffset.error.error.message);
+  }
 }
 
 function testCalendarDayBounds(): void {
@@ -1987,6 +2059,37 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
     assert(clockMd.includes("Covered **2026-10-03 15:00:00 inclusive to 2026-10-05 exclusive (UTC)**"), clockMd);
     assert(clockMd.includes("| Total spend | $4.00 |"), clockMd);
 
+    const plusCsv = await fetch(`${base}/api/export.csv?since=2026-10-03T15:00:00+00:00&until=2026-10-05T00:00:00+00:00`);
+    assert(plusCsv.status === 200, `plus-offset csv ${plusCsv.status}: ${await plusCsv.clone().text()}`);
+    assert(
+      (plusCsv.headers.get("content-disposition") ?? "").includes("spendlight-2026-10-03T150000_2026-10-05.csv"),
+      plusCsv.headers.get("content-disposition") ?? "plus offset changed the filename",
+    );
+    const plusLines = csvLines(await plusCsv.text());
+    assert(plusLines.length === clockLines.length, `plus-offset csv rows ${plusLines.length}`);
+    assert(plusLines[1] === clockLines[1], `plus-offset csv row ${plusLines[1]}`);
+    const plusSummary = (await fetch(`${base}/api/summary?since=2026-10-03T15:00:00+00:00&until=2026-10-05T00:00:00+00:00`).then((r) => r.json())) as {
+      spendUsd: number;
+      scopeSince: string | null;
+      scopeUntil: string | null;
+    };
+    assert(plusSummary.scopeSince === "2026-10-03T15:00:00.000Z", plusSummary.scopeSince ?? "missing plus since");
+    assert(plusSummary.scopeUntil === "2026-10-05T00:00:00.000Z", plusSummary.scopeUntil ?? "missing plus until");
+    assert(Math.abs(plusSummary.spendUsd - 4) < 1e-6, `plus-offset summary spend ${plusSummary.spendUsd}`);
+    const plusMd = await fetch(`${base}/receipt.md?since=2026-10-03T15:00:00+00:00&until=2026-10-05T00:00:00+00:00`).then((r) => r.text());
+    assert(plusMd.includes("| Total spend | $4.00 |"), plusMd);
+    const shifted = (await fetch(`${base}/api/summary?since=2026-10-03T15:00:00+05:30&until=2026-10-05T00:00:00Z`).then((r) => r.json())) as {
+      spendUsd: number;
+      requests: number;
+      scopeSince: string | null;
+    };
+    assert(shifted.scopeSince === "2026-10-03T09:30:00.000Z", shifted.scopeSince ?? "missing shifted since");
+    assert(shifted.requests === 2, `+05:30 should include the 12:00 row, requests ${shifted.requests}`);
+    assert(Math.abs(shifted.spendUsd - 6) < 1e-6, `shifted summary spend ${shifted.spendUsd}`);
+    const encoded = (await fetch(`${base}/api/export.json?since=2026-10-03T15:00:00%2B00:00`).then((r) => r.json())) as { timestamp: string }[];
+    assert(encoded.length === 2, `%2B00:00 json rows ${encoded.length}`);
+    assert(encoded[0]?.timestamp === "2026-10-03T18:00:00.000Z", encoded[0]?.timestamp ?? "missing encoded row");
+
     const andCsv = await fetch(`${base}/api/export.csv?project=demo&model=gpt-4o-mini&since=2026-10-01&until=2026-10-05`);
     assert(andCsv.status === 200, `project+model+range csv ${andCsv.status}`);
     assert(
@@ -2043,6 +2146,8 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
     await expectRange400(`${base}/api/export.csv?until=2026-02-31`, "until", "does not exist");
     await expectRange400(`${base}/api/export.csv?since=2026-13-01`, "since", "does not exist");
     await expectRange400(`${base}/api/export.csv?since=2026-10-04T25:00:00Z`, "since", "does not exist");
+    await expectRange400(`${base}/api/export.csv?since=2026-10-03%2015:00:00`, "since", "Invalid since");
+    await expectRange400(`${base}/api/export.csv?since=2026-10-03T15:00:00+99:99`, "since", "could not be parsed");
     await expectRange400(`${base}/api/export.csv?since=2026-10-05&until=2026-10-03`, null, "earlier than until");
     await expectRange400(`${base}/api/export.csv?since=2026-10-03&until=2026-10-03`, null, "earlier than until");
     await expectRange400(`${base}/receipt.md?since=nope`, "since", "Invalid since");
