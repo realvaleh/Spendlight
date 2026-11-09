@@ -31,6 +31,7 @@ const DATE_TIME =
  * `since` / `until` / `window` for an export or receipt.
  * Absent params leave the ledger unscoped in time. A bare date is midnight in the
  * budget timezone. The range is half-open: since inclusive, until exclusive.
+ * A `+` offset in the query string is decoded as a space and accepted.
  */
 export function parseExportRange(url: URL, config: Config, now = new Date()): ParsedExportRange {
   const params = url.searchParams;
@@ -83,7 +84,7 @@ export function parseExportRange(url: URL, config: Config, now = new Date()): Pa
 type BoundResult = { ok: true; iso: string } | { ok: false; error: TimeRangeErrorBody };
 
 function parseBound(raw: string, param: "since" | "until", timeZone: string): BoundResult {
-  const text = raw.trim();
+  const text = restoreDecodedPlusOffset(raw.trim());
   if (!text) {
     return fail(param, `Invalid ${param}. Use an ISO date (YYYY-MM-DD) or datetime.`);
   }
@@ -124,6 +125,18 @@ function parseBound(raw: string, param: "since" | "until", timeZone: string): Bo
     return { ok: true, iso: parsed.toISOString() };
   }
   return civil(param, timeZone, { year, month, day, hour, minute, second, millisecond }, text);
+}
+
+/**
+ * `URLSearchParams` decodes `+` as a space, so a query such as
+ * `since=2026-10-03T15:00:00+00:00` arrives as `2026-10-03T15:00:00 00:00`.
+ * A space before `HH:MM` or `HHMM` is that missing plus. `%2B` is unchanged.
+ */
+function restoreDecodedPlusOffset(text: string): string {
+  return text.replace(
+    /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?) (\d{2}:\d{2}|\d{4})$/,
+    "$1+$2",
+  );
 }
 
 function civil(param: "since" | "until", timeZone: string, parts: CivilTime, raw: string): BoundResult {
