@@ -145,6 +145,14 @@ export function dashboardHtml(): string {
 
     <article class="card" style="margin-bottom:18px">
       <div class="row-head">
+        <div class="k">By endpoint</div>
+        <div class="sub">request path · highest spend first</div>
+      </div>
+      <div id="by-path" class="empty">No endpoints yet.</div>
+    </article>
+
+    <article class="card" style="margin-bottom:18px">
+      <div class="row-head">
         <div class="k">Spend by day</div>
         <div class="sub" id="daily-sub">last 14 days</div>
       </div>
@@ -323,6 +331,19 @@ export function dashboardHtml(): string {
       );
       $("by-pair").className = "";
       $("by-pair").innerHTML = pairs || '<div class="empty">No project and model pairs yet.</div>';
+      const pathRows = s.byPath || [];
+      const maxPath = Math.max(...pathRows.map(p => p.spendUsd), 1e-9);
+      const paths = table(
+        [{label:"Endpoint"},{label:"Spend",num:true},{label:"Reqs",num:true},{label:"Tokens",num:true}],
+        pathRows.map(p => [
+          "<code>" + esc(p.path) + "</code>" + '<div class="bar"><i style="width:' + (p.spendUsd / maxPath * 100) + '%"></i></div>',
+          fmtMoney(p.spendUsd),
+          fmtInt(p.requests),
+          fmtInt(p.tokens)
+        ])
+      );
+      $("by-path").className = "";
+      $("by-path").innerHTML = paths || '<div class="empty">No endpoints yet.</div>';
       const ranked = s.topRequests || [];
       const maxT = Math.max(...ranked.map(r => r.costUsd), 1e-9);
       const top = table(

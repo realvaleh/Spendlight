@@ -208,12 +208,17 @@ async function main(): Promise<void> {
       spendUsd: number;
       requests: number;
       recent: { project: string; model: string; costUsd: number }[];
+      byPath: { path: string; spendUsd: number; requests: number; tokens: number }[];
       budget: { status: string };
     };
     assert(summary.requests === 1, `expected 1 logged request, got ${summary.requests}`);
     assert(Math.abs(summary.spendUsd - 0.045) < 1e-6, `logged spend ${summary.spendUsd}`);
     assert(summary.recent[0]?.project === "demo", "project not logged");
     assert(summary.recent[0]?.model === "gpt-4o-mini", "model not logged");
+    assert(summary.byPath.length === 1, `logged completion should be one endpoint, got ${summary.byPath.length}`);
+    assert(summary.byPath[0]?.path === "/v1/chat/completions", `logged path ${summary.byPath[0]?.path}`);
+    assert(summary.byPath[0]?.requests === 1, `endpoint requests ${summary.byPath[0]?.requests}`);
+    assert(Math.abs((summary.byPath[0]?.spendUsd ?? NaN) - summary.spendUsd) < 1e-6, "endpoint spend drifted from the logged completion");
 
     const csvRes = await fetch(`${base}/api/export.csv`);
     assert(csvRes.status === 200, `csv export status ${csvRes.status}`);
@@ -332,6 +337,11 @@ async function main(): Promise<void> {
     assert(dash.includes("highest cost first"), "dashboard should order expensive requests by cost");
     assert(dash.includes('id="top-requests"'), "dashboard missing most-expensive mount");
     assert(dash.includes("s.topRequests"), "dashboard should render topRequests");
+    assert(dash.includes("By endpoint"), "dashboard missing endpoint card");
+    assert(dash.includes("request path"), "dashboard should label endpoint rows as request paths");
+    assert(dash.includes('id="by-path"'), "dashboard missing endpoint mount");
+    assert(dash.includes("s.byPath"), "dashboard should render byPath");
+    assert(dash.includes("esc(p.path)"), "dashboard should escape endpoint paths");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -364,8 +374,9 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testEndpointSpend(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, endpoint spend");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -546,7 +557,14 @@ async function summaryOf(base: string): Promise<{
   };
 }
 
-function seedSpend(db: Db, createdAt: string, costUsd: number, project: string, model = "gpt-4o-mini"): void {
+function seedSpend(
+  db: Db,
+  createdAt: string,
+  costUsd: number,
+  project: string,
+  model = "gpt-4o-mini",
+  path = "/v1/chat/completions",
+): void {
   insertRequest(db, {
     createdAt,
     project,
@@ -554,7 +572,7 @@ function seedSpend(db: Db, createdAt: string, costUsd: number, project: string, 
     usage: { promptTokens: 1, completionTokens: 0, cachedTokens: 0, totalTokens: 1 },
     costUsd,
     status: 200,
-    path: "/v1/chat/completions",
+    path,
   });
 }
 
@@ -2298,6 +2316,7 @@ const SUMMARY_FIELDS = [
   "byProject",
   "byModel",
   "byProjectModel",
+  "byPath",
   "daily",
   "recent",
   "topRequests",
@@ -2329,7 +2348,7 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
     const limit = budget[side] as Record<string, unknown>;
     assert(limit && "softUsd" in limit && "hardUsd" in limit, `${label} ${side} missing soft/hard`);
   }
-  for (const key of ["byProject", "byModel", "byProjectModel", "daily", "recent", "topRequests", "events"] as const) {
+  for (const key of ["byProject", "byModel", "byProjectModel", "byPath", "daily", "recent", "topRequests", "events"] as const) {
     assert(Array.isArray(summary[key]), `${label} ${key} is not an array`);
   }
   const projects = summary.byProject as Record<string, unknown>[];
@@ -2348,6 +2367,12 @@ function assertSummaryFields(summary: Record<string, unknown>, label: string): v
   if (pairs[0]) {
     for (const key of ["project", "model", "spendUsd", "requests", "tokens"]) {
       assert(key in pairs[0], `${label} byProjectModel missing ${key}`);
+    }
+  }
+  const paths = summary.byPath as Record<string, unknown>[];
+  if (paths[0]) {
+    for (const key of ["path", "spendUsd", "requests", "tokens"]) {
+      assert(key in paths[0], `${label} byPath missing ${key}`);
     }
   }
   const daily = summary.daily as Record<string, unknown>[];
@@ -2407,6 +2432,27 @@ function sliceDaily(daily: DailyRow[], from: string, untilDay: string): DailyRow
 
 function sumDaily(daily: DailyRow[]): number {
   return daily.reduce((sum, row) => sum + row.spendUsd, 0);
+}
+
+type PathRow = { path: string; spendUsd: number; requests: number; tokens: number };
+
+function assertPaths(paths: PathRow[], expected: PathRow[], label: string): void {
+  assert(
+    paths.length === expected.length,
+    `${label} paths [${paths.map((p) => p.path).join(",")}] expected [${expected.map((p) => p.path).join(",")}]`,
+  );
+  for (let i = 0; i < expected.length; i++) {
+    const got = paths[i];
+    const want = expected[i]!;
+    assert(got?.path === want.path, `${label} path ${i} ${got?.path} !== ${want.path}`);
+    assert(Math.abs((got?.spendUsd ?? NaN) - want.spendUsd) < 1e-6, `${label} ${want.path} spend ${got?.spendUsd}`);
+    assert(got?.requests === want.requests, `${label} ${want.path} requests ${got?.requests}`);
+    assert(got?.tokens === want.tokens, `${label} ${want.path} tokens ${got?.tokens}`);
+  }
+}
+
+function sumPaths(paths: PathRow[]): number {
+  return paths.reduce((sum, row) => sum + row.spendUsd, 0);
 }
 
 function assertPairs(pairs: PairRow[], expected: PairRow[], label: string): void {
@@ -2743,6 +2789,68 @@ async function testTopRequests(dir: string, mockUrl: string): Promise<void> {
       assert(lifetime.scopeSince == null, "unscoped summary picked up window=current");
     },
   );
+}
+
+async function testEndpointSpend(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "by-path", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
+    seedSpend(app.db, "2026-10-02T00:00:00.000Z", 4, "alpha", "gpt-4o", "/v1/embeddings");
+    seedSpend(app.db, "2026-10-02T01:00:00.000Z", 4, "alpha", "gpt-4o-mini", "/v1/chat/completions");
+    seedSpend(app.db, "2026-10-02T02:00:00.000Z", 4, "zeta", "gpt-4o", "/v1/embeddings");
+    seedSpend(app.db, "2026-10-02T03:00:00.000Z", 4, "alpha", "gpt-4o", "/v1/responses");
+    seedSpend(app.db, "2026-10-03T00:00:00.000Z", 4, "alpha", "gpt-4o", "/v1/chat/completions");
+
+    const summary = (await fetch(`${base}/api/summary`).then((r) => r.json())) as DailySummary & { byPath: PathRow[] };
+    assertSummaryFields(summary, "endpoints");
+    assertPaths(summary.byPath, [
+      { path: "/v1/chat/completions", spendUsd: 8, requests: 2, tokens: 2 },
+      { path: "/v1/embeddings", spendUsd: 8, requests: 2, tokens: 2 },
+      { path: "/v1/responses", spendUsd: 4, requests: 1, tokens: 1 },
+    ], "tie break");
+    assert(Math.abs(sumPaths(summary.byPath) - summary.spendUsd) < 1e-6, "endpoint spend drifted from the ledger");
+    assert(summary.byProject.length === 2 && summary.byModel.length === 2, "endpoint grouping changed the other breakdowns");
+
+    const projectScoped = (await fetch(`${base}/api/summary?project=alpha`).then((r) => r.json())) as {
+      byPath: PathRow[];
+      spendUsd: number;
+      budget: { globalSpend: number };
+    };
+    assertPaths(projectScoped.byPath, [
+      { path: "/v1/chat/completions", spendUsd: 8, requests: 2, tokens: 2 },
+      { path: "/v1/embeddings", spendUsd: 4, requests: 1, tokens: 1 },
+      { path: "/v1/responses", spendUsd: 4, requests: 1, tokens: 1 },
+    ], "project filter");
+    assert(Math.abs(sumPaths(projectScoped.byPath) - projectScoped.spendUsd) < 1e-6, "project endpoint spend drifted");
+    assert(Math.abs(projectScoped.budget.globalSpend - 20) < 1e-6, "endpoint filter changed kill-switch spend");
+
+    const modelScoped = (await fetch(`${base}/api/summary?model=gpt-4o`).then((r) => r.json())) as { byPath: PathRow[] };
+    assertPaths(modelScoped.byPath, [
+      { path: "/v1/embeddings", spendUsd: 8, requests: 2, tokens: 2 },
+      { path: "/v1/chat/completions", spendUsd: 4, requests: 1, tokens: 1 },
+      { path: "/v1/responses", spendUsd: 4, requests: 1, tokens: 1 },
+    ], "model filter");
+
+    const ranged = (await fetch(`${base}/api/summary?since=2026-10-03&until=2026-10-04`).then((r) => r.json())) as {
+      byPath: PathRow[];
+      spendUsd: number;
+      requests: number;
+    };
+    assertPaths(ranged.byPath, [
+      { path: "/v1/chat/completions", spendUsd: 4, requests: 1, tokens: 1 },
+    ], "time slice");
+    assert(ranged.requests === 1, `time slice requests ${ranged.requests}`);
+    assert(Math.abs(ranged.spendUsd - 4) < 1e-6, `time slice spend ${ranged.spendUsd}`);
+
+    const both = (await fetch(`${base}/api/summary?project=zeta&model=gpt-4o&since=2026-10-02&until=2026-10-03`).then((r) => r.json())) as {
+      byPath: PathRow[];
+    };
+    assertPaths(both.byPath, [
+      { path: "/v1/embeddings", spendUsd: 4, requests: 1, tokens: 1 },
+    ], "project+model+range");
+
+    const miss = (await fetch(`${base}/api/summary?model=missing`).then((r) => r.json())) as { byPath: PathRow[]; requests: number };
+    assert(miss.byPath.length === 0, "unknown model should have no endpoints");
+    assert(miss.requests === 0, "unknown model should match nothing");
+  });
 }
 
 async function expectRange400(url: string, param: string | null, snippet: string): Promise<void> {
