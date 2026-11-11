@@ -343,6 +343,7 @@ async function main(): Promise<void> {
     testCalendarWeekBounds();
     testCalendarMonthBounds();
     testBudgetConfig(dir);
+    testBudgetAmounts(dir);
     testDayLedgerWindow(dir);
     testWeekLedgerWindow(dir);
     testMonthLedgerWindow(dir);
@@ -365,7 +366,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, budget amounts");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -791,6 +792,92 @@ function testBudgetConfig(dir: string): void {
     assert(threw, "invalid period must fail startup");
   } finally {
     console.warn = origWarn;
+    if (savedPeriod == null) delete process.env.SPENDLIGHT_BUDGET_PERIOD;
+    else process.env.SPENDLIGHT_BUDGET_PERIOD = savedPeriod;
+    if (savedZone == null) delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
+    else process.env.SPENDLIGHT_BUDGET_TIMEZONE = savedZone;
+  }
+}
+
+function testBudgetAmounts(dir: string): void {
+  const savedSoft = process.env.SPENDLIGHT_SOFT_BUDGET_USD;
+  const savedHard = process.env.SPENDLIGHT_HARD_BUDGET_USD;
+  const savedPeriod = process.env.SPENDLIGHT_BUDGET_PERIOD;
+  const savedZone = process.env.SPENDLIGHT_BUDGET_TIMEZONE;
+  const basePath = join(dir, "amounts.json");
+  writeFileSync(basePath, JSON.stringify({ budgets: { global: { softUsd: 1, hardUsd: 7 } } }));
+
+  const expectReject = (run: () => void, ...needles: string[]) => {
+    let threw = false;
+    try {
+      run();
+    } catch (err) {
+      threw = true;
+      const message = err instanceof Error ? err.message : String(err);
+      for (const needle of needles) {
+        assert(message.includes(needle), `expected "${needle}" in: ${message}`);
+      }
+    }
+    assert(threw, `expected startup to reject a budget (${needles.join(", ")})`);
+  };
+
+  try {
+    delete process.env.SPENDLIGHT_BUDGET_PERIOD;
+    delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
+    delete process.env.SPENDLIGHT_SOFT_BUDGET_USD;
+    delete process.env.SPENDLIGHT_HARD_BUDGET_USD;
+
+    const numericString = join(dir, "amounts-string.json");
+    writeFileSync(
+      numericString,
+      JSON.stringify({ budgets: { global: { softUsd: "1.5", hardUsd: "12.5" }, projects: { demo: { hardUsd: 0 } } } }),
+    );
+    const parsed = loadConfig(numericString);
+    assert(parsed.budgets.global.softUsd === 1.5, `string soft ${parsed.budgets.global.softUsd}`);
+    assert(parsed.budgets.global.hardUsd === 12.5, `string hard ${parsed.budgets.global.hardUsd}`);
+    assert(parsed.budgets.projects.demo?.hardUsd === 0, "zero is a real project hard cap");
+
+    process.env.SPENDLIGHT_HARD_BUDGET_USD = "   ";
+    const blank = loadConfig(basePath);
+    assert(blank.budgets.global.hardUsd === 7, `blank hard env should stay unset, got ${blank.budgets.global.hardUsd}`);
+    process.env.SPENDLIGHT_HARD_BUDGET_USD = "  25  ";
+    const trimmed = loadConfig(basePath);
+    assert(trimmed.budgets.global.hardUsd === 25, `trimmed hard env ${trimmed.budgets.global.hardUsd}`);
+    delete process.env.SPENDLIGHT_HARD_BUDGET_USD;
+
+    process.env.SPENDLIGHT_HARD_BUDGET_USD = "10usd";
+    expectReject(() => loadConfig(basePath), "SPENDLIGHT_HARD_BUDGET_USD", "10usd", "USD");
+    process.env.SPENDLIGHT_HARD_BUDGET_USD = "Infinity";
+    expectReject(() => loadConfig(basePath), "SPENDLIGHT_HARD_BUDGET_USD", "Infinity", "USD");
+    delete process.env.SPENDLIGHT_HARD_BUDGET_USD;
+    process.env.SPENDLIGHT_SOFT_BUDGET_USD = "-1";
+    expectReject(() => loadConfig(basePath), "SPENDLIGHT_SOFT_BUDGET_USD", "-1", "USD");
+    delete process.env.SPENDLIGHT_SOFT_BUDGET_USD;
+
+    const badGlobal = join(dir, "amounts-bad-global.json");
+    writeFileSync(badGlobal, JSON.stringify({ budgets: { global: { hardUsd: "nope" } } }));
+    expectReject(() => loadConfig(badGlobal), "budgets.global.hardUsd", "nope", "USD");
+
+    const badProject = join(dir, "amounts-bad-project.json");
+    writeFileSync(badProject, JSON.stringify({ budgets: { projects: { demo: { softUsd: -2 } } } }));
+    expectReject(() => loadConfig(badProject), "budgets.projects.demo.softUsd", "-2", "USD");
+
+    const badBool = join(dir, "amounts-bool.json");
+    writeFileSync(badBool, JSON.stringify({ budgets: { global: { hardUsd: true } } }));
+    expectReject(() => loadConfig(badBool), "budgets.global.hardUsd", "true", "USD");
+
+    const badShape = join(dir, "amounts-shape.json");
+    writeFileSync(badShape, JSON.stringify({ budgets: { global: 10 } }));
+    expectReject(() => loadConfig(badShape), "budgets.global", "softUsd");
+
+    const badProjects = join(dir, "amounts-projects.json");
+    writeFileSync(badProjects, JSON.stringify({ budgets: { projects: ["demo"] } }));
+    expectReject(() => loadConfig(badProjects), "budgets.projects", "project tag");
+  } finally {
+    if (savedSoft == null) delete process.env.SPENDLIGHT_SOFT_BUDGET_USD;
+    else process.env.SPENDLIGHT_SOFT_BUDGET_USD = savedSoft;
+    if (savedHard == null) delete process.env.SPENDLIGHT_HARD_BUDGET_USD;
+    else process.env.SPENDLIGHT_HARD_BUDGET_USD = savedHard;
     if (savedPeriod == null) delete process.env.SPENDLIGHT_BUDGET_PERIOD;
     else process.env.SPENDLIGHT_BUDGET_PERIOD = savedPeriod;
     if (savedZone == null) delete process.env.SPENDLIGHT_BUDGET_TIMEZONE;
