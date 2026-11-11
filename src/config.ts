@@ -44,11 +44,42 @@ type FileConfig = {
   fallbackPrice?: Partial<ModelPrice>;
 };
 
-function numEnv(name: string): number | undefined {
+/** Finite decimal, zero or greater. Rejects `10usd`, `0x10`, `Infinity`, and blanks. */
+const USD_AMOUNT = /^[+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
+
+function usdEnv(name: string): number | undefined {
   const raw = process.env[name];
-  if (raw == null || raw === "") return undefined;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : undefined;
+  if (raw == null || raw.trim() === "") return undefined;
+  const amount = parseUsdAmount(raw, name);
+  return amount == null ? undefined : amount;
+}
+
+function parseUsdAmount(raw: unknown, label: string): number | null {
+  if (raw == null) return null;
+  if (typeof raw === "number") {
+    if (Number.isFinite(raw) && raw >= 0) return raw;
+    throw new Error(usdMessage(label, String(raw)));
+  }
+  if (typeof raw === "string") {
+    const text = raw.trim();
+    if (text === "") {
+      throw new Error(`Invalid ${label}. Expected a finite number of USD that is zero or greater, or omit the field.`);
+    }
+    if (!USD_AMOUNT.test(text)) throw new Error(usdMessage(label, text));
+    const n = Number(text);
+    if (!Number.isFinite(n) || n < 0) throw new Error(usdMessage(label, text));
+    return n;
+  }
+  throw new Error(usdMessage(label, String(raw)));
+}
+
+function usdMessage(label: string, shown: string): string {
+  return `Invalid ${label} "${clipSetting(shown)}". Expected a finite number of USD that is zero or greater.`;
+}
+
+function clipSetting(raw: string): string {
+  const text = raw.replace(/[\r\n]+/g, " ").trim();
+  return text.length > 80 ? `${text.slice(0, 79)}…` : text;
 }
 
 function strEnv(name: string): string | undefined {
@@ -86,10 +117,17 @@ function parseTimeZone(raw: string | undefined, period: BudgetPeriod): string {
   return timeZone;
 }
 
-function parseBudget(raw: Partial<BudgetLimit> | undefined): BudgetLimit {
+function parseBudget(raw: unknown, label: string): BudgetLimit {
+  if (raw == null) return { softUsd: null, hardUsd: null };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(
+      `Invalid ${label}. Expected an object with optional softUsd and hardUsd (finite USD, zero or greater).`,
+    );
+  }
+  const rec = raw as { softUsd?: unknown; hardUsd?: unknown };
   return {
-    softUsd: raw?.softUsd == null ? null : Number(raw.softUsd),
-    hardUsd: raw?.hardUsd == null ? null : Number(raw.hardUsd),
+    softUsd: parseUsdAmount(rec.softUsd, `${label}.softUsd`),
+    hardUsd: parseUsdAmount(rec.hardUsd, `${label}.hardUsd`),
   };
 }
 
@@ -127,14 +165,18 @@ export function loadConfig(explicitPath?: string): Config {
     };
   }
 
+  const rawProjects = file.budgets?.projects;
+  if (rawProjects != null && (typeof rawProjects !== "object" || Array.isArray(rawProjects))) {
+    throw new Error("Invalid budgets.projects. Expected an object keyed by project tag.");
+  }
   const projects: Record<string, BudgetLimit> = {};
-  for (const [name, b] of Object.entries(file.budgets?.projects ?? {})) {
-    projects[name] = parseBudget(b);
+  for (const [name, b] of Object.entries(rawProjects ?? {})) {
+    projects[name] = parseBudget(b, `budgets.projects.${name}`);
   }
 
-  const envSoft = numEnv("SPENDLIGHT_SOFT_BUDGET_USD");
-  const envHard = numEnv("SPENDLIGHT_HARD_BUDGET_USD");
-  const global = parseBudget(file.budgets?.global);
+  const envSoft = usdEnv("SPENDLIGHT_SOFT_BUDGET_USD");
+  const envHard = usdEnv("SPENDLIGHT_HARD_BUDGET_USD");
+  const global = parseBudget(file.budgets?.global, "budgets.global");
   if (envSoft !== undefined) global.softUsd = envSoft;
   if (envHard !== undefined) global.hardUsd = envHard;
 
@@ -183,10 +225,13 @@ Env:
   SPENDLIGHT_PORT                Port (default 8787)
   SPENDLIGHT_DB                  SQLite path
   SPENDLIGHT_CONFIG              Config JSON path
-  SPENDLIGHT_SOFT_BUDGET_USD     Global soft budget
-  SPENDLIGHT_HARD_BUDGET_USD     Global hard budget (kill-switch)
+  SPENDLIGHT_SOFT_BUDGET_USD     Global soft budget (finite USD, zero or greater)
+  SPENDLIGHT_HARD_BUDGET_USD     Global hard budget (kill-switch; finite USD, zero or greater)
   SPENDLIGHT_BUDGET_PERIOD       lifetime (default), day, week, or month
   SPENDLIGHT_BUDGET_TIMEZONE     IANA zone when period is day, week, or month (e.g. America/New_York)
+
+A blank budget env var counts as unset. Any other value that is not a finite USD amount
+zero or greater stops startup. The same rule applies to softUsd and hardUsd in the config file.
 
 Bind to 127.0.0.1 (the default). The dashboard, receipts, and /api/summary have no auth.
 `;

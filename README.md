@@ -145,6 +145,8 @@ export SPENDLIGHT_SOFT_BUDGET_USD=10
 export SPENDLIGHT_HARD_BUDGET_USD=25
 ```
 
+Each soft or hard amount has to be a finite number of USD, zero or greater. That applies to these env vars and to `softUsd` / `hardUsd` on `budgets.global` and each `budgets.projects` entry. Startup stops with an error that names the setting when the value is anything else, such as `10usd`, `-1`, or `Infinity`. A blank env var counts as unset. Omit the field, or leave the env var unset, when that cap is unused. `0` is a real cap: a hard limit of zero rejects every mutating `/v1` call. A numeric string such as `"12.5"` is accepted.
+
 Per-project limits live in `spendlight.config.json`. A request is blocked if **either** the project hard cap **or** the global hard cap is hit.
 
 Caps count the **whole ledger** unless you set a calendar window. `period` defaults to `lifetime` (omit it and nothing changes). `day` counts only rows whose timestamp falls on the current calendar day in an IANA timezone, and the window resets at local midnight. `week` counts only rows in the current ISO week (Monday through Sunday) in that same timezone, and the window resets at local midnight on Monday. `month` counts only rows in the current calendar month in that same timezone, and the window resets at local midnight on the 1st. That is a daily, weekly, or monthly kill-switch: soft $5 / hard $10 today, soft $20 / hard $40 this week, or soft $50 / hard $100 this month, without wiping the database. The dashboard hero total stays lifetime. The budget meter, kill-switch, reservation room, and soft-warn dedupe use the day, week, or month window, so the next day, week, or month can warn again.
@@ -329,8 +331,8 @@ Spendlight is a **localhost reverse proxy that can spend your API key**. Treat t
 | `SPENDLIGHT_PORT` | `8787` | Listen port |
 | `SPENDLIGHT_DB` | `./data/spendlight.db` | SQLite path (`/data/spendlight.db` in Docker) |
 | `SPENDLIGHT_CONFIG` | `./spendlight.config.json` | Optional JSON config |
-| `SPENDLIGHT_SOFT_BUDGET_USD` | — | Global soft budget (warn) |
-| `SPENDLIGHT_HARD_BUDGET_USD` | — | Global hard budget (kill-switch) |
+| `SPENDLIGHT_SOFT_BUDGET_USD` | — | Global soft budget (warn). Finite USD, zero or greater; a blank value is unset |
+| `SPENDLIGHT_HARD_BUDGET_USD` | — | Global hard budget (kill-switch). Finite USD, zero or greater; a blank value is unset |
 | `SPENDLIGHT_BUDGET_PERIOD` | `lifetime` | `lifetime` (whole ledger), `day` (calendar day), `week` (ISO week, Monday–Sunday), or `month` (calendar month) |
 | `SPENDLIGHT_BUDGET_TIMEZONE` | `UTC` | IANA zone for a day, week, or month window, e.g. `America/New_York` |
 
