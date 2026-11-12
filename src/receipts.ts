@@ -1,4 +1,4 @@
-import type { Summary } from "./types.js";
+import type { LedgerRow, Summary } from "./types.js";
 import { fmt } from "./budget.js";
 import { formatCivil } from "./day.js";
 
@@ -59,6 +59,41 @@ export function receiptMarkdown(summary: Summary): string {
     ``,
   ];
   return lines.filter((l, i, arr) => !(l === "" && arr[i - 1] === "")).join("\n");
+}
+
+/**
+ * Markdown receipt for one logged request.
+ * Table cells are flattened so a pipe or newline in an upstream error cannot add a row.
+ */
+export function requestReceiptMarkdown(row: LedgerRow): string {
+  const lines = [
+    `# Spendlight request receipt`,
+    ``,
+    `| | |`,
+    `| --- | ---: |`,
+    `| Id | \`${mdCell(row.id)}\` |`,
+    `| When | ${mdCell(row.createdAt)} |`,
+    `| Project | ${mdCell(row.project || "—")} |`,
+    `| Model | \`${mdCell(row.model)}\` |`,
+    `| Path | \`${mdCell(row.path)}\` |`,
+    `| Status | ${row.status} |`,
+    `| Streamed | ${row.streamed ? "yes" : "no"} |`,
+    `| Prompt tokens | ${row.promptTokens.toLocaleString("en-US")} |`,
+    `| Completion tokens | ${row.completionTokens.toLocaleString("en-US")} |`,
+    `| Cached tokens | ${row.cachedTokens.toLocaleString("en-US")} |`,
+    `| Total tokens | ${row.totalTokens.toLocaleString("en-US")} |`,
+    `| Estimated cost | ${fmt(row.costUsd)} |`,
+    `| Upstream id | ${row.upstreamId ? `\`${mdCell(row.upstreamId)}\`` : "—"} |`,
+    `| Error | ${mdCell(row.error ?? "—")} |`,
+    ``,
+    `_Logged by [Spendlight](https://github.com/realvaleh/Spendlight). Costs are estimates from the configured price table._`,
+    ``,
+  ];
+  return lines.join("\n");
+}
+
+function mdCell(value: string): string {
+  return value.replace(/[\r\n|`]/g, " ");
 }
 
 export function receiptSvg(summary: Summary): string {

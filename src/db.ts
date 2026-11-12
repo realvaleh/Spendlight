@@ -249,6 +249,12 @@ export function listRecent(db: Db, limit = 50, project?: string, model?: string,
   return rows.map(normalizeRow);
 }
 
+/** One ledger row by primary key, or null when that id was never logged. */
+export function getRequest(db: Db, id: string): LedgerRow | null {
+  const row = db.prepare(`SELECT ${REQUEST_COLUMNS} FROM requests WHERE id = ?`).get(id) as LedgerRow | undefined;
+  return row ? normalizeRow(row) : null;
+}
+
 /** Ledger rows, oldest first, for CSV export. Pass a project, model, and/or time range to export one slice. */
 export function listRequests(db: Db, project?: string, model?: string, range?: CreatedRange | null): LedgerRow[] {
   const { clause, args } = requestWhere({ project, model }, range);
