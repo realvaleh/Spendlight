@@ -332,6 +332,12 @@ async function main(): Promise<void> {
     assert(dash.includes("highest cost first"), "dashboard should order expensive requests by cost");
     assert(dash.includes('id="top-requests"'), "dashboard missing most-expensive mount");
     assert(dash.includes("s.topRequests"), "dashboard should render topRequests");
+    assert(dash.includes("function requestLinks"), "dashboard missing per-request receipt links");
+    assert(
+      dash.includes('href="/requests/\' + encodeURIComponent(id) + \'.md"'),
+      "dashboard receipt links should target /requests/:id.md",
+    );
+    assert((dash.split("requestLinks(r.id)").length - 1) === 2, "most expensive and recent rows should both link a receipt");
 
     const models = await fetch(`${base}/v1/models`);
     assert(models.status === 200, `pass-through /v1/models failed (${models.status})`);
@@ -364,8 +370,9 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testRequestReceipt(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, request receipts");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2743,6 +2750,173 @@ async function testTopRequests(dir: string, mockUrl: string): Promise<void> {
       assert(lifetime.scopeSince == null, "unscoped summary picked up window=current");
     },
   );
+}
+
+async function testRequestReceipt(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "request-receipt", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
+    const missing = await fetch(`${base}/api/requests/missing`);
+    const missingText = await missing.text();
+    assert(missing.status === 404, `missing json ${missing.status}: ${missingText}`);
+    assert((missing.headers.get("content-type") ?? "").includes("application/json"), "missing json content-type");
+    const missingBody = JSON.parse(missingText) as { error?: { message?: string; type?: string; param?: string; code?: string } };
+    assert(missingBody.error?.code === "request_not_found", missingText);
+    assert(missingBody.error?.type === "invalid_request_error", missingText);
+    assert(missingBody.error?.param === "id", missingText);
+    assert(!missingText.includes("promptTokens"), "404 leaked a ledger row");
+
+    const missingMd = await fetch(`${base}/requests/missing.md`);
+    const missingMdText = await missingMd.text();
+    assert(missingMd.status === 404, `missing md ${missingMd.status}: ${missingMdText}`);
+    assert((missingMd.headers.get("content-type") ?? "").includes("application/json"), "missing markdown should stay JSON");
+    const missingMdBody = JSON.parse(missingMdText) as { error?: { code?: string } };
+    assert(missingMdBody.error?.code === "request_not_found", missingMdText);
+
+    const badEncoding = await fetch(`${base}/api/requests/%E0%A4%A`);
+    const badEncodingText = await badEncoding.text();
+    assert(badEncoding.status === 400, `bad encoding ${badEncoding.status}: ${badEncodingText}`);
+    const badEncodingBody = JSON.parse(badEncodingText) as { error?: { code?: string; type?: string; param?: string } };
+    assert(badEncodingBody.error?.code === "invalid_request_id", badEncodingText);
+    assert(badEncodingBody.error?.type === "invalid_request_error", badEncodingText);
+    assert(badEncodingBody.error?.param === "id", badEncodingText);
+
+    const slashed = await fetch(`${base}/api/requests/a%2Fb`);
+    const slashedText = await slashed.text();
+    assert(slashed.status === 400, `slash id ${slashed.status}: ${slashedText}`);
+    assert((JSON.parse(slashedText) as { error?: { code?: string } }).error?.code === "invalid_request_id", slashedText);
+
+    const dotted = await fetch(`${base}/requests/%2E%2E.md`);
+    const dottedText = await dotted.text();
+    assert(dotted.status === 400, `dotdot id ${dotted.status}: ${dottedText}`);
+    assert((JSON.parse(dottedText) as { error?: { code?: string } }).error?.code === "invalid_request_id", dottedText);
+    const singleDot = await fetch(`${base}/requests/%2E.md`);
+    const singleDotText = await singleDot.text();
+    assert(singleDot.status === 400, `dot id ${singleDot.status}: ${singleDotText}`);
+    assert((JSON.parse(singleDotText) as { error?: { code?: string } }).error?.code === "invalid_request_id", singleDotText);
+    const control = await fetch(`${base}/api/requests/%00abc`);
+    const controlText = await control.text();
+    assert(control.status === 400, `control id ${control.status}: ${controlText}`);
+    assert((JSON.parse(controlText) as { error?: { code?: string } }).error?.code === "invalid_request_id", controlText);
+
+    const tooLong = "a".repeat(201);
+    const longRes = await fetch(`${base}/api/requests/${tooLong}`);
+    const longText = await longRes.text();
+    assert(longRes.status === 400, `long id ${longRes.status}: ${longText.slice(0, 180)}`);
+    assert((JSON.parse(longText) as { error?: { code?: string } }).error?.code === "invalid_request_id", longText.slice(0, 240));
+
+    const collection = await fetch(`${base}/api/requests`);
+    const collectionText = await collection.text();
+    assert(collection.status === 404, `collection ${collection.status}: ${collectionText}`);
+    assert(!collectionText.includes("request_not_found"), "a bare /api/requests should stay the generic 404");
+
+    const posted = await fetch(`${base}/api/requests/missing`, { method: "POST" });
+    assert(posted.status === 404, `post lookup ${posted.status}`);
+
+    insertRequest(app.db, {
+      id: "req 1",
+      createdAt: "2026-10-04T15:04:00.000Z",
+      project: "demo",
+      model: "gpt-4o-mini",
+      usage: { promptTokens: 1200, completionTokens: 30, cachedTokens: 4, totalTokens: 1230 },
+      costUsd: 0.045,
+      status: 200,
+      error: null,
+      upstreamId: "chatcmpl-demo",
+      path: "/v1/chat/completions",
+      streamed: false,
+    });
+    insertRequest(app.db, {
+      id: "other",
+      createdAt: "2026-10-05T00:00:00.000Z",
+      project: "zeta",
+      model: "gpt-4o",
+      usage: { promptTokens: 1, completionTokens: 1, cachedTokens: 0, totalTokens: 2 },
+      costUsd: 9,
+      status: 500,
+      error: "upstream | blew\nup",
+      upstreamId: null,
+      path: "/v1/chat/completions",
+      streamed: true,
+    });
+    insertRequest(app.db, {
+      id: "100%",
+      createdAt: "2026-10-06T00:00:00.000Z",
+      project: "pct",
+      model: "gpt-4o-mini",
+      usage: { promptTokens: 1, completionTokens: 0, cachedTokens: 0, totalTokens: 1 },
+      costUsd: 0.01,
+      status: 200,
+      path: "/v1/chat/completions",
+    });
+
+    const before = await summaryOf(base);
+    const found = await fetch(`${base}/api/requests/${encodeURIComponent("req 1")}?project=zeta`);
+    const foundText = await found.text();
+    assert(found.status === 200, `found json ${found.status}: ${foundText}`);
+    assert((found.headers.get("content-type") ?? "").includes("application/json"), "request json content-type");
+    const row = JSON.parse(foundText) as {
+      id: string;
+      createdAt: string;
+      project: string;
+      model: string;
+      promptTokens: number;
+      completionTokens: number;
+      cachedTokens: number;
+      totalTokens: number;
+      costUsd: number;
+      status: number;
+      error: string | null;
+      upstreamId: string | null;
+      path: string;
+      streamed: number;
+    };
+    assert(row.id === "req 1", `id ${row.id}`);
+    assert(row.createdAt === "2026-10-04T15:04:00.000Z", row.createdAt);
+    assert(row.project === "demo" && row.model === "gpt-4o-mini", `${row.project} ${row.model}`);
+    assert(row.promptTokens === 1200 && row.completionTokens === 30 && row.cachedTokens === 4, foundText);
+    assert(row.totalTokens === 1230, `tokens ${row.totalTokens}`);
+    assert(Math.abs(row.costUsd - 0.045) < 1e-9, `cost ${row.costUsd}`);
+    assert(row.status === 200 && row.error === null && row.upstreamId === "chatcmpl-demo", foundText);
+    assert(row.path === "/v1/chat/completions" && row.streamed === 0, foundText);
+    assert(!foundText.includes("zeta"), "project filter leaked into a request lookup");
+
+    const mdRes = await fetch(`${base}/requests/${encodeURIComponent("req 1")}.md`);
+    const md = await mdRes.text();
+    assert(mdRes.status === 200, `md ${mdRes.status}: ${md}`);
+    assert((mdRes.headers.get("content-type") ?? "").includes("text/markdown"), mdRes.headers.get("content-type") ?? "");
+    assert(md.startsWith("# Spendlight request receipt\n"), md);
+    assert(md.includes("| Project | demo |"), md);
+    assert(md.includes("| Model | `gpt-4o-mini` |"), md);
+    assert(md.includes("| Estimated cost | $0.0450 |"), md);
+    assert(md.includes("| Total tokens | 1,230 |"), md);
+    assert(md.includes("| Upstream id | `chatcmpl-demo` |"), md);
+    assert(md.includes("| Streamed | no |"), md);
+    assert(md.includes("| Error | — |"), md);
+    assert(!md.includes("zeta"), "request receipt included another row");
+    assert(!md.includes("Most expensive"), "request receipt grew a summary section");
+
+    const failedMd = await fetch(`${base}/requests/other.md`).then((r) => r.text());
+    assert(failedMd.includes("| Status | 500 |"), failedMd);
+    assert(failedMd.includes("| Streamed | yes |"), failedMd);
+    assert(failedMd.includes("| Estimated cost | $9.00 |"), failedMd);
+    assert(failedMd.includes("| Error | upstream   blew up |"), failedMd);
+    assert(!failedMd.includes("upstream | blew"), "error pipe broke the markdown table");
+    assert(!failedMd.includes("\nup |"), failedMd);
+    assert(!failedMd.includes("demo"), "failed receipt included the other request");
+
+    const encoded = await fetch(`${base}/api/requests/${encodeURIComponent("100%")}`);
+    const encodedText = await encoded.text();
+    assert(encoded.status === 200, `percent id ${encoded.status}: ${encodedText}`);
+    assert((JSON.parse(encodedText) as { id?: string; project?: string }).id === "100%", encodedText);
+    assert((JSON.parse(encodedText) as { project?: string }).project === "pct", encodedText);
+    const encodedMd = await fetch(`${base}/requests/${encodeURIComponent("100%")}.md`);
+    const encodedMdText = await encodedMd.text();
+    assert(encodedMd.status === 200 && encodedMdText.includes("| Id | `100%` |"), encodedMdText);
+
+    const after = await summaryOf(base);
+    assert(after.requests === before.requests && after.requests === 3, `lookup changed the ledger count ${after.requests}`);
+    assert(Math.abs(after.spendUsd - before.spendUsd) < 1e-9, "lookup changed spend");
+    assert(Math.abs(after.budget.globalSpend - before.budget.globalSpend) < 1e-9, "lookup changed the kill-switch");
+  });
 }
 
 async function expectRange400(url: string, param: string | null, snippet: string): Promise<void> {

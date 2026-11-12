@@ -188,7 +188,7 @@ Env:
   SPENDLIGHT_BUDGET_PERIOD       lifetime (default), day, week, or month
   SPENDLIGHT_BUDGET_TIMEZONE     IANA zone when period is day, week, or month (e.g. America/New_York)
 
-Bind to 127.0.0.1 (the default). The dashboard, receipts, and /api/summary have no auth.
+Bind to 127.0.0.1 (the default). The dashboard, receipts, /api/summary, and /api/requests/:id have no auth.
 `;
 
 /** http(s) only; strips userinfo so keys in the URL cannot leak via logs or fetch. */

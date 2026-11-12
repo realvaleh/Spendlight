@@ -16,7 +16,7 @@ A single Node process that:
 2. Forwards to any OpenAI-compatible upstream (`OPENAI_BASE_URL` + `OPENAI_API_KEY`).
 3. Writes a spend ledger (model, tokens, estimated USD, project tag, timestamp, request id).
 4. Warns on a **soft** budget and rejects further mutating `/v1` calls with **402** when a **hard** budget is hit.
-5. Serves a one-page dashboard, Markdown + SVG receipts, and a README badge.
+5. Serves a one-page dashboard, Markdown + SVG receipts, a receipt for one logged request, and a README badge.
 
 ## What it isn’t (v1 non-goals)
 
@@ -39,6 +39,8 @@ A single Node process that:
   │  /api/export.csv   spend ledger CSV      │
   │  /api/export.json  spend ledger JSON     │
   │  /receipt.md .svg  shareable receipts    │
+  │  /requests/:id.md  one-request receipt   │
+  │  /api/requests/:id one ledger row        │
   │  /badge.svg        README badge          │
   │  /v1/*             reverse proxy         │
   │        │                                 │
@@ -239,11 +241,13 @@ HTTP status is **402**. Clients choose the project tag; a global hard cap is the
 
 | URL | What |
 | --- | --- |
-| `/` | Dashboard (spend, budgets, spend by day, project and model pairs, most expensive requests, recent requests) |
+| `/` | Dashboard (spend, budgets, spend by day, project and model pairs, most expensive requests, recent requests, a receipt link on each of those rows) |
 | `/receipt.md` | Markdown receipt (`?project=`, `?model=`, optional `?since=` / `?until=` / `?window=current`) |
 | `/receipt.svg` | Paper-style SVG receipt (same scope parameters as the markdown receipt) |
+| `/requests/:id.md` | Markdown receipt for one logged request |
 | `/badge.svg` | Shields-style badge for a local README (`?project=` or `?model=`; time parameters are ignored) |
 | `/api/summary` | JSON for the same numbers (same scope parameters as the receipts) |
+| `/api/requests/:id` | That one ledger row as JSON |
 | `/api/export.csv` | Spend ledger as CSV (same scope parameters as the receipts) |
 | `/api/export.json` | Same filtered ledger rows as the CSV, as a JSON array |
 | `/health` | Liveness |
@@ -289,7 +293,14 @@ Quiet days inside the covered span are included, with `spendUsd: 0` and `request
 
 `/api/summary` also adds `byProjectModel`: one object per project and model pair inside those same filters, highest spend first. Each object is `{ "project": "<tag>", "model": "<id>", "spendUsd": <number>, "requests": <number>, "tokens": <number> }`. Equal spend is ordered by project tag, then model id. A project-scoped summary lists only that tag's models, and a model-scoped summary lists only the projects that used it. The array is empty when nothing matches. `byProject` and `byModel` are unchanged. The dashboard **By project and model** card lists the pairs and links each one to its Markdown receipt, SVG receipt, CSV, and JSON via `project=<tag>&model=<id>`.
 
-`/api/summary` also adds `topRequests`: up to ten ledger rows inside those same filters, highest `costUsd` first. Each object is a request row, the same shape as `recent` (`id`, `createdAt`, `project`, `model`, token counts, `costUsd`, `status`, `error`, `upstreamId`, `path`, `streamed`). Equal cost is ordered by `createdAt` descending, then `id` ascending. Fewer than ten matches returns every match, and a miss is `[]`. Failed and streamed rows stay in the ranking. `recent` is still the latest requests, newest first. The dashboard **Most expensive** card lists this ranking, with a bar under each cost.
+`/api/summary` also adds `topRequests`: up to ten ledger rows inside those same filters, highest `costUsd` first. Each object is a request row, the same shape as `recent` (`id`, `createdAt`, `project`, `model`, token counts, `costUsd`, `status`, `error`, `upstreamId`, `path`, `streamed`). Equal cost is ordered by `createdAt` descending, then `id` ascending. Fewer than ten matches returns every match, and a miss is `[]`. Failed and streamed rows stay in the ranking. `recent` is still the latest requests, newest first. The dashboard **Most expensive** card lists this ranking, with a bar under each cost. Each row in **Most expensive** and **Recent requests** links to that request's receipt.
+
+`/api/requests/<id>` returns that one ledger row, the same object shape as an entry in `recent` or `topRequests`. `/requests/<id>.md` is a Markdown receipt for the same row: id, time, project, model, path, status, whether it streamed, token counts, estimated cost, upstream id, and error. Both ignore `project`, `model`, `since`, `until`, and `window` — the id is the whole lookup, so a `?project=` on the JSON URL does not hide the row. An unknown id is a 404 JSON error (`invalid_request_error` / `request_not_found`). A segment that does not percent-decode, is empty after decoding, is `.` or `..`, is longer than 200 characters, or contains a slash, backslash, or control character is a 400 (`invalid_request_id`). Browsers resolve a `.` or `..` path segment before the request is sent, so `/api/requests/..` is the generic 404 rather than that 400. A missing receipt uses the same JSON errors. Looking up a row does not change spend or the kill-switch.
+
+```bash
+curl -s http://127.0.0.1:8787/api/requests/REQUEST_ID
+curl -s http://127.0.0.1:8787/requests/REQUEST_ID.md
+```
 
 ```bash
 curl -s "http://127.0.0.1:8787/api/export.csv?since=2026-10-01&until=2026-10-05" -o october-week.csv
@@ -313,7 +324,7 @@ Streaming chat completions: Spendlight sets `stream_options.include_usage` so a 
 
 Spendlight is a **localhost reverse proxy that can spend your API key**. Treat the bind address like a secret.
 
-- **Bind localhost.** Default `SPENDLIGHT_HOST=127.0.0.1`. Docker Compose publishes `127.0.0.1:8787`. Do not put this on `0.0.0.0` / the public internet. The dashboard, receipts, badge, `/api/summary`, `/api/export.csv`, and `/api/export.json` have **no auth**.
+- **Bind localhost.** Default `SPENDLIGHT_HOST=127.0.0.1`. Docker Compose publishes `127.0.0.1:8787`. Do not put this on `0.0.0.0` / the public internet. The dashboard, receipts, badge, `/api/summary`, `/api/requests/:id`, `/requests/:id.md`, `/api/export.csv`, and `/api/export.json` have **no auth**.
 - **API keys.** If `OPENAI_API_KEY` is set, any client that can reach the proxy and omits `Authorization` uses your key. If the client sends `Authorization`, that value is forwarded instead. Keys are not written to the ledger or stdout. Prefer the env var over `upstream.apiKey` in JSON (do not commit keys).
 - **Trust model.** Anyone who can talk to the port is trusted: they can complete, retag projects, and read spend. Project tags are labels, not ACLs. CORS is allowed only from `http(s)://127.0.0.1`, `localhost`, and `::1` so a random website cannot drive the proxy from the browser.
 - **Upstream URL.** `OPENAI_BASE_URL` is operator-controlled (http/https only). Clients cannot pick a different host. Do not point it at arbitrary internal URLs.

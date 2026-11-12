@@ -328,7 +328,7 @@ export function dashboardHtml(): string {
       const top = table(
         [{label:"When"},{label:"Project"},{label:"Model"},{label:"Tokens",num:true},{label:"Cost",num:true}],
         ranked.map(r => [
-          new Date(r.createdAt).toLocaleString(),
+          new Date(r.createdAt).toLocaleString() + requestLinks(r.id),
           esc(r.project),
           "<code>" + esc(r.model) + "</code>",
           fmtInt(r.totalTokens),
@@ -340,7 +340,7 @@ export function dashboardHtml(): string {
       const recent = table(
         [{label:"When"},{label:"Project"},{label:"Model"},{label:"Tokens",num:true},{label:"Cost",num:true}],
         s.recent.map(r => [
-          new Date(r.createdAt).toLocaleString(),
+          new Date(r.createdAt).toLocaleString() + requestLinks(r.id),
           esc(r.project),
           "<code>" + esc(r.model) + "</code>",
           fmtInt(r.totalTokens),
@@ -351,6 +351,11 @@ export function dashboardHtml(): string {
       $("events").innerHTML = s.events.length
         ? s.events.map(e => "<li><strong>" + esc(e.type) + "</strong> · " + esc(e.project) + " · " + esc(e.message) + "</li>").join("")
         : '<li class="empty" style="border:0;padding-left:0">None yet.</li>';
+    }
+    function requestLinks(id) {
+      return '<div class="proj-links">' +
+        '<a class="btn mini" href="/requests/' + encodeURIComponent(id) + '.md">Receipt</a>' +
+        '</div>';
     }
     function projectLinks(name) {
       const q = encodeURIComponent(name);

@@ -1,9 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Config, LedgerRow, Summary } from "./types.js";
-import { closeDb, listRequests, loadSummaryParts, openDb, spendMatching, type CreatedRange, type Db } from "./db.js";
+import { closeDb, getRequest, listRequests, loadSummaryParts, openDb, spendMatching, type CreatedRange, type Db } from "./db.js";
 import { evaluateBudget, spendWindow } from "./budget.js";
 import { dashboardHtml, FAVICON_SVG } from "./ui.js";
-import { badgeSvg, receiptMarkdown, receiptSvg } from "./receipts.js";
+import { badgeSvg, receiptMarkdown, receiptSvg, requestReceiptMarkdown } from "./receipts.js";
 import { proxyRequest, corsHeaders, normalizeModelId, normalizeProjectTag } from "./proxy.js";
 import { parseExportRange, type ParsedExportRange } from "./range.js";
 
@@ -58,6 +58,9 @@ export function listen(app: App): Promise<string> {
   });
 }
 
+const REQUEST_JSON_PATH = /^\/api\/requests\/([^/]+)$/;
+const REQUEST_MD_PATH = /^\/requests\/([^/]+)\.md$/;
+
 async function handle(req: IncomingMessage, res: ServerResponse, config: Config, db: Db): Promise<void> {
   const host = req.headers.host ?? `${config.host}:${config.port}`;
   const url = new URL(req.url ?? "/", `http://${host}`);
@@ -111,6 +114,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: Config,
     res.setHeader("cache-control", "no-cache");
     return send(res, 200, "image/svg+xml; charset=utf-8", badgeSvg(summaryFor(db, config, url)), req);
   }
+  const requestJson = REQUEST_JSON_PATH.exec(url.pathname);
+  if (req.method === "GET" && requestJson?.[1]) {
+    return sendRequestLookup(res, req, db, requestJson[1], "json");
+  }
+  const requestMd = REQUEST_MD_PATH.exec(url.pathname);
+  if (req.method === "GET" && requestMd?.[1]) {
+    return sendRequestLookup(res, req, db, requestMd[1], "markdown");
+  }
 
   if (url.pathname.startsWith("/v1/") || url.pathname === "/v1") {
     await proxyRequest(req, res, config, db, url);
@@ -141,6 +152,58 @@ export function buildSummary(
     scopeUntil: range?.untilIso ?? null,
     scopeWindowSpend,
     budget,
+  };
+}
+
+/** One ledger id. Rejects traversal-shaped and oversized segments before the query. */
+function matchRequestId(segment: string): { ok: true; id: string } | { ok: false; message: string } {
+  let id: string;
+  try {
+    id = decodeURIComponent(segment);
+  } catch {
+    return { ok: false, message: "Request id is not valid percent-encoding." };
+  }
+  if (id.length < 1 || id.length > 200 || id === "." || id === ".." || /[\u0000-\u001f\u007f/\\]/.test(id)) {
+    return {
+      ok: false,
+      message: "Request id must be one path segment of 1 to 200 characters, without slashes or control characters.",
+    };
+  }
+  return { ok: true, id };
+}
+
+function sendRequestLookup(
+  res: ServerResponse,
+  req: IncomingMessage,
+  db: Db,
+  segment: string,
+  format: "json" | "markdown",
+): void {
+  const matched = matchRequestId(segment);
+  if (!matched.ok) {
+    sendJson(res, 400, requestIdError(matched.message, "invalid_request_id"), req);
+    return;
+  }
+  const row = getRequest(db, matched.id);
+  if (!row) {
+    sendJson(res, 404, requestIdError("No ledger row with that id.", "request_not_found"), req);
+    return;
+  }
+  if (format === "json") {
+    sendJson(res, 200, row, req);
+    return;
+  }
+  send(res, 200, "text/markdown; charset=utf-8", requestReceiptMarkdown(row), req);
+}
+
+function requestIdError(message: string, code: "invalid_request_id" | "request_not_found") {
+  return {
+    error: {
+      message,
+      type: "invalid_request_error",
+      param: "id",
+      code,
+    },
   };
 }
 
