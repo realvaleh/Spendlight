@@ -78,7 +78,7 @@ export OPENAI_API_KEY=sk-...
 docker compose up --build
 ```
 
-Compose publishes **localhost only** (`127.0.0.1:8787`). Inside the container Spendlight still listens on `0.0.0.0` so the published port works. The image and Compose file healthcheck `GET /health` on port 8787.
+Compose publishes **localhost only** (`127.0.0.1:8787`). Inside the container Spendlight still listens on `0.0.0.0` so the published port works. The startup log prints `http://127.0.0.1:8787` for that wildcard bind (`0.0.0.0` or `::`), because `http://0.0.0.0:8787` is not a URL you can open. A specific IPv6 address is printed in brackets, for example `http://[::1]:8787`. The image and Compose file healthcheck `GET /health` on port 8787.
 
 ```bash
 docker build -t spendlight . && docker run --rm -p 127.0.0.1:8787:8787 \
