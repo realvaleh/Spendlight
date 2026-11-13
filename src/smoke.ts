@@ -6,7 +6,7 @@ import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
 import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
-import { createApp, listen, type App } from "./server.js";
+import { createApp, formatListenUrl, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
@@ -79,6 +79,7 @@ async function main(): Promise<void> {
       "https://api.openai.com/v1/evil.example/x",
     "protocol-relative join must not escape upstream host",
   );
+  await testListenUrls();
 
   const dir = mkdtempSync(join(tmpdir(), "spendlight-smoke-"));
   const dbPath = join(dir, "ledger.db");
@@ -2820,6 +2821,84 @@ function writeStream(res: ServerResponse): void {
     if (!res.writableEnded) res.end();
   } catch {
     // The proxy closes the upstream once the hard cap is hit.
+  }
+}
+
+/** Wildcard binds stay wildcard; the URL listen() returns is one fetch can open. */
+async function testListenUrls(): Promise<void> {
+  assert(formatListenUrl("127.0.0.1", 8787) === "http://127.0.0.1:8787", "loopback url");
+  assert(formatListenUrl("localhost", 8787) === "http://localhost:8787", "hostname url");
+  assert(formatListenUrl("0.0.0.0", 8787) === "http://127.0.0.1:8787", "ipv4 wildcard should log loopback");
+  assert(formatListenUrl("::", 8787) === "http://127.0.0.1:8787", "ipv6 wildcard should log loopback");
+  assert(formatListenUrl("[::]", 8787) === "http://127.0.0.1:8787", "bracketed ipv6 wildcard should log loopback");
+  assert(formatListenUrl("*", 9) === "http://127.0.0.1:9", "star bind should log loopback");
+  assert(formatListenUrl("::1", 8787) === "http://[::1]:8787", "ipv6 loopback needs brackets");
+  assert(formatListenUrl("[::1]", 8787) === "http://[::1]:8787", "already bracketed ipv6 stays one pair");
+  assert(formatListenUrl("2001:db8::1", 8787) === "http://[2001:db8::1]:8787", "ipv6 literal needs brackets");
+
+  const savedHost = process.env.SPENDLIGHT_HOST;
+  const savedPort = process.env.SPENDLIGHT_PORT;
+  const savedDb = process.env.SPENDLIGHT_DB;
+  const savedConfig = process.env.SPENDLIGHT_CONFIG;
+  delete process.env.SPENDLIGHT_HOST;
+  delete process.env.SPENDLIGHT_PORT;
+  delete process.env.SPENDLIGHT_DB;
+  delete process.env.SPENDLIGHT_CONFIG;
+
+  const dir = mkdtempSync(join(tmpdir(), "spendlight-listen-"));
+  try {
+    for (const host of ["127.0.0.1", "0.0.0.0", "::", "::1"]) {
+      await assertBoundListenUrl(dir, host);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedHost === undefined) delete process.env.SPENDLIGHT_HOST;
+    else process.env.SPENDLIGHT_HOST = savedHost;
+    if (savedPort === undefined) delete process.env.SPENDLIGHT_PORT;
+    else process.env.SPENDLIGHT_PORT = savedPort;
+    if (savedDb === undefined) delete process.env.SPENDLIGHT_DB;
+    else process.env.SPENDLIGHT_DB = savedDb;
+    if (savedConfig === undefined) delete process.env.SPENDLIGHT_CONFIG;
+    else process.env.SPENDLIGHT_CONFIG = savedConfig;
+  }
+}
+
+async function assertBoundListenUrl(dir: string, host: string): Promise<void> {
+  const slug = host.replace(/[^A-Za-z0-9]+/g, "_");
+  const configPath = join(dir, `listen-${slug}.json`);
+  const dbPath = join(dir, `listen-${slug}.db`);
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      host,
+      port: 0,
+      dbPath,
+      upstream: { baseUrl: "http://127.0.0.1:9/v1" },
+    }),
+  );
+  const config = loadConfig(configPath);
+  config.port = 0;
+  assert(config.host === host, `config host ${config.host} !== ${host}`);
+  const app = createApp(config);
+  try {
+    const base = await listen(app);
+    const addr = app.server.address();
+    assert(addr && typeof addr === "object", `${host} did not bind`);
+    assert(addr.address === host, `${host} bound as ${addr.address}`);
+    const expected = formatListenUrl(addr.address, addr.port);
+    assert(base === expected, `${host} listen URL ${base} !== ${expected}`);
+    if (host === "0.0.0.0" || host === "::") {
+      assert(base === `http://127.0.0.1:${addr.port}`, `${host} should log loopback, got ${base}`);
+    }
+    if (host === "::1") {
+      assert(base === `http://[::1]:${addr.port}`, `ipv6 loopback url ${base}`);
+    }
+    const res = await fetch(`${base}/health`);
+    const body = (await res.json()) as { ok?: boolean; service?: string };
+    assert(res.status === 200, `${host} health ${res.status} via ${base}`);
+    assert(body.ok === true && body.service === "spendlight", `${host} health body ${JSON.stringify(body)}`);
+  } finally {
+    await app.close();
   }
 }
 

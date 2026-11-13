@@ -43,16 +43,36 @@ export function createApp(config: Config): App {
   };
 }
 
+/**
+ * URL printed at startup and returned by {@link listen}.
+ * Wildcard binds (`0.0.0.0`, `::`) stay on all interfaces, but those addresses
+ * are not hosts a browser can open, so the URL uses `127.0.0.1`. Any other
+ * IPv6 address is wrapped in brackets (`http://[::1]:8787`).
+ */
+export function formatListenUrl(host: string, port: number): string {
+  const reachable = isUnreachableBindHost(host) ? "127.0.0.1" : host;
+  return `http://${bracketHost(reachable)}:${port}`;
+}
+
+function isUnreachableBindHost(host: string): boolean {
+  return host === "0.0.0.0" || host === "::" || host === "[::]" || host === "*";
+}
+
+function bracketHost(host: string): string {
+  if (host.startsWith("[") && host.endsWith("]")) return host;
+  if (host.includes(":")) return `[${host}]`;
+  return host;
+}
+
 export function listen(app: App): Promise<string> {
   return new Promise((resolve, reject) => {
     app.server.once("error", reject);
     app.server.listen(app.config.port, app.config.host, () => {
       const addr = app.server.address();
       if (addr && typeof addr === "object") {
-        const host = addr.address === "::" ? "127.0.0.1" : addr.address;
-        resolve(`http://${host}:${addr.port}`);
+        resolve(formatListenUrl(addr.address, addr.port));
       } else {
-        resolve(`http://${app.config.host}:${app.config.port}`);
+        resolve(formatListenUrl(app.config.host, app.config.port));
       }
     });
   });
