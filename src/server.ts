@@ -281,8 +281,20 @@ export function ledgerCsv(rows: LedgerRow[]): string {
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * Spreadsheet apps treat a text cell that starts with `=`, `+`, `-`, `@`,
+ * a tab, or a carriage return as a formula (CSV injection). A leading
+ * apostrophe keeps the characters and stops evaluation. Spaces, tabs, or
+ * carriage returns in front of `=`, `+`, `-`, or `@` count too.
+ * Numeric cells are left alone, so a negative cost stays a number.
+ */
+function neutralizeSpreadsheetFormula(text: string): string {
+  if (/^[\t\r ]*[=+\-@]/.test(text) || /^[\t\r]/.test(text)) return `'${text}`;
+  return text;
+}
+
 function csvCell(value: string | number): string {
-  const text = String(value);
+  const text = typeof value === "string" ? neutralizeSpreadsheetFormula(value) : String(value);
   if (/[",\r\n]/.test(text)) return `"${text.replaceAll('"', '""')}"`;
   return text;
 }
