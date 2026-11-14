@@ -6,7 +6,7 @@ import { admitMutating, evaluateBudget, spendWindow } from "./budget.js";
 import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } from "./config.js";
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
-import { createApp, listen, type App } from "./server.js";
+import { createApp, ledgerCsv, ledgerJson, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
@@ -36,6 +36,7 @@ function assert(cond: unknown, message: string): asserts cond {
 }
 
 async function main(): Promise<void> {
+  testCsvFormulaCells();
   const cost = estimateCostUsd(
     "gpt-4o-mini",
     { promptTokens: 100_000, completionTokens: 50_000, cachedTokens: 0, totalTokens: 150_000 },
@@ -2791,6 +2792,120 @@ async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise
     const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
     assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
   });
+}
+
+function testCsvFormulaCells(): void {
+  const base = {
+    createdAt: "2026-10-01T00:00:00.000Z",
+    promptTokens: 1,
+    completionTokens: 2,
+    cachedTokens: 0,
+    totalTokens: 3,
+    status: 200,
+    upstreamId: null,
+    path: "/v1/chat/completions",
+    streamed: 0,
+  };
+  const formula = csvLines(
+    ledgerCsv([
+      {
+        ...base,
+        id: "formula",
+        project: "-2+3",
+        model: "=1+1",
+        costUsd: -0.25,
+        error: "+cmd|' /C calc'!A0",
+      },
+    ]),
+  );
+  assert(
+    formula[0] ===
+      "timestamp,project,model,promptTokens,completionTokens,cachedTokens,totalTokens,costUsd,streamed,id,error",
+    "csv header changed",
+  );
+  assert(
+    formula[1] ===
+      "2026-10-01T00:00:00.000Z,'-2+3,'=1+1,1,2,0,3,-0.25,0,formula,'+cmd|' /C calc'!A0",
+    formula[1] ?? "missing formula row",
+  );
+
+  const quoted = csvLines(
+    ledgerCsv([
+      {
+        ...base,
+        id: "quoted",
+        project: "demo",
+        model: '=HYPERLINK("http://evil.example")',
+        costUsd: 1.5,
+        error: " =1,2",
+      },
+    ]),
+  );
+  assert(
+    quoted[1] ===
+      '2026-10-01T00:00:00.000Z,demo,"\'=HYPERLINK(""http://evil.example"")",1,2,0,3,1.5,0,quoted,"\' =1,2"',
+    quoted[1] ?? "missing quoted formula row",
+  );
+
+  const plain = csvLines(
+    ledgerCsv([
+      {
+        ...base,
+        id: "plain",
+        createdAt: "2026-10-02T00:00:00.000Z",
+        project: "demo",
+        model: "gpt-4o-mini",
+        costUsd: 1.5,
+        error: "upstream timeout, retry",
+      },
+    ]),
+  );
+  assert(
+    plain[1] ===
+      '2026-10-02T00:00:00.000Z,demo,gpt-4o-mini,1,2,0,3,1.5,0,plain,"upstream timeout, retry"',
+    plain[1] ?? "missing plain row",
+  );
+
+  const tab = csvLines(
+    ledgerCsv([
+      {
+        ...base,
+        id: "tab",
+        project: "demo",
+        model: "@SUM(A1)",
+        costUsd: 0,
+        error: "\t=1+1",
+      },
+    ]),
+  );
+  assert(tab[1] === "2026-10-01T00:00:00.000Z,demo,'@SUM(A1),1,2,0,3,0,0,tab,'\t=1+1", tab[1] ?? "missing tab row");
+
+  const cr = ledgerCsv([
+    {
+      ...base,
+      id: "cr",
+      project: "demo",
+      model: "gpt-4o-mini",
+      costUsd: 0,
+      error: "\r=1+1",
+    },
+  ]);
+  assert(cr.includes('"\'\r=1+1"'), cr);
+
+  const json = ledgerJson([
+    {
+      ...base,
+      id: "formula",
+      project: "-2+3",
+      model: "=1+1",
+      costUsd: -0.25,
+      error: "+cmd",
+    },
+  ]);
+  assert(json[0]?.model === "=1+1", "json should keep the raw model id");
+  assert(json[0]?.project === "-2+3", "json should keep the raw project");
+  assert(json[0]?.error === "+cmd", "json should keep the raw error");
+  assert(json[0]?.costUsd === -0.25, `json cost ${json[0]?.costUsd}`);
 }
 
 function readReq(req: IncomingMessage): Promise<string> {
