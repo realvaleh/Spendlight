@@ -36,6 +36,24 @@ export async function proxyRequest(
   db: Db,
   url: URL,
 ): Promise<void> {
+  if (isMutating(req.method ?? "GET") && hasForeignOrigin(req)) {
+    json(
+      res,
+      403,
+      {
+        error: {
+          message:
+            "Spendlight refused this request because its Origin is not local. Another website cannot spend the upstream API key. Non-browser clients should omit Origin. Browser calls must come from 127.0.0.1, localhost, or [::1].",
+          type: "spendlight_error",
+          code: "foreign_origin",
+        },
+      },
+      {},
+      req,
+    );
+    return;
+  }
+
   const rawBody = await readBody(req);
   const project = resolveProject(req, url, rawBody);
   const priced = isPricedPath(url.pathname);
@@ -386,14 +404,29 @@ export function corsHeaders(req: IncomingMessage): Record<string, string> {
   };
 }
 
+/**
+ * True for http(s) origins whose host is loopback.
+ * Node reports IPv6 hostname as `[::1]`; a bare `::1` is accepted too.
+ * A single trailing dot (`localhost.`) still matches. Userinfo does not.
+ */
 export function isLocalOrigin(origin: string): boolean {
   try {
     const u = new URL(origin);
     if (u.protocol !== "http:" && u.protocol !== "https:") return false;
-    return u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1";
+    if (u.username || u.password) return false;
+    let host = u.hostname.toLowerCase().replace(/\.$/, "");
+    if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+    return host === "127.0.0.1" || host === "localhost" || host === "::1";
   } catch {
     return false;
   }
+}
+
+/** Present Origin that is not loopback. Missing Origin is a non-browser client and is allowed. */
+function hasForeignOrigin(req: IncomingMessage): boolean {
+  const origin = headerVal(req, "origin");
+  if (origin == null || origin.trim() === "") return false;
+  return !isLocalOrigin(origin);
 }
 
 function resolveProject(req: IncomingMessage, url: URL, body: Buffer): string {
