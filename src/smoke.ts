@@ -8,7 +8,7 @@ import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBou
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
-import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
+import { isLocalOrigin, joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
   prompt_tokens: 100_000,
@@ -79,6 +79,16 @@ async function main(): Promise<void> {
       "https://api.openai.com/v1/evil.example/x",
     "protocol-relative join must not escape upstream host",
   );
+  assert(isLocalOrigin("http://127.0.0.1:3000"), "ipv4 loopback origin");
+  assert(isLocalOrigin("https://localhost"), "localhost origin");
+  assert(isLocalOrigin("http://localhost."), "trailing-dot localhost is still local");
+  assert(isLocalOrigin("http://[::1]:8787"), "bracketed ipv6 loopback origin");
+  assert(isLocalOrigin("http://[0:0:0:0:0:0:0:1]/"), "expanded ipv6 loopback origin");
+  assert(!isLocalOrigin("http://127.0.0.1.evil.example"), "loopback suffix is not local");
+  assert(!isLocalOrigin("http://evil.example@127.0.0.1"), "userinfo origin is not local");
+  assert(!isLocalOrigin("https://evil.example"), "foreign origin is not local");
+  assert(!isLocalOrigin("null"), "opaque null origin is not local");
+  assert(!isLocalOrigin("file:///tmp/x"), "non-http origin is not local");
 
   const dir = mkdtempSync(join(tmpdir(), "spendlight-smoke-"));
   const dbPath = join(dir, "ledger.db");
@@ -364,12 +374,106 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testForeignOrigin(dir);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, foreign origin");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
     rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function testForeignOrigin(dir: string): Promise<void> {
+  let hits = 0;
+  const mock = createServer(async (req, res) => {
+    hits += 1;
+    await readReq(req);
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (url.pathname.endsWith("/models")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data: [] }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl-origin",
+        model: "gpt-4o-mini",
+        choices: [{ message: { role: "assistant", content: "ok" } }],
+        usage: SMALL_USAGE,
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => mock.listen(0, "127.0.0.1", resolve));
+  const addr = mock.address();
+  assert(addr && typeof addr === "object", "origin mock failed to bind");
+  const mockUrl = `http://127.0.0.1:${addr.port}/v1`;
+
+  try {
+    await withApp(dir, "foreign-origin", mockUrl, { softUsd: null, hardUsd: 10 }, async (base) => {
+      const blocked = async (origin: string, method = "POST", contentType = "text/plain") => {
+        const before = hits;
+        const response = await fetch(`${base}/v1/chat/completions`, {
+          method,
+          headers: { origin, "content-type": contentType },
+          body:
+            method === "GET" || method === "HEAD"
+              ? undefined
+              : '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}',
+        });
+        const body = (await response.json()) as { error?: { code?: string; type?: string } };
+        assert(response.status === 403, `origin ${origin} ${method} status ${response.status}`);
+        assert(body.error?.code === "foreign_origin", `origin ${origin} code ${body.error?.code}`);
+        assert(body.error?.type === "spendlight_error", `origin ${origin} type ${body.error?.type}`);
+        assert(response.headers.get("access-control-allow-origin") == null, `origin ${origin} must not be reflected`);
+        assert(hits === before, `origin ${origin} reached upstream (${hits - before})`);
+      };
+
+      await blocked("https://evil.example");
+      await blocked("https://evil.example", "POST", "application/json");
+      await blocked("null");
+      await blocked("http://127.0.0.1.evil.example");
+      await blocked("http://evil.example@127.0.0.1");
+      await blocked("https://evil.example", "PUT");
+
+      const allow = async (origin: string | null) => {
+        const headers: Record<string, string> = { "content-type": "application/json" };
+        if (origin) headers.origin = origin;
+        const response = await fetch(`${base}/v1/chat/completions`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "hi" }] }),
+        });
+        const text = await response.text();
+        assert(response.status === 200, `allowed origin ${origin ?? "(none)"} status ${response.status}: ${text}`);
+        if (origin) {
+          assert(
+            response.headers.get("access-control-allow-origin") === origin,
+            `local origin ${origin} should be reflected`,
+          );
+        }
+      };
+
+      const beforeAllow = hits;
+      await allow("http://127.0.0.1:3000");
+      await allow("http://localhost:3000");
+      await allow("http://localhost.");
+      await allow("http://[::1]:3000");
+      await allow(null);
+      assert(hits === beforeAllow + 5, `allowed posts reached upstream ${hits - beforeAllow} times`);
+
+      const models = await fetch(`${base}/v1/models`, { headers: { origin: "https://evil.example" } });
+      assert(models.status === 200, `GET /v1/models with a foreign origin should pass (${models.status})`);
+      assert(models.headers.get("access-control-allow-origin") == null, "foreign GET must not be CORS-allowed");
+      await models.text();
+      assert(hits === beforeAllow + 6, "foreign GET /v1/models should still reach upstream");
+
+      const summary = await summaryOf(base);
+      assert(summary.requests === 5, `foreign-origin blocks should not be logged, got ${summary.requests}`);
+    });
+  } finally {
+    await new Promise<void>((resolve) => mock.close(() => resolve()));
   }
 }
 
