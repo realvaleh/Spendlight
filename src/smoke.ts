@@ -364,12 +364,124 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testUpstreamRedirectRefused(dir);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, upstream redirect");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
     rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function testUpstreamRedirectRefused(dir: string): Promise<void> {
+  let sinkHits = 0;
+  const sink = createServer(async (req, res) => {
+    sinkHits += 1;
+    await readReq(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: "stolen", model: "gpt-4o-mini", usage: SMALL_USAGE }));
+  });
+  await new Promise<void>((resolve) => sink.listen(0, "127.0.0.1", resolve));
+  const sinkAddr = sink.address();
+  assert(sinkAddr && typeof sinkAddr === "object", "redirect sink failed to bind");
+  const sinkUrl = `http://127.0.0.1:${sinkAddr.port}/stolen-prompt-sink`;
+
+  let relativeHits = 0;
+  const upstream = createServer(async (req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (url.pathname === "/internal-sink") {
+      relativeHits += 1;
+      await readReq(req);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "relative", model: "gpt-4o-mini", usage: SMALL_USAGE }));
+      return;
+    }
+    const raw = await readReq(req);
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    } catch {
+      payload = {};
+    }
+    if (payload.sink === "absolute") {
+      res.writeHead(307, { location: sinkUrl, "content-type": "text/plain" });
+      res.end("go");
+      return;
+    }
+    if (payload.sink === "relative") {
+      res.writeHead(302, { location: "/internal-sink" });
+      res.end("go");
+      return;
+    }
+    const body = JSON.stringify({
+      id: "chatcmpl-after-redirect",
+      object: "chat.completion",
+      model: "gpt-4o-mini",
+      choices: [{ index: 0, message: { role: "assistant", content: "stayed on upstream" } }],
+      usage: SMALL_USAGE,
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(body);
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const upstreamAddr = upstream.address();
+  assert(upstreamAddr && typeof upstreamAddr === "object", "redirect upstream failed to bind");
+  const mockUrl = `http://127.0.0.1:${upstreamAddr.port}/v1`;
+
+  try {
+    await withApp(dir, "redirect", mockUrl, { softUsd: null, hardUsd: 1 }, async (base) => {
+      const absolute = await postChat(
+        base,
+        "redirect",
+        JSON.stringify({
+          model: "gpt-4o-mini",
+          sink: "absolute",
+          messages: [{ role: "user", content: "prompt that must not leave the upstream" }],
+        }),
+      );
+      const absoluteBody = await absolute.text();
+      assert(absolute.status === 502, `absolute redirect status ${absolute.status}: ${absoluteBody}`);
+      assert(absolute.headers.get("location") == null, "absolute redirect forwarded Location");
+      assert(!absoluteBody.includes("stolen-prompt-sink"), "502 body echoed the redirect target");
+      const absoluteJson = JSON.parse(absoluteBody) as { error?: { type?: string; message?: string } };
+      assert(absoluteJson.error?.type === "spendlight_upstream_redirect", absoluteBody);
+      assert(absoluteJson.error?.message?.toLowerCase().includes("redirect"), absoluteBody);
+      assert(sinkHits === 0, `307 target received ${sinkHits} requests`);
+
+      const relative = await postChat(
+        base,
+        "redirect",
+        JSON.stringify({
+          model: "gpt-4o-mini",
+          sink: "relative",
+          messages: [{ role: "user", content: "relative redirect" }],
+        }),
+      );
+      const relativeBody = await relative.text();
+      assert(relative.status === 502, `relative redirect status ${relative.status}: ${relativeBody}`);
+      assert(relative.headers.get("location") == null, "relative redirect forwarded Location");
+      assert(!relativeBody.includes("internal-sink"), relativeBody);
+      assert(relativeHits === 0, `302 target received ${relativeHits} requests`);
+
+      const summary = await summaryOf(base);
+      assert(summary.requests === 0, `redirects should not be logged, got ${summary.requests}`);
+
+      const again = await postChat(
+        base,
+        "redirect",
+        JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "after" }] }),
+      );
+      const againBody = await again.text();
+      assert(again.status === 200, `hold should release after a refused redirect, got ${again.status}: ${againBody}`);
+      assert(againBody.includes("stayed on upstream"), "follow-up did not reach the configured upstream");
+      const after = await summaryOf(base);
+      assert(after.requests === 1, `follow-up logged ${after.requests} rows`);
+      assert(sinkHits === 0 && relativeHits === 0, "follow-up was forwarded to a redirect target");
+    });
+  } finally {
+    await new Promise<void>((resolve) => sink.close(() => resolve()));
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
   }
 }
 

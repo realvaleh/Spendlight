@@ -112,6 +112,8 @@ export async function proxyRequest(
       headers,
       body: req.method === "GET" || req.method === "HEAD" ? undefined : outboundBody,
       signal: ac.signal,
+      // A 307/308 would forward the prompt to Location. Same-origin redirects keep Authorization.
+      redirect: "manual",
     });
   } catch (err) {
     release();
@@ -129,6 +131,24 @@ export async function proxyRequest(
   }
 
   try {
+    if (isUpstreamRedirect(upstream.status)) {
+      await discardUpstreamBody(upstream);
+      json(
+        res,
+        502,
+        {
+          error: {
+            message:
+              "Spendlight refused to follow an upstream redirect. Set OPENAI_BASE_URL to the final URL.",
+            type: "spendlight_upstream_redirect",
+          },
+        },
+        {},
+        req,
+      );
+      return;
+    }
+
     const outHeaders = filterResponseHeaders(upstream.headers, req);
     outHeaders["x-spendlight-project"] = project;
     outHeaders["x-spendlight-budget-status"] = decision.status;
@@ -318,6 +338,20 @@ function completionCharsFromEvent(event: string): number {
     chars += completionCharsFromSseData(trimmed.slice(5).trim());
   }
   return chars;
+}
+
+/** Any 3xx. The client must not see Location; an SDK would follow it and may send the API key. */
+function isUpstreamRedirect(status: number): boolean {
+  return status >= 300 && status < 400;
+}
+
+async function discardUpstreamBody(upstream: Response): Promise<void> {
+  if (!upstream.body) return;
+  try {
+    await upstream.body.cancel();
+  } catch {
+    // The redirect body is not forwarded.
+  }
 }
 
 function isMutating(method: string): boolean {
