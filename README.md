@@ -317,6 +317,7 @@ Spendlight is a **localhost reverse proxy that can spend your API key**. Treat t
 - **API keys.** If `OPENAI_API_KEY` is set, any client that can reach the proxy and omits `Authorization` uses your key. If the client sends `Authorization`, that value is forwarded instead. Keys are not written to the ledger or stdout. Prefer the env var over `upstream.apiKey` in JSON (do not commit keys).
 - **Trust model.** Anyone who can talk to the port is trusted: they can complete, retag projects, and read spend. Project tags are labels, not ACLs. CORS is allowed only from `http(s)://127.0.0.1`, `localhost`, and `::1` so a random website cannot drive the proxy from the browser.
 - **Upstream URL.** `OPENAI_BASE_URL` is operator-controlled (http/https only). Clients cannot pick a different host. Do not point it at arbitrary internal URLs.
+- **Redirects.** Spendlight does not follow upstream redirects. A 3xx is answered with **502** (`spendlight_upstream_redirect`) and `Location` is not returned to the client. That stops a 307/308 from sending the prompt to another host, and stops a same-origin redirect from carrying `Authorization` any further. Point `OPENAI_BASE_URL` at the final URL.
 - **Runtime deps.** Zero npm runtime dependencies (`node:http`, `fetch`, `node:sqlite`).
 
 ## Env vars
