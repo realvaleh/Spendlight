@@ -94,7 +94,7 @@ export async function proxyRequest(
     }
   }
 
-  const upstreamUrl = joinUpstream(config.upstreamBaseUrl, url.pathname, url.search);
+  const upstreamUrl = joinUpstream(config.upstreamBaseUrl, url.pathname, stripSpendlightSearch(url.search));
   const headers = forwardHeaders(req, config, outboundBody.length);
   const ac = new AbortController();
   let settled = false;
@@ -361,6 +361,38 @@ function logCompleted(args: {
     path: args.path,
     streamed: args.streamed,
   });
+}
+
+const SPENDLIGHT_QUERY = new Set(["project", "tag"]);
+
+/**
+ * Drop `project` and `tag` before forwarding. Those keys are Spendlight bucket
+ * labels (same as `x-spendlight-project` / `spendlight_project`), not upstream
+ * parameters. Every other query key is left byte-for-byte as the client sent it.
+ */
+export function stripSpendlightSearch(search: string): string {
+  if (!search || search === "?") return "";
+  const raw = search.startsWith("?") ? search.slice(1) : search;
+  const kept: string[] = [];
+  for (const part of raw.split("&")) {
+    if (part !== "" && SPENDLIGHT_QUERY.has(decodeQueryName(queryName(part)))) continue;
+    kept.push(part);
+  }
+  if (kept.every((part) => part === "")) return "";
+  return `?${kept.join("&")}`;
+}
+
+function queryName(part: string): string {
+  const eq = part.indexOf("=");
+  return eq === -1 ? part : part.slice(0, eq);
+}
+
+function decodeQueryName(raw: string): string {
+  try {
+    return decodeURIComponent(raw.replaceAll("+", " "));
+  } catch {
+    return raw;
+  }
 }
 
 export function joinUpstream(base: string, pathname: string, search = ""): string {

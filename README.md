@@ -212,7 +212,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -H "x-spendlight-project: demo" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 
-# or query string
+# or query string (`project` and `tag` are stripped before forwarding)
 curl "http://127.0.0.1:8787/v1/chat/completions?project=demo" ...
 
 # or JSON body (stripped before forwarding)
