@@ -8,7 +8,7 @@ import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBou
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
-import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
+import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject, stripSpendlightSearch } from "./proxy.js";
 
 const MOCK_USAGE = {
   prompt_tokens: 100_000,
@@ -25,6 +25,7 @@ const SMALL_USAGE = {
 };
 
 const hits = { bounded: 0, unbounded: 0 };
+const upstreamSeen = { url: "", body: "" };
 
 function fail(message: string): never {
   console.error(`SMOKE FAIL: ${message}`);
@@ -79,6 +80,24 @@ async function main(): Promise<void> {
       "https://api.openai.com/v1/evil.example/x",
     "protocol-relative join must not escape upstream host",
   );
+  assert(stripSpendlightSearch("") === "", "empty search stays empty");
+  assert(stripSpendlightSearch("?") === "", "bare question mark stays empty");
+  assert(stripSpendlightSearch("?project=demo") === "", "lone project tag is not forwarded");
+  assert(stripSpendlightSearch("?tag=secret") === "", "lone tag alias is not forwarded");
+  assert(
+    stripSpendlightSearch("?foo=1&project=demo&bar=2") === "?foo=1&bar=2",
+    "project tag is removed and surrounding params stay in order",
+  );
+  assert(
+    stripSpendlightSearch("?%70roject=demo&foo=a%20b&tag=secret") === "?foo=a%20b",
+    "percent-encoded tag keys are removed without re-encoding the rest",
+  );
+  assert(
+    stripSpendlightSearch("?Project=keep&project_id=keep&project=drop&tag=drop") === "?Project=keep&project_id=keep",
+    "only the exact tag keys are removed",
+  );
+  assert(stripSpendlightSearch("?foo=1&&bar=2") === "?foo=1&&bar=2", "unrelated query is unchanged");
+  assert(stripSpendlightSearch("?project=demo&") === "", "a stripped tag does not leave a dangling separator");
 
   const dir = mkdtempSync(join(tmpdir(), "spendlight-smoke-"));
   const dbPath = join(dir, "ledger.db");
@@ -87,7 +106,9 @@ async function main(): Promise<void> {
   const mock = createServer(async (req, res) => {
     res.on("error", () => {});
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    upstreamSeen.url = req.url ?? "";
     const raw = await readReq(req);
+    upstreamSeen.body = raw;
     let payload: Record<string, unknown> = {};
     try {
       payload = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
@@ -364,8 +385,9 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testTagQueryNotForwarded(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, tag query stripped");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2790,6 +2812,56 @@ async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise
     await res.text();
     const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
     assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
+  });
+}
+
+async function testTagQueryNotForwarded(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "tag-query", mockUrl, { softUsd: null, hardUsd: 100 }, async (base) => {
+    upstreamSeen.url = "";
+    const models = await fetch(`${base}/v1/models?project=from-query&tag=secret-tag&foo=bar`);
+    assert(models.status === 200, `models status ${models.status}`);
+    assert(upstreamSeen.url.includes("foo=bar"), `upstream query missing foo: ${upstreamSeen.url}`);
+    assert(!/[\?&]project=/.test(upstreamSeen.url), `project query forwarded: ${upstreamSeen.url}`);
+    assert(!/[\?&]tag=/.test(upstreamSeen.url), `tag query forwarded: ${upstreamSeen.url}`);
+    assert(!upstreamSeen.url.includes("secret-tag"), `tag value forwarded: ${upstreamSeen.url}`);
+    assert(!upstreamSeen.url.includes("from-query"), `project value forwarded: ${upstreamSeen.url}`);
+
+    const posted = await fetch(`${base}/v1/chat/completions?project=from-query&foo=keep`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        small: true,
+        spendlight_project: "body-tag",
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    assert(posted.status === 200, `tagged completion ${posted.status}`);
+    await posted.json();
+    assert(upstreamSeen.url.includes("foo=keep"), `completion query missing foo: ${upstreamSeen.url}`);
+    assert(!/[\?&]project=/.test(upstreamSeen.url), `completion forwarded project: ${upstreamSeen.url}`);
+    assert(!upstreamSeen.url.includes("from-query"), `project value forwarded on completion: ${upstreamSeen.url}`);
+    assert(!upstreamSeen.body.includes("spendlight_project"), "body tag should still be stripped");
+    assert(!upstreamSeen.body.includes("body-tag"), "body tag value should not reach upstream");
+
+    const summary = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+      recent: { project: string }[];
+    };
+    assert(summary.recent[0]?.project === "from-query", `query tag should win over the body, got ${summary.recent[0]?.project}`);
+
+    const headed = await fetch(`${base}/v1/chat/completions?project=from-query&tag=secret-tag`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-spendlight-project": "from-header" },
+      body: JSON.stringify({ model: "gpt-4o-mini", small: true, messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert(headed.status === 200, `header-tagged completion ${headed.status}`);
+    await headed.json();
+    assert(!/[\?&](?:project|tag)=/.test(upstreamSeen.url), `header request forwarded a tag query: ${upstreamSeen.url}`);
+    assert(!upstreamSeen.url.includes("secret-tag") && !upstreamSeen.url.includes("from-query"), upstreamSeen.url);
+    const afterHeader = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+      recent: { project: string }[];
+    };
+    assert(afterHeader.recent[0]?.project === "from-header", `header should win over the query, got ${afterHeader.recent[0]?.project}`);
   });
 }
 
