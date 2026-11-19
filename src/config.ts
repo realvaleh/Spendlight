@@ -57,6 +57,29 @@ function strEnv(name: string): string | undefined {
   return raw.trim();
 }
 
+/**
+ * Blank host is unset. `server.listen(port, "")` binds every interface (`::`),
+ * and the dashboard has no auth. An explicit wildcard (`0.0.0.0`, `::`) stays.
+ */
+function configuredHost(fileHost: unknown): string {
+  const env = strEnv("SPENDLIGHT_HOST");
+  if (env !== undefined) return env;
+  if (typeof fileHost === "string" && fileHost.trim() !== "") return fileHost.trim();
+  return "127.0.0.1";
+}
+
+/**
+ * Blank port is unset. `Number("")` is 0, which asks the OS for a random port.
+ * An explicit `0` still does that.
+ */
+function configuredPort(filePort: unknown): number {
+  const env = strEnv("SPENDLIGHT_PORT");
+  if (env !== undefined) return Number(env);
+  if (typeof filePort === "number") return filePort;
+  if (typeof filePort === "string" && filePort.trim() !== "") return Number(filePort.trim());
+  return 8787;
+}
+
 function asString(raw: unknown): string | undefined {
   if (raw == null) return undefined;
   if (typeof raw === "string") return raw;
@@ -148,8 +171,8 @@ export function loadConfig(explicitPath?: string): Config {
   }
 
   return {
-    host: process.env.SPENDLIGHT_HOST ?? file.host ?? "127.0.0.1",
-    port: Number(process.env.SPENDLIGHT_PORT ?? file.port ?? 8787),
+    host: configuredHost(file.host),
+    port: configuredPort(file.port),
     dbPath: process.env.SPENDLIGHT_DB ?? file.dbPath ?? "./data/spendlight.db",
     configPath,
     upstreamBaseUrl: normalizeUpstreamUrl(
@@ -179,8 +202,8 @@ Point any OpenAI client at http://HOST:PORT/v1 and keep (or omit) your API key.
 Env:
   OPENAI_API_KEY                 Upstream key (optional if clients send Authorization)
   OPENAI_BASE_URL                Upstream base, default https://api.openai.com/v1
-  SPENDLIGHT_HOST                Bind address (default 127.0.0.1; Docker uses 0.0.0.0)
-  SPENDLIGHT_PORT                Port (default 8787)
+  SPENDLIGHT_HOST                Bind address (default 127.0.0.1; blank keeps the default; Docker sets 0.0.0.0)
+  SPENDLIGHT_PORT                Port (default 8787; blank keeps the default)
   SPENDLIGHT_DB                  SQLite path
   SPENDLIGHT_CONFIG              Config JSON path
   SPENDLIGHT_SOFT_BUDGET_USD     Global soft budget

@@ -343,6 +343,7 @@ async function main(): Promise<void> {
     testCalendarWeekBounds();
     testCalendarMonthBounds();
     testBudgetConfig(dir);
+    await testBlankListenDefaults(dir);
     testDayLedgerWindow(dir);
     testWeekLedgerWindow(dir);
     testMonthLedgerWindow(dir);
@@ -365,7 +366,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, blank listen defaults");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2791,6 +2792,78 @@ async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise
     const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
     assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
   });
+}
+
+/** A blank host or port must not become a wildcard bind or a random port. */
+async function testBlankListenDefaults(dir: string): Promise<void> {
+  const savedHost = process.env.SPENDLIGHT_HOST;
+  const savedPort = process.env.SPENDLIGHT_PORT;
+  const savedDb = process.env.SPENDLIGHT_DB;
+  const savedConfig = process.env.SPENDLIGHT_CONFIG;
+  try {
+    delete process.env.SPENDLIGHT_HOST;
+    delete process.env.SPENDLIGHT_PORT;
+    delete process.env.SPENDLIGHT_DB;
+    delete process.env.SPENDLIGHT_CONFIG;
+
+    const blankPath = join(dir, "listen-blank.json");
+    writeFileSync(blankPath, JSON.stringify({ host: "", port: "", dbPath: ":memory:" }));
+    const blank = loadConfig(blankPath);
+    assert(blank.host === "127.0.0.1", `blank file host bound ${blank.host}`);
+    assert(blank.port === 8787, `blank file port became ${blank.port}`);
+
+    const whitespacePath = join(dir, "listen-whitespace.json");
+    writeFileSync(whitespacePath, JSON.stringify({ host: "   ", dbPath: ":memory:" }));
+    const whitespace = loadConfig(whitespacePath);
+    assert(whitespace.host === "127.0.0.1", `whitespace file host bound ${whitespace.host}`);
+    assert(whitespace.port === 8787, `omitted port became ${whitespace.port}`);
+
+    const explicitPath = join(dir, "listen-explicit.json");
+    writeFileSync(explicitPath, JSON.stringify({ host: "0.0.0.0", port: 0, dbPath: ":memory:" }));
+    process.env.SPENDLIGHT_HOST = "";
+    process.env.SPENDLIGHT_PORT = "   ";
+    const kept = loadConfig(explicitPath);
+    assert(kept.host === "0.0.0.0", `blank env host overrode the file with ${kept.host}`);
+    assert(kept.port === 0, `blank env port overrode explicit 0 with ${kept.port}`);
+
+    process.env.SPENDLIGHT_HOST = "  127.0.0.1  ";
+    process.env.SPENDLIGHT_PORT = "0";
+    const trimmed = loadConfig(explicitPath);
+    assert(trimmed.host === "127.0.0.1", `trimmed host ${trimmed.host}`);
+    assert(trimmed.port === 0, `explicit env port 0 became ${trimmed.port}`);
+
+    delete process.env.SPENDLIGHT_HOST;
+    delete process.env.SPENDLIGHT_PORT;
+    const loopbackPath = join(dir, "listen-loopback.json");
+    writeFileSync(loopbackPath, JSON.stringify({ host: "", port: 0, dbPath: join(dir, "listen-loopback.db") }));
+    const config = loadConfig(loopbackPath);
+    assert(config.host === "127.0.0.1", `listen config host ${config.host}`);
+    assert(config.port === 0, `listen config port ${config.port}`);
+    const app = createApp(config);
+    try {
+      const base = await listen(app);
+      const addr = app.server.address();
+      assert(addr && typeof addr === "object", "blank host did not bind");
+      assert(addr.address === "127.0.0.1", `blank host listened on ${addr.address}`);
+      assert(addr.family === "IPv4", `blank host family ${addr.family}`);
+      assert(base === `http://127.0.0.1:${addr.port}`, `blank host url ${base}`);
+      const res = await fetch(`${base}/health`);
+      const body = (await res.json()) as { ok?: boolean; service?: string };
+      assert(res.status === 200, `blank host health ${res.status}`);
+      assert(body.ok === true && body.service === "spendlight", `blank host health body ${JSON.stringify(body)}`);
+    } finally {
+      await app.close();
+    }
+  } finally {
+    if (savedHost === undefined) delete process.env.SPENDLIGHT_HOST;
+    else process.env.SPENDLIGHT_HOST = savedHost;
+    if (savedPort === undefined) delete process.env.SPENDLIGHT_PORT;
+    else process.env.SPENDLIGHT_PORT = savedPort;
+    if (savedDb === undefined) delete process.env.SPENDLIGHT_DB;
+    else process.env.SPENDLIGHT_DB = savedDb;
+    if (savedConfig === undefined) delete process.env.SPENDLIGHT_CONFIG;
+    else process.env.SPENDLIGHT_CONFIG = savedConfig;
+  }
 }
 
 function readReq(req: IncomingMessage): Promise<string> {
