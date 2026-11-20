@@ -178,7 +178,7 @@ Point any OpenAI client at http://HOST:PORT/v1 and keep (or omit) your API key.
 
 Env:
   OPENAI_API_KEY                 Upstream key (optional if clients send Authorization)
-  OPENAI_BASE_URL                Upstream base, default https://api.openai.com/v1
+  OPENAI_BASE_URL                Upstream base (http/https path only; userinfo, query, and hash are dropped)
   SPENDLIGHT_HOST                Bind address (default 127.0.0.1; Docker uses 0.0.0.0)
   SPENDLIGHT_PORT                Port (default 8787)
   SPENDLIGHT_DB                  SQLite path
@@ -191,7 +191,11 @@ Env:
 Bind to 127.0.0.1 (the default). The dashboard, receipts, and /api/summary have no auth.
 `;
 
-/** http(s) only; strips userinfo so keys in the URL cannot leak via logs or fetch. */
+/**
+ * http(s) only. The base is scheme, host, and path.
+ * Userinfo, query, and hash are dropped so a key stuck in the URL is not printed
+ * at startup, stored on the config, or forwarded. Client request queries are unchanged.
+ */
 export function normalizeUpstreamUrl(raw: string): string {
   const trimmed = raw.trim();
   let parsed: URL;
@@ -203,8 +207,17 @@ export function normalizeUpstreamUrl(raw: string): string {
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error("OPENAI_BASE_URL must be http or https");
   }
+  const droppedSecretCarrier =
+    parsed.username !== "" || parsed.password !== "" || parsed.search !== "" || parsed.hash !== "";
   parsed.username = "";
   parsed.password = "";
+  parsed.search = "";
+  parsed.hash = "";
+  if (droppedSecretCarrier) {
+    console.warn(
+      "Spendlight: the upstream URL is scheme, host, and path only. Userinfo, query, and hash were dropped so a key there is not logged or forwarded. Put the key in OPENAI_API_KEY.",
+    );
+  }
   return parsed.href.replace(/\/$/, "");
 }
 

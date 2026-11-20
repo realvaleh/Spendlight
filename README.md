@@ -316,7 +316,7 @@ Spendlight is a **localhost reverse proxy that can spend your API key**. Treat t
 - **Bind localhost.** Default `SPENDLIGHT_HOST=127.0.0.1`. Docker Compose publishes `127.0.0.1:8787`. Do not put this on `0.0.0.0` / the public internet. The dashboard, receipts, badge, `/api/summary`, `/api/export.csv`, and `/api/export.json` have **no auth**.
 - **API keys.** If `OPENAI_API_KEY` is set, any client that can reach the proxy and omits `Authorization` uses your key. If the client sends `Authorization`, that value is forwarded instead. Keys are not written to the ledger or stdout. Prefer the env var over `upstream.apiKey` in JSON (do not commit keys).
 - **Trust model.** Anyone who can talk to the port is trusted: they can complete, retag projects, and read spend. Project tags are labels, not ACLs. CORS is allowed only from `http(s)://127.0.0.1`, `localhost`, and `::1` so a random website cannot drive the proxy from the browser.
-- **Upstream URL.** `OPENAI_BASE_URL` is operator-controlled (http/https only). Clients cannot pick a different host. Do not point it at arbitrary internal URLs.
+- **Upstream URL.** `OPENAI_BASE_URL` is operator-controlled (http/https only). Clients cannot pick a different host. Do not point it at arbitrary internal URLs. The base is scheme, host, and path: userinfo, a query string, and a hash are removed at startup so a key stuck in the URL is not printed or forwarded. Put the key in `OPENAI_API_KEY`. A query on the client request is still forwarded.
 - **Runtime deps.** Zero npm runtime dependencies (`node:http`, `fetch`, `node:sqlite`).
 
 ## Env vars
@@ -324,7 +324,7 @@ Spendlight is a **localhost reverse proxy that can spend your API key**. Treat t
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `OPENAI_API_KEY` | — | Upstream key if the client does not send `Authorization` |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Upstream OpenAI-compatible base |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Upstream base. Scheme, host, and path only; userinfo, query, and hash are dropped |
 | `SPENDLIGHT_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` inside Docker) |
 | `SPENDLIGHT_PORT` | `8787` | Listen port |
 | `SPENDLIGHT_DB` | `./data/spendlight.db` | SQLite path (`/data/spendlight.db` in Docker) |

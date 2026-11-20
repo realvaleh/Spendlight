@@ -45,8 +45,54 @@ async function main(): Promise<void> {
   assert(Math.abs(cost - 0.045) < 1e-9, `expected $0.045 cost, got ${cost}`);
 
   assert(normalizeUpstreamUrl("https://api.openai.com/v1/") === "https://api.openai.com/v1", "strip trailing slash");
-  const redacted = normalizeUpstreamUrl("https://user:sk-secret@api.openai.com/v1");
-  assert(redacted === "https://api.openai.com/v1", `userinfo should be stripped, got ${redacted}`);
+  const urlWarnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    urlWarnings.push(args.map(String).join(" "));
+  };
+  try {
+    const beforeClean = urlWarnings.length;
+    assert(normalizeUpstreamUrl("https://api.openai.com/v1") === "https://api.openai.com/v1", "clean upstream url");
+    assert(urlWarnings.length === beforeClean, "a clean upstream url must not warn");
+
+    const redacted = normalizeUpstreamUrl("https://user:sk-secret@api.openai.com/v1");
+    assert(redacted === "https://api.openai.com/v1", `userinfo should be stripped, got ${redacted}`);
+    assert(!redacted.includes("sk-secret"), "userinfo secret must not remain in the base url");
+
+    const query = normalizeUpstreamUrl(
+      "https://api.openai.com/v1?api_key=sk-live-secret&api-version=2024-10-21",
+    );
+    assert(query === "https://api.openai.com/v1", `query should be stripped, got ${query}`);
+    assert(!query.includes("sk-live-secret"), "query secret must not remain in the base url");
+    assert(!query.includes("api-version"), "base query is not part of the upstream path");
+
+    const encoded = normalizeUpstreamUrl("https://api.openai.com/v1?api_key=sk%2Dlive%2Dsecret");
+    assert(encoded === "https://api.openai.com/v1", `encoded query secret should be stripped, got ${encoded}`);
+    assert(!encoded.includes("sk%2D") && !encoded.includes("secret"), "encoded secret must not remain");
+
+    const hash = normalizeUpstreamUrl("http://[::1]:9/v1#sk-fragment-secret");
+    assert(hash === "http://[::1]:9/v1", `hash should be stripped, got ${hash}`);
+    assert(!hash.includes("sk-fragment-secret"), "fragment secret must not remain in the base url");
+
+    const passwordOnly = normalizeUpstreamUrl(
+      "https://:sk-password-secret@api.openai.com/v1/org?token=sekret#frag",
+    );
+    assert(
+      passwordOnly === "https://api.openai.com/v1/org",
+      `userinfo, query, and hash should be stripped, got ${passwordOnly}`,
+    );
+    assert(
+      !passwordOnly.includes("sekret") && !passwordOnly.includes("sk-password-secret"),
+      "combined secret url must be stripped",
+    );
+  } finally {
+    console.warn = origWarn;
+  }
+  assert(urlWarnings.length >= 4, `secret url parts should warn, got ${urlWarnings.length}`);
+  const leaked = urlWarnings.filter((warning) =>
+    /sk-secret|sk-live-secret|sk-fragment-secret|sk-password-secret|sekret|sk%2D/i.test(warning),
+  );
+  assert(leaked.length === 0, `upstream url warning must not echo the key: ${leaked.join(" | ")}`);
   let rejected = false;
   try {
     normalizeUpstreamUrl("file:///etc/passwd");
@@ -365,7 +411,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, upstream url redaction");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
