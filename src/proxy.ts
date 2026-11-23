@@ -13,6 +13,7 @@ import {
   roughTokens,
   type Preflight,
 } from "./pricing.js";
+import { ledgerErrorText } from "./redact.js";
 
 const HOP = new Set([
   "connection",
@@ -205,7 +206,7 @@ export async function proxyRequest(
         path: url.pathname,
         streamed: false,
         upstreamId,
-        error: upstream.ok ? null : buf.toString("utf8").slice(0, 500),
+        error: upstream.ok ? null : buf.toString("utf8"),
         reservationId,
       });
       settled = true;
@@ -349,6 +350,8 @@ function logCompleted(args: {
   reservationId: string | null;
 }): void {
   const { costUsd } = estimateCostUsd(args.model, args.usage, args.config.pricing, args.config.fallbackPrice);
+  const error =
+    args.error == null ? null : ledgerErrorText(args.error, [args.config.upstreamApiKey]);
   settleReservation(args.db, args.reservationId, {
     id: randomUUID(),
     project: args.project,
@@ -356,7 +359,7 @@ function logCompleted(args: {
     usage: args.usage,
     costUsd,
     status: args.status,
-    error: args.error ?? null,
+    error,
     upstreamId: args.upstreamId,
     path: args.path,
     streamed: args.streamed,

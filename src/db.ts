@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { redactSecrets } from "./redact.js";
 import { calendarDayKey, shiftCalendarDay } from "./day.js";
 import type { LedgerRow, Usage } from "./types.js";
 
@@ -168,6 +169,7 @@ export function insertRequest(
 ): LedgerRow {
   const id = row.id ?? randomUUID();
   const createdAt = row.createdAt ?? new Date().toISOString();
+  const error = row.error == null ? null : redactSecrets(row.error);
   db.prepare(
     `INSERT INTO requests (
       id, created_at, project, model, prompt_tokens, completion_tokens, cached_tokens,
@@ -184,7 +186,7 @@ export function insertRequest(
     row.usage.totalTokens,
     roundUsd(row.costUsd),
     row.status,
-    row.error ?? null,
+    error,
     row.upstreamId ?? null,
     row.path,
     row.streamed ? 1 : 0,
@@ -200,7 +202,7 @@ export function insertRequest(
     totalTokens: row.usage.totalTokens,
     costUsd: roundUsd(row.costUsd),
     status: row.status,
-    error: row.error ?? null,
+    error,
     upstreamId: row.upstreamId ?? null,
     path: row.path,
     streamed: row.streamed ? 1 : 0,
