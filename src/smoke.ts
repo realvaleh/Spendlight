@@ -9,6 +9,7 @@ import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
 import { estimateCostUsd } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
+import { ledgerErrorText, redactSecrets } from "./redact.js";
 
 const MOCK_USAGE = {
   prompt_tokens: 100_000,
@@ -95,6 +96,17 @@ async function main(): Promise<void> {
       payload = {};
     }
     if (url.pathname === "/chat/completions" || url.pathname === "/v1/chat/completions") {
+      if (payload.leak === true) {
+        const body = JSON.stringify({
+          error: {
+            message: "Incorrect API key provided: sk-proj-SMOKEKEY1234567890abcdef",
+            hint: "Authorization: Bearer ya29.supersecretgoogletokenvalue echoed sk-smoke api_key=rawsecretvalue99",
+          },
+        });
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(body);
+        return;
+      }
       if (payload.stream === true) {
         writeStream(res);
         return;
@@ -364,8 +376,9 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    await testRedactedLedgerErrors(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, redacted errors");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -2791,6 +2804,93 @@ async function testSoftWarnLifetimeDedupe(dir: string, mockUrl: string): Promise
     const warns = (await summaryOf(base)).events.filter((e) => e.type === "soft_warn");
     assert(warns.length === 1, `lifetime soft_warn should stay deduped across days, got ${warns.length}`);
   });
+}
+
+const LEAKED_KEY = "sk-proj-SMOKEKEY1234567890abcdef";
+const LEAKED_BEARER = "ya29.supersecretgoogletokenvalue";
+const LEAKED_QUERY = "rawsecretvalue99";
+const DIRECT_KEY = "sk-proj-DIRECTINSERTKEY1234567890";
+const DIRECT_QUERY = "directsecretvalue99";
+
+function testRedactSecretsUnit(): void {
+  const raw = `Incorrect API key provided: ${LEAKED_KEY}. Authorization: Bearer ${LEAKED_BEARER} api_key=${LEAKED_QUERY} access_token=accesstokenvalue99`;
+  const redacted = redactSecrets(raw, ["sk-smoke"]);
+  assert(!redacted.includes(LEAKED_KEY), redacted);
+  assert(!redacted.includes(LEAKED_BEARER), redacted);
+  assert(!redacted.includes(LEAKED_QUERY), redacted);
+  assert(!redacted.includes("accesstokenvalue99"), redacted);
+  assert(redacted.includes("Incorrect API key provided"), redacted);
+  assert(redacted.includes("sk-[redacted]"), redacted);
+  assert(redacted.includes("Bearer [redacted]"), redacted);
+  assert(redacted.includes("api_key=[redacted]"), redacted);
+  assert(redacted.includes("access_token=[redacted]"), redacted);
+  assert(redactSecrets(redacted, ["sk-smoke"]) === redacted, "redaction should be stable");
+  assert(redactSecrets("upstream timeout") === "upstream timeout", "plain ledger errors stay");
+  assert(
+    redactSecrets("Bearer tokens are documented") === "Bearer tokens are documented",
+    "a short bearer word is not a credential",
+  );
+  assert(redactSecrets("api_key=short") === "api_key=short", "a short assigned value stays");
+  const configured = redactSecrets("echoed sk-smoke in the body", ["sk-smoke"]);
+  assert(!configured.includes("sk-smoke"), configured);
+  assert(configured.includes("[redacted]"), configured);
+  const pastClip = ledgerErrorText(`${"x".repeat(520)}${LEAKED_KEY} sk-smoke`, ["sk-smoke"]);
+  assert(pastClip.length === 500, `clip length ${pastClip.length}`);
+  assert(!pastClip.includes(LEAKED_KEY) && !pastClip.includes("sk-smoke"), pastClip);
+  const straddling = ledgerErrorText(`${"y".repeat(490)}${LEAKED_KEY}`);
+  assert(straddling.length === 500, `straddle length ${straddling.length}`);
+  assert(!straddling.includes(LEAKED_KEY) && !straddling.includes("SMOKEKEY"), straddling);
+}
+
+async function testRedactedLedgerErrors(dir: string, mockUrl: string): Promise<void> {
+  testRedactSecretsUnit();
+  await withApp(dir, "redact-errors", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
+    const res = await postChat(
+      base,
+      "redact",
+      JSON.stringify({ model: "gpt-4o-mini", leak: true, messages: [{ role: "user", content: "hi" }] }),
+    );
+    const clientBody = await res.text();
+    assert(res.status === 401, `upstream error status ${res.status}: ${clientBody.slice(0, 180)}`);
+    assert(clientBody.includes(LEAKED_KEY), "proxied body should still contain the upstream key");
+    assert(clientBody.includes(LEAKED_BEARER), "proxied body should still contain the bearer token");
+    assert(clientBody.includes("sk-smoke"), "proxied body should still contain the configured key");
+    assert(clientBody.includes(LEAKED_QUERY), "proxied body should still contain the query secret");
+
+    const summary = await summaryOf(base);
+    assert(summary.requests === 1, `redacted error should still be logged, got ${summary.requests}`);
+    const stored = summary.recent[0]?.error ?? "";
+    assertNoSecrets(stored, "summary");
+    assert(stored.includes("Incorrect API key provided"), stored);
+    assert(stored.includes("sk-[redacted]"), stored);
+    assert(stored.includes("Bearer [redacted]"), stored);
+    assert(stored.includes("api_key=[redacted]"), stored);
+
+    insertRequest(app.db, {
+      id: "direct-secret",
+      project: "redact",
+      model: "gpt-4o-mini",
+      usage: { promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0 },
+      costUsd: 0,
+      status: 500,
+      error: `bad key ${DIRECT_KEY} api_key=${DIRECT_QUERY}`,
+      path: "/v1/chat/completions",
+    });
+
+    const csv = await fetch(`${base}/api/export.csv`).then((r) => r.text());
+    const json = await fetch(`${base}/api/export.json`).then((r) => r.text());
+    assertNoSecrets(csv, "csv");
+    assertNoSecrets(json, "json");
+    assert(json.includes("direct-secret"), "direct insert should be exported");
+    assert(json.includes("Incorrect API key provided"), json);
+    assert(!json.includes(DIRECT_KEY) && !json.includes(DIRECT_QUERY), json);
+  });
+}
+
+function assertNoSecrets(text: string, label: string): void {
+  for (const secret of [LEAKED_KEY, LEAKED_BEARER, LEAKED_QUERY, "sk-smoke", DIRECT_KEY, DIRECT_QUERY, "accesstokenvalue99"]) {
+    assert(!text.includes(secret), `${label} leaked ${secret}: ${text.slice(0, 300)}`);
+  }
 }
 
 function readReq(req: IncomingMessage): Promise<string> {
