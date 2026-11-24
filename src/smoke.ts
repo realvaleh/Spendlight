@@ -43,6 +43,55 @@ async function main(): Promise<void> {
     DEFAULT_FALLBACK,
   ).costUsd;
   assert(Math.abs(cost - 0.045) < 1e-9, `expected $0.045 cost, got ${cost}`);
+  const inheritedUsage = {
+    promptTokens: 100_000,
+    completionTokens: 50_000,
+    cachedTokens: 0,
+    totalTokens: 150_000,
+  };
+  for (const model of ["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf"]) {
+    const inherited = estimateCostUsd(model, inheritedUsage, DEFAULT_PRICING, DEFAULT_FALLBACK);
+    assert(inherited.matched == null, `${model} should not match an inherited price (${inherited.matched})`);
+    assert(
+      Math.abs(inherited.costUsd - 1.25) < 1e-9,
+      `${model} should use the fallback price, got ${inherited.costUsd}`,
+    );
+  }
+  const dated = estimateCostUsd(
+    "gpt-4o-mini-2024-07-18",
+    { promptTokens: 1_000_000, completionTokens: 0, cachedTokens: 0, totalTokens: 1_000_000 },
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(dated.matched === "gpt-4o-mini", `dated snapshot matched ${dated.matched}`);
+  assert(Math.abs(dated.costUsd - 0.15) < 1e-9, `dated snapshot cost ${dated.costUsd}`);
+  const ownConstructor = estimateCostUsd(
+    "constructor",
+    { promptTokens: 1_000_000, completionTokens: 0, cachedTokens: 0, totalTokens: 1_000_000 },
+    { ...DEFAULT_PRICING, constructor: { inputPerMillion: 1, outputPerMillion: 2 } },
+    DEFAULT_FALLBACK,
+  );
+  assert(ownConstructor.matched === "constructor", "an own constructor price should still match");
+  assert(Math.abs(ownConstructor.costUsd - 1) < 1e-9, `own constructor cost ${ownConstructor.costUsd}`);
+  const brokenMini = estimateCostUsd(
+    "gpt-4o-mini",
+    { promptTokens: 1_000_000, completionTokens: 0, cachedTokens: 0, totalTokens: 1_000_000 },
+    {
+      "gpt-4o-mini": { inputPerMillion: Number.NaN, outputPerMillion: 1 },
+      "gpt-4o": { inputPerMillion: 2.5, outputPerMillion: 10 },
+    },
+    DEFAULT_FALLBACK,
+  );
+  assert(brokenMini.matched == null, `broken own price should fall back, matched ${brokenMini.matched}`);
+  assert(Math.abs(brokenMini.costUsd - 5) < 1e-9, `broken own price cost ${brokenMini.costUsd}`);
+  const negativeMini = estimateCostUsd(
+    "gpt-4o-mini",
+    { promptTokens: 1_000_000, completionTokens: 0, cachedTokens: 0, totalTokens: 1_000_000 },
+    { "gpt-4o-mini": { inputPerMillion: -5, outputPerMillion: 1 } },
+    DEFAULT_FALLBACK,
+  );
+  assert(negativeMini.matched == null, "negative rates should not match");
+  assert(Math.abs(negativeMini.costUsd - 5) < 1e-9, `negative rate cost ${negativeMini.costUsd}`);
 
   assert(normalizeUpstreamUrl("https://api.openai.com/v1/") === "https://api.openai.com/v1", "strip trailing slash");
   const redacted = normalizeUpstreamUrl("https://user:sk-secret@api.openai.com/v1");
@@ -339,6 +388,7 @@ async function main(): Promise<void> {
     await testUnboundedRace(dir, mockUrl);
     await testBoundedRace(dir, mockUrl);
     await testStreamCutoff(dir, mockUrl);
+    await testInheritedModelLedger(dir, mockUrl);
     testCalendarDayBounds();
     testCalendarWeekBounds();
     testCalendarMonthBounds();
@@ -365,7 +415,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, inherited model price, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -438,6 +488,40 @@ async function testBoundedRace(dir: string, mockUrl: string): Promise<void> {
     );
     assert(again.status === 200, `hold should release after settle, got ${again.status}`);
     await again.text();
+  });
+}
+
+async function testInheritedModelLedger(dir: string, mockUrl: string): Promise<void> {
+  await withApp(dir, "inherited-model", mockUrl, { softUsd: null, hardUsd: null }, async (base) => {
+    for (const model of ["constructor", "__proto__"]) {
+      const res = await postChat(
+        base,
+        "proto",
+        JSON.stringify({
+          model,
+          stream: true,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      const text = await res.text();
+      assert(res.status === 200, `${model} stream status ${res.status}: ${text.slice(0, 180)}`);
+    }
+    const summary = (await fetch(`${base}/api/summary`).then((r) => r.json())) as {
+      spendUsd: number;
+      requests: number;
+      recent: { model: string; costUsd: number; streamed?: number }[];
+    };
+    assert(summary.requests === 2, `inherited models logged ${summary.requests} rows`);
+    assert(
+      Math.abs(summary.spendUsd - 2.5) < 1e-6,
+      `inherited model ids should bill the fallback price, spend ${summary.spendUsd}`,
+    );
+    const models = summary.recent.map((row) => row.model).sort();
+    assert(models[0] === "__proto__" && models[1] === "constructor", `logged models ${models.join(",")}`);
+    assert(
+      summary.recent.every((row) => row.streamed === 1 && Math.abs(row.costUsd - 1.25) < 1e-6),
+      `inherited row costs ${summary.recent.map((row) => row.costUsd).join(",")}`,
+    );
   });
 }
 
