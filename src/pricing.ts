@@ -1,16 +1,40 @@
 import type { ModelPrice, Usage } from "./types.js";
 
+/**
+ * Own table entries win. A client-supplied model id is not a price just because
+ * the object inherits it: `constructor`, `__proto__`, and `toString` would
+ * otherwise price as NaN and never count toward the hard budget.
+ * An own entry with a non-finite or negative rate is unusable and falls back,
+ * instead of prefix-matching a different model or crediting spend.
+ */
 export function lookupPrice(
   model: string,
   pricing: Record<string, ModelPrice>,
   fallback: ModelPrice,
 ): { price: ModelPrice; matched: string | null } {
-  if (pricing[model]) return { price: pricing[model], matched: model };
+  if (Object.hasOwn(pricing, model)) {
+    const own = usablePrice(pricing[model]);
+    if (own) return { price: own, matched: model };
+    return { price: fallback, matched: null };
+  }
   const keys = Object.keys(pricing).sort((a, b) => b.length - a.length);
   for (const key of keys) {
-    if (model.startsWith(key)) return { price: pricing[key], matched: key };
+    if (!model.startsWith(key)) continue;
+    const price = usablePrice(pricing[key]);
+    if (price) return { price, matched: key };
   }
   return { price: fallback, matched: null };
+}
+
+function usablePrice(price: ModelPrice | undefined): ModelPrice | null {
+  if (!price || typeof price !== "object") return null;
+  if (!usableRate(price.inputPerMillion) || !usableRate(price.outputPerMillion)) return null;
+  if (price.cachedInputPerMillion != null && !usableRate(price.cachedInputPerMillion)) return null;
+  return price;
+}
+
+function usableRate(rate: unknown): boolean {
+  return typeof rate === "number" && Number.isFinite(rate) && rate >= 0;
 }
 
 export function estimateCostUsd(
