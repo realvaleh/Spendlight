@@ -7,7 +7,7 @@ import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } f
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
-import { estimateCostUsd } from "./pricing.js";
+import { estimateCostUsd, preflightFromBody } from "./pricing.js";
 import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
@@ -24,7 +24,7 @@ const SMALL_USAGE = {
   prompt_tokens_details: { cached_tokens: 0 },
 };
 
-const hits = { bounded: 0, unbounded: 0 };
+const hits = { bounded: 0, unbounded: 0, embeddings: 0 };
 
 function fail(message: string): never {
   console.error(`SMOKE FAIL: ${message}`);
@@ -122,6 +122,18 @@ async function main(): Promise<void> {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(body);
       }
+      return;
+    }
+    if (url.pathname === "/embeddings" || url.pathname === "/v1/embeddings") {
+      hits.embeddings += 1;
+      const body = JSON.stringify({
+        object: "list",
+        data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2] }],
+        model: "text-embedding-3-small",
+        usage: { prompt_tokens: 1, total_tokens: 1 },
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(body);
       return;
     }
     if (url.pathname === "/models" || url.pathname === "/v1/models") {
@@ -364,8 +376,10 @@ async function main(): Promise<void> {
     await testDailyDst(dir, mockUrl);
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
+    testEmbeddingTokenIds();
+    await testEmbeddingTokenHold(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, embedding token hold");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -474,6 +488,122 @@ type SmokeBudgets = {
   timezone?: string;
   projects?: Record<string, { softUsd: number | null; hardUsd: number | null }>;
 };
+
+function testEmbeddingTokenIds(): void {
+  const ids = preflightFromBody(
+    "text-embedding-3-small",
+    { input: [1, 2, 3, 4] },
+    "/v1/embeddings",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(ids.usage.promptTokens === 4, `token-id embedding held ${ids.usage.promptTokens}, expected 4`);
+  assert(ids.outputBounded, "embeddings are output-bounded");
+  assert(ids.usage.completionTokens === 0, "embeddings should not invent completion tokens");
+
+  const nested = preflightFromBody(
+    "text-embedding-3-small",
+    { input: [[1, 2, 3], [4, 5]] },
+    "/v1/embeddings",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(nested.usage.promptTokens === 5, `nested token batch held ${nested.usage.promptTokens}`);
+
+  const one = preflightFromBody(
+    "text-embedding-3-small",
+    { input: 42 },
+    "/v1/embeddings",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(one.usage.promptTokens === 1, `single token id held ${one.usage.promptTokens}`);
+
+  const poisoned = preflightFromBody(
+    "text-embedding-3-small",
+    { input: [1, Number.NaN, -5, Number.POSITIVE_INFINITY] },
+    "/v1/embeddings",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(poisoned.usage.promptTokens === 4, `non-finite token ids held ${poisoned.usage.promptTokens}`);
+
+  const text = preflightFromBody(
+    "text-embedding-3-small",
+    { input: "hello world" },
+    "/v1/embeddings",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(text.usage.promptTokens === 3, `string embedding held ${text.usage.promptTokens}, expected 3`);
+
+  const batch = preflightFromBody(
+    "text-embedding-3-small",
+    { input: ["hello", "world"] },
+    "/v1/embeddings",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(batch.usage.promptTokens === 3, `string batch held ${batch.usage.promptTokens}, expected 3`);
+
+  const mixed = preflightFromBody(
+    "text-embedding-3-small",
+    { input: ["hello", 1, 2, 3] },
+    "/v1/embeddings",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(mixed.usage.promptTokens === 2, `mixed input held ${mixed.usage.promptTokens}, expected character estimate`);
+
+  const prompt = preflightFromBody(
+    "gpt-4o",
+    { prompt: new Array(1000).fill(7), max_tokens: 16 },
+    "/v1/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(prompt.usage.promptTokens === 1000, `completion token prompt held ${prompt.usage.promptTokens}`);
+  assert(prompt.usage.completionTokens === 16, `completion cap ${prompt.usage.completionTokens}`);
+  const expected = (1000 / 1_000_000) * 2.5 + (16 / 1_000_000) * 10;
+  assert(Math.abs(prompt.costUsd - expected) < 1e-12, `completion token preflight ${prompt.costUsd}`);
+
+  const chat = preflightFromBody(
+    "gpt-4o-mini",
+    { messages: [{ role: "user", content: "hi" }], max_tokens: 10 },
+    "/v1/chat/completions",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(chat.usage.promptTokens === 2, `chat text held ${chat.usage.promptTokens}, expected 2`);
+  assert(chat.usage.completionTokens === 10, `chat cap ${chat.usage.completionTokens}`);
+}
+
+async function testEmbeddingTokenHold(dir: string, mockUrl: string): Promise<void> {
+  const before = hits.embeddings;
+  await withApp(dir, "embed-tokens", mockUrl, { softUsd: null, hardUsd: 0.001 }, async (base) => {
+    const blocked = await fetch(`${base}/v1/embeddings`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "text-embedding-3-small", input: new Array(200_000).fill(1) }),
+    });
+    assert(blocked.status === 402, `token-array embedding should 402, got ${blocked.status}`);
+    const body = (await blocked.json()) as { error?: { code?: string; message?: string } };
+    assert(body.error?.code === "budget_hard_limit", "token-array embedding missing budget_hard_limit");
+    assert(body.error?.message?.includes("preflight"), "token-array rejection should be a preflight hold");
+    assert(hits.embeddings === before, "over-cap token-array embedding must not reach upstream");
+
+    const allowed = await fetch(`${base}/v1/embeddings`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-spendlight-project": "embed" },
+      body: JSON.stringify({ model: "text-embedding-3-small", input: "hi" }),
+    });
+    assert(allowed.status === 200, `short embedding status ${allowed.status}`);
+    assert(hits.embeddings === before + 1, "short string embedding should reach upstream");
+    const summary = await summaryOf(base);
+    assert(summary.requests === 1, `embedding ledger rows ${summary.requests}`);
+    assert(summary.spendUsd > 0 && summary.spendUsd < 0.001, `embedding spend ${summary.spendUsd}`);
+  });
+}
 
 async function withApp(
   dir: string,

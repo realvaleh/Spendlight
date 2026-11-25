@@ -65,6 +65,26 @@ function finiteNum(v: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * Token ids for embeddings `input` and legacy completions `prompt`.
+ * OpenAI accepts a number or an array of numbers (batches nest one level).
+ * Each number counts as one id, including NaN and negatives, so a non-finite
+ * id cannot drop the whole array onto the character estimate (that path
+ * ignores numbers and would reserve nothing).
+ * Returns null when the value contains text. String batches stay character-sized.
+ */
+function tokenIdCount(value: unknown): number | null {
+  if (typeof value === "number") return 1;
+  if (!Array.isArray(value)) return null;
+  let count = 0;
+  for (const item of value) {
+    const nested = tokenIdCount(item);
+    if (nested == null) return null;
+    count += nested;
+  }
+  return count;
+}
+
 function textChars(value: unknown): number {
   if (typeof value === "string") return value.length;
   if (Array.isArray(value)) {
@@ -94,12 +114,17 @@ export function preflightFromBody(
   fallback: ModelPrice,
 ): Preflight {
   let promptChars = 0;
+  let tokenIds = 0;
   if (body) {
     if (body.messages != null) promptChars += textChars(body.messages);
-    if (body.prompt != null) promptChars += textChars(body.prompt);
-    if (body.input != null) promptChars += textChars(body.input);
+    for (const field of [body.prompt, body.input]) {
+      if (field == null) continue;
+      const ids = tokenIdCount(field);
+      if (ids != null) tokenIds += ids;
+      else promptChars += textChars(field);
+    }
   }
-  const promptTokens = roughTokens(promptChars);
+  const promptTokens = roughTokens(promptChars) + tokenIds;
   const embeddings = pathname.endsWith("/embeddings");
   let outputTokens = 0;
   let outputBounded = embeddings;
