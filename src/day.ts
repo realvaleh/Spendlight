@@ -104,6 +104,7 @@ export class SkippedLocalTimeError extends Error {
 /**
  * Civil time in `timeZone` as a UTC instant.
  * When the local clock repeats (DST overlap), the earlier offset is used.
+ * `millisecond` is kept; a fractional second is not treated as a missing local time.
  */
 export function utcFromCivilTime(timeZone: string, civil: CivilTime): Date {
   const millisecond = civil.millisecond ?? 0;
@@ -161,7 +162,11 @@ function zonedMidnightUtc(timeZone: string, date: Ymd): Date {
 function zoneOffsetMs(timeZone: string, date: Date): number {
   const parts = zonedParts(timeZone, date);
   const asUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
-  return asUtc - date.getTime();
+  // Intl parts stop at the second. Drop this instant's sub-second remainder or the
+  // offset shrinks by that many milliseconds and a civil time like 12:00:00.900
+  // lands late or is rejected as a DST gap.
+  const wholeSecond = date.getTime() - date.getUTCMilliseconds();
+  return asUtc - wholeSecond;
 }
 
 function zonedParts(timeZone: string, date: Date): Ymd & { hour: number; minute: number; second: number } {

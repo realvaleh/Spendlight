@@ -1851,6 +1851,64 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
     skipped = err instanceof SkippedLocalTimeError;
   }
   assert(skipped, "spring-forward gap should be rejected");
+  const fracUtc = utcFromCivilTime("UTC", {
+    year: 2026,
+    month: 10,
+    day: 4,
+    hour: 12,
+    minute: 0,
+    second: 0,
+    millisecond: 900,
+  });
+  assert(fracUtc.toISOString() === "2026-10-04T12:00:00.900Z", `utc fractional ${fracUtc.toISOString()}`);
+  const fracNy = utcFromCivilTime("America/New_York", {
+    year: 2026,
+    month: 10,
+    day: 4,
+    hour: 12,
+    minute: 0,
+    second: 0,
+    millisecond: 250,
+  });
+  assert(fracNy.toISOString() === "2026-10-04T16:00:00.250Z", `ny fractional ${fracNy.toISOString()}`);
+  const fracFold = utcFromCivilTime("America/New_York", {
+    year: 2026,
+    month: 11,
+    day: 1,
+    hour: 1,
+    minute: 30,
+    second: 0,
+    millisecond: 250,
+  });
+  assert(fracFold.toISOString() === "2026-11-01T05:30:00.250Z", `dst overlap fractional ${fracFold.toISOString()}`);
+  const fracKolkata = utcFromCivilTime("Asia/Kolkata", {
+    year: 2026,
+    month: 1,
+    day: 15,
+    hour: 12,
+    minute: 0,
+    second: 0,
+    millisecond: 123,
+  });
+  assert(
+    fracKolkata.toISOString() === "2026-01-15T06:30:00.123Z",
+    `kolkata fractional ${fracKolkata.toISOString()}`,
+  );
+  let skippedFrac = false;
+  try {
+    utcFromCivilTime("America/New_York", {
+      year: 2026,
+      month: 3,
+      day: 8,
+      hour: 2,
+      minute: 30,
+      second: 0,
+      millisecond: 250,
+    });
+  } catch (err) {
+    skippedFrac = err instanceof SkippedLocalTimeError;
+  }
+  assert(skippedFrac, "spring-forward gap with milliseconds should be rejected");
 
   await withApp(dir, "time-scope", mockUrl, { softUsd: null, hardUsd: 100 }, async (base, app) => {
     seedSpend(app.db, "2026-10-01T00:00:00.000Z", 1, "demo", "gpt-4o-mini");
@@ -2149,6 +2207,30 @@ async function testTimeScope(dir: string, mockUrl: string): Promise<void> {
       assert(Math.abs(civil.spendUsd - 2) < 1e-6, `civil datetime spend ${civil.spendUsd}`);
       const partial = (await fetch(`${base}/api/summary?since=2026-10-04T12:00:00&until=2026-10-05`).then((r) => r.json())) as DailySummary;
       assertDaily(partial.daily, [{ day: "2026-10-04", spendUsd: 2, requests: 1 }], "ny partial day");
+
+      const frac = (await fetch(`${base}/api/summary?since=2026-10-04T12:00:00.250`).then((r) => r.json())) as {
+        spendUsd: number;
+        scopeSince: string | null;
+      };
+      assert(frac.scopeSince === "2026-10-04T16:00:00.250Z", frac.scopeSince ?? "fractional civil since");
+      assert(Math.abs(frac.spendUsd - 4) < 1e-6, `fractional civil spend ${frac.spendUsd}`);
+      const shortFrac = (await fetch(`${base}/api/summary?since=2026-10-04T12:00:00.25`).then((r) => r.json())) as {
+        scopeSince: string | null;
+      };
+      assert(shortFrac.scopeSince === "2026-10-04T16:00:00.250Z", shortFrac.scopeSince ?? "short fraction");
+      const late = await fetch(`${base}/api/summary?since=2026-10-04T12:00:00.900`);
+      assert(late.status === 200, `fractional .900 status ${late.status}`);
+      const lateJson = (await late.json()) as { scopeSince: string | null };
+      assert(lateJson.scopeSince === "2026-10-04T16:00:00.900Z", lateJson.scopeSince ?? "late fractional since");
+      const fracMd = await fetch(`${base}/receipt.md?since=2026-10-04T12:00:00.250`).then((r) => r.text());
+      assert(
+        fracMd.includes("Covered **from 2026-10-04 12:00:00.250 inclusive (America/New_York)**"),
+        fracMd,
+      );
+      const zuluFrac = (await fetch(`${base}/api/summary?since=2026-10-04T16:00:00.400Z`).then((r) => r.json())) as {
+        scopeSince: string | null;
+      };
+      assert(zuluFrac.scopeSince === "2026-10-04T16:00:00.400Z", zuluFrac.scopeSince ?? "zulu fractional");
 
       const andCsv = await fetch(`${base}/api/export.csv?project=demo&model=gpt-4o-mini&since=2026-10-04&until=2026-10-05`);
       assert(
