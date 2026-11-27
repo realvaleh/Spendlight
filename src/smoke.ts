@@ -7,8 +7,8 @@ import { DEFAULT_FALLBACK, DEFAULT_PRICING, loadConfig, normalizeUpstreamUrl } f
 import { calendarDayBounds, calendarDayKey, calendarMonthBounds, calendarWeekBounds, shiftCalendarDay, SkippedLocalTimeError, utcFromCivilTime } from "./day.js";
 import { closeDb, insertRequest, openDb, type Db } from "./db.js";
 import { createApp, listen, type App } from "./server.js";
-import { estimateCostUsd } from "./pricing.js";
-import { joinUpstream, normalizeModelId, normalizeProjectTag, sanitizeProject } from "./proxy.js";
+import { estimateCostUsd, preflightFromBody } from "./pricing.js";
+import { joinUpstream, normalizeModelId, normalizeProjectTag, routePathname, sanitizeProject } from "./proxy.js";
 
 const MOCK_USAGE = {
   prompt_tokens: 100_000,
@@ -24,7 +24,7 @@ const SMALL_USAGE = {
   prompt_tokens_details: { cached_tokens: 0 },
 };
 
-const hits = { bounded: 0, unbounded: 0 };
+const hits = { bounded: 0, unbounded: 0, streamUsage: 0 };
 
 function fail(message: string): never {
   console.error(`SMOKE FAIL: ${message}`);
@@ -79,6 +79,29 @@ async function main(): Promise<void> {
       "https://api.openai.com/v1/evil.example/x",
     "protocol-relative join must not escape upstream host",
   );
+  assert(routePathname("/v1/chat/completions/") === "/v1/chat/completions", "one trailing slash stays the chat route");
+  assert(routePathname("/v1/chat/completions//") === "/v1/chat/completions", "repeated trailing slashes stay the chat route");
+  assert(routePathname("/v1/embeddings/") === "/v1/embeddings", "trailing slash stays the embeddings route");
+  assert(routePathname("/v1/responses/") === "/v1/responses", "trailing slash stays the responses route");
+  assert(routePathname("/v1/chat/completions") === "/v1/chat/completions", "canonical route is unchanged");
+  assert(routePathname("/v1/") === "/v1", "a bare /v1/ slash is not a priced suffix");
+  assert(routePathname("/") === "/", "root slash stays");
+  const slashEmbed = preflightFromBody(
+    "text-embedding-3-small",
+    { input: "hello" },
+    "/v1/embeddings/",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  const plainEmbed = preflightFromBody(
+    "text-embedding-3-small",
+    { input: "hello" },
+    "/v1/embeddings",
+    DEFAULT_PRICING,
+    DEFAULT_FALLBACK,
+  );
+  assert(slashEmbed.outputBounded === true, "trailing-slash embeddings must stay output-bounded");
+  assert(slashEmbed.costUsd === plainEmbed.costUsd, "trailing-slash embeddings must price like the canonical path");
 
   const dir = mkdtempSync(join(tmpdir(), "spendlight-smoke-"));
   const dbPath = join(dir, "ledger.db");
@@ -94,8 +117,11 @@ async function main(): Promise<void> {
     } catch {
       payload = {};
     }
-    if (url.pathname === "/chat/completions" || url.pathname === "/v1/chat/completions") {
+    const path = url.pathname.replace(/\/+$/, "") || "/";
+    if (path === "/chat/completions" || path === "/v1/chat/completions") {
       if (payload.stream === true) {
+        const options = payload.stream_options as { include_usage?: unknown } | undefined;
+        if (options?.include_usage === true) hits.streamUsage += 1;
         writeStream(res);
         return;
       }
@@ -338,6 +364,7 @@ async function main(): Promise<void> {
 
     await testUnboundedRace(dir, mockUrl);
     await testBoundedRace(dir, mockUrl);
+    await testTrailingSlashHold(dir, mockUrl);
     await testStreamCutoff(dir, mockUrl);
     testCalendarDayBounds();
     testCalendarWeekBounds();
@@ -365,7 +392,7 @@ async function main(): Promise<void> {
     await testProjectModelPairs(dir, mockUrl);
     await testTopRequests(dir, mockUrl);
 
-    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests");
+    console.log("SMOKE OK: logged completion, csv export, json export, hard kill-switch, receipts, pass-through, cors, budget race, stream cutoff, day window, week window, month window, project scope, model scope, time scope, daily breakdown, project-model spend, top requests, trailing-slash hold");
   } finally {
     await app.close();
     await new Promise<void>((resolve) => mock.close(() => resolve()));
@@ -403,6 +430,52 @@ async function testUnboundedRace(dir: string, mockUrl: string): Promise<void> {
     );
     assert(again.status === 200, `headroom hold should release after settle, got ${again.status}`);
     await again.text();
+  });
+}
+
+/** A trailing slash is still a priced chat call, so it must take the same hard-budget hold. */
+async function testTrailingSlashHold(dir: string, mockUrl: string): Promise<void> {
+  hits.unbounded = 0;
+  hits.streamUsage = 0;
+  await withApp(dir, "slash-hold", mockUrl, { softUsd: null, hardUsd: 0.04 }, async (base) => {
+    const body = JSON.stringify({
+      model: "gpt-4o-mini",
+      delay: true,
+      small: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const postSlash = (project: string) =>
+      fetch(`${base}/v1/chat/completions/`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-spendlight-project": project },
+        body,
+      });
+    const [a, b] = await Promise.all([postSlash("slash"), postSlash("slash")]);
+    const statuses = [a.status, b.status].sort((x, y) => x - y);
+    assert(statuses[0] === 200 && statuses[1] === 402, `trailing-slash race statuses ${statuses.join(",")}`);
+    assert(hits.unbounded === 1, `trailing-slash race reached upstream ${hits.unbounded} times`);
+    const blocked = a.status === 402 ? a : b;
+    const winner = a.status === 200 ? a : b;
+    const blockedJson = (await blocked.json()) as { error?: { code?: string } };
+    assert(blockedJson.error?.code === "budget_hard_limit", "trailing-slash 402 missing budget code");
+    await winner.text();
+    const summary = await summaryOf(base);
+    assert(summary.requests === 1, `trailing-slash race logged ${summary.requests} rows`);
+    assert(summary.spendUsd > 0 && summary.spendUsd < 0.001, `trailing-slash spend ${summary.spendUsd}`);
+
+    const streamed = await fetch(`${base}/v1/chat/completions//`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-spendlight-project": "slash" },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        stream: true,
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    const streamedText = await streamed.text();
+    assert(streamed.status === 200, `trailing-slash stream status ${streamed.status}: ${streamedText.slice(0, 120)}`);
+    assert(hits.streamUsage === 1, "trailing-slash chat stream should ask upstream for usage");
   });
 }
 

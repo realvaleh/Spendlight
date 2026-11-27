@@ -100,7 +100,8 @@ export function preflightFromBody(
     if (body.input != null) promptChars += textChars(body.input);
   }
   const promptTokens = roughTokens(promptChars);
-  const embeddings = pathname.endsWith("/embeddings");
+  const route = pathname.length > 1 ? pathname.replace(/\/+$/, "") : pathname;
+  const embeddings = route.endsWith("/embeddings");
   let outputTokens = 0;
   let outputBounded = embeddings;
   if (!embeddings && body) {
