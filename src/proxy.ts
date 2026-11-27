@@ -38,9 +38,10 @@ export async function proxyRequest(
 ): Promise<void> {
   const rawBody = await readBody(req);
   const project = resolveProject(req, url, rawBody);
-  const priced = isPricedPath(url.pathname);
+  const routePath = routePathname(url.pathname);
+  const priced = isPricedPath(routePath);
   const mutating = isMutating(req.method ?? "GET");
-  const isChat = url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions";
+  const isChat = routePath === "/v1/chat/completions" || routePath === "/chat/completions";
 
   let outboundBody = rawBody;
   let model = "unknown";
@@ -67,7 +68,7 @@ export async function proxyRequest(
   }
 
   const preflight = priced
-    ? preflightFromBody(model, parsed, url.pathname, config.pricing, config.fallbackPrice)
+    ? preflightFromBody(model, parsed, routePath, config.pricing, config.fallbackPrice)
     : null;
 
   let decision = evaluateBudget(db, config, project);
@@ -323,6 +324,16 @@ function completionCharsFromEvent(event: string): number {
 function isMutating(method: string): boolean {
   const m = method.toUpperCase();
   return m !== "GET" && m !== "HEAD" && m !== "OPTIONS";
+}
+
+/**
+ * Drop extra trailing slashes. `/v1/chat/completions/` is the same priced route as
+ * `/v1/chat/completions`; a slash must not skip the hard-budget hold.
+ * A single `/` stays. Encoded slashes are left alone.
+ */
+export function routePathname(pathname: string): string {
+  if (pathname.length > 1 && pathname.endsWith("/")) return pathname.replace(/\/+$/, "");
+  return pathname;
 }
 
 /** Routes whose usage we know how to price. Kill-switch still covers all mutating /v1 calls. */
